@@ -1,6 +1,6 @@
-# Voice Typer Runtime
+# STT Server
 
-Local-first transcription server using [faster-whisper](https://github.com/SYSTRAN/faster-whisper). This is the standalone local-model runtime component of [Voice Typer](https://github.com/mariuszRep/whisper-vibes), sideloaded by the desktop app as a PyInstaller sidecar. It owns model execution and the public transcription API contract; the app owns UI, capture, and display.
+Local-first speech-to-text transcription server using [faster-whisper](https://github.com/SYSTRAN/faster-whisper). This is the standalone local-model runtime component of [Voice Typer](https://github.com/mariuszRep/whisper-vibes), sideloaded by the desktop app as a PyInstaller sidecar. It owns model execution and the public transcription API contract; the app owns UI, capture, and display.
 
 ## Setup
 

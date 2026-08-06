@@ -64,20 +64,20 @@ jobs:
         shell: bash
         run: |
           mkdir -p release-assets
-          cp dist/voice-typer-backend.exe release-assets/voice-typer-runtime-windows-cpu.exe
-          cp dist-gpu/voice-typer-backend.exe release-assets/voice-typer-runtime-windows-gpu.exe
+          cp dist/voice-typer-backend.exe release-assets/stt-server-windows-cpu.exe
+          cp dist-gpu/voice-typer-backend.exe release-assets/stt-server-windows-gpu.exe
 
       - name: Stage release assets (Linux)
         if: matrix.platform == 'linux'
         run: |
           mkdir -p release-assets
-          cp dist/voice-typer-backend release-assets/voice-typer-runtime-linux-cpu
-          chmod +x release-assets/voice-typer-runtime-linux-cpu
+          cp dist/voice-typer-backend release-assets/stt-server-linux-cpu
+          chmod +x release-assets/stt-server-linux-cpu
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: voice-typer-runtime-${{ matrix.platform }}
+          name: stt-server-${{ matrix.platform }}
           path: release-assets/*
           retention-days: 1
 
@@ -91,7 +91,7 @@ jobs:
           merge-multiple: true
 
       - name: Restore executable bit (Linux binary)
-        run: chmod +x artifacts/voice-typer-runtime-linux-cpu
+        run: chmod +x artifacts/stt-server-linux-cpu
 
       - name: List staged assets
         run: ls -lh artifacts
@@ -103,6 +103,6 @@ jobs:
           TAG="${GITHUB_REF##*/}"
           gh release create "${TAG}" \
             --repo "${{ github.repository }}" \
-            --title "voice-typer-runtime ${TAG}" \
+            --title "stt-server ${TAG}" \
             --notes "Automated build of the Voice Typer local-model runtime (faster-whisper/CTranslate2 sidecar server). Consumed by https://github.com/mariuszRep/whisper-vibes." \
             artifacts/*
