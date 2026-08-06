@@ -1,0 +1,116 @@
+# Voice Typer Runtime
+
+Local-first transcription server using [faster-whisper](https://github.com/SYSTRAN/faster-whisper). This is the standalone local-model runtime component of [Voice Typer](https://github.com/mariuszRep/whisper-vibes), sideloaded by the desktop app as a PyInstaller sidecar. It owns model execution and the public transcription API contract; the app owns UI, capture, and display.
+
+## Setup
+
+```bash
+python -m venv venv
+source venv/bin/activate  # venv\Scripts\activate on Windows
+pip install -r requirements.txt
+```
+
+## Run
+
+```bash
+./run.sh
+```
+
+Or directly:
+
+```bash
+uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+Consumers (e.g. the desktop app) should check `GET /health` before starting a new process, and reuse an already-running compatible server on the configured host/port instead of double-starting.
+
+## Configuration
+
+All settings are environment variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `VOICE_TYPER_HOST` | `127.0.0.1` | Bind address |
+| `VOICE_TYPER_PORT` | `8000` | Listen port |
+| `VOICE_TYPER_MODEL` | `Systran/faster-whisper-small` | Whisper model ID |
+| `VOICE_TYPER_DEVICE` | `auto` | Device selection. Auto uses CUDA when CTranslate2 detects a CUDA device, otherwise CPU. Set `cpu` or `cuda` to force a device. |
+| `VOICE_TYPER_COMPUTE_TYPE` | `auto` | faster-whisper compute type. Auto uses `float16` on CUDA and `int8` on CPU. |
+| `VOICE_TYPER_LANGUAGE` | _(auto)_ | Language code or auto-detect |
+
+## CUDA Behavior
+
+CUDA is optional. When `VOICE_TYPER_DEVICE` is unset, the backend asks CTranslate2 whether CUDA is available. If CUDA is detected, Voice Typer starts with `device=cuda` and `compute_type=float16`; otherwise it starts with `device=cpu` and `compute_type=int8`.
+
+If CUDA is requested but the runtime is incomplete or inference fails, the backend falls back to CPU and exposes the error through `GET /v1/config`. On Windows, CTranslate2 CUDA support requires the CUDA runtime DLLs to be loadable by the backend process, including `cublas64_12.dll`.
+
+If `cublas64_12.dll` is installed but not on `PATH`, set `VOICE_TYPER_CUDA_DLL_DIR` to the directory containing the CUDA DLLs, for example a CUDA Toolkit `bin` directory. The packaged backend also searches common Python NVIDIA package DLL folders and CUDA Toolkit v12 install folders automatically.
+
+## API Contract
+
+### `GET /health`
+
+Returns server status and configured model.
+
+```json
+{ "status": "ok", "model": "Systran/faster-whisper-small" }
+```
+
+### `POST /v1/audio/transcriptions`
+
+OpenAI-compatible transcription endpoint.
+
+**Request:** multipart form data with field `file` containing an audio file (webm, wav, mp3, etc.). Optional `Authorization: Bearer <token>` header (accepted but not validated — for OpenDora compatibility).
+
+**Response:**
+
+```json
+{ "text": "transcribed text here" }
+```
+
+### `GET /v1/config`
+
+Returns runtime configuration and diagnostics, including requested device, active device, compute type, CUDA availability, CUDA runtime status, CUDA-supported compute types, model load state, and recent timing metrics.
+
+### `WS /v1/audio/stream`
+
+Realtime streaming transcription with partial and final transcript events, backed by a LocalAgreement2 adapter over faster-whisper. JSON control messages and events in text frames; raw PCM in binary frames. The full wire protocol and the Live Transcription Provider Standard it implements are specified in the app repo: [`protocol.md`](https://github.com/mariuszRep/whisper-vibes/blob/main/protocol.md) and [`CONVENTIONS.md`](https://github.com/mariuszRep/whisper-vibes/blob/main/CONVENTIONS.md).
+
+`GET /v1/config` reports `schema_version: 4` and includes a `streaming` block describing the endpoint, accepted encodings/sample rates, and channel count. Clients must treat a missing `streaming` block (`schema_version < 4`) as "streaming unavailable" and fall back to batch transcription.
+
+### `POST /v1/admin/restart`
+
+Restarts the standalone backend process with optional overrides:
+
+```json
+{
+  "host": "127.0.0.1",
+  "port": 8000,
+  "model": "Systran/faster-whisper-small",
+  "device": "cuda",
+  "compute_type": "float16"
+}
+```
+
+Omit `device` and `compute_type` to keep automatic CUDA/CPU selection. In desktop mode, Tauri manages the sidecar process directly and forwards the same settings as environment variables.
+
+### `POST /v1/admin/stop`
+
+Stops the standalone backend process. Starting the backend is handled by the process manager: shell command, standalone binary, dev script, or Tauri sidecar.
+
+## OpenDora Compatibility
+
+Voice Typer is designed as a drop-in replacement for the local Whisper provider in OpenDora.
+
+In OpenDora: **Settings → Voice → Speech-to-Text → Local Whisper Server URL** → set to `http://127.0.0.1:8000`.
+
+OpenDora appends `/v1/audio/transcriptions` to this URL and sends multipart audio with field name `file` (filename `recording.webm`, format `audio/webm;codecs=opus`). The response must be JSON containing `text`.
+
+No OpenDora changes are required — the contract matches exactly.
+
+## Building the sidecar binary
+
+```bash
+python -m PyInstaller --clean --distpath dist voice-typer-backend.spec
+```
+
+Set `VOICE_TYPER_BUILD_VARIANT=gpu` before building to bundle NVIDIA cuBLAS/cuDNN/cuda_runtime DLLs (larger binary, CUDA works out of the box). Default (`cpu`, or unset) omits them for a smaller CPU-only build. See `.github/workflows/build.yml` for the CI build/release process.

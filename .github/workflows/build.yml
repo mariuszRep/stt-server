@@ -1,0 +1,108 @@
+name: Build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+          - os: ubuntu-latest
+            platform: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Create virtualenv (Windows)
+        if: matrix.platform == 'windows'
+        run: python -m venv venv_win
+
+      - name: Create virtualenv (Linux)
+        if: matrix.platform == 'linux'
+        run: python -m venv venv
+
+      - name: Install dependencies (Windows)
+        if: matrix.platform == 'windows'
+        run: venv_win\Scripts\pip.exe install -r requirements.txt pyinstaller
+
+      - name: Install dependencies (Linux)
+        if: matrix.platform == 'linux'
+        run: venv/bin/pip install -r requirements.txt pyinstaller
+
+      - name: Build CPU sidecar (Windows)
+        if: matrix.platform == 'windows'
+        run: venv_win\Scripts\python.exe -m PyInstaller --clean --distpath dist voice-typer-backend.spec
+
+      - name: Build CPU sidecar (Linux)
+        if: matrix.platform == 'linux'
+        run: venv/bin/python -m PyInstaller --clean --distpath dist voice-typer-backend.spec
+
+      # GPU variant bundles NVIDIA cuBLAS/cuDNN/cuda_runtime DLLs so CUDA works out of the
+      # box. Windows-only today, mirroring the prior in-monorepo desktop-build.yml behavior.
+      - name: Build GPU-enabled variant (Windows only)
+        if: matrix.platform == 'windows'
+        env:
+          VOICE_TYPER_BUILD_VARIANT: gpu
+        run: venv_win\Scripts\python.exe -m PyInstaller --clean --distpath dist-gpu --workpath build-gpu voice-typer-backend.spec
+
+      - name: Stage release assets (Windows)
+        if: matrix.platform == 'windows'
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          cp dist/voice-typer-backend.exe release-assets/voice-typer-runtime-windows-cpu.exe
+          cp dist-gpu/voice-typer-backend.exe release-assets/voice-typer-runtime-windows-gpu.exe
+
+      - name: Stage release assets (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          mkdir -p release-assets
+          cp dist/voice-typer-backend release-assets/voice-typer-runtime-linux-cpu
+          chmod +x release-assets/voice-typer-runtime-linux-cpu
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: voice-typer-runtime-${{ matrix.platform }}
+          path: release-assets/*
+          retention-days: 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Restore executable bit (Linux binary)
+        run: chmod +x artifacts/voice-typer-runtime-linux-cpu
+
+      - name: List staged assets
+        run: ls -lh artifacts
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF##*/}"
+          gh release create "${TAG}" \
+            --repo "${{ github.repository }}" \
+            --title "voice-typer-runtime ${TAG}" \
+            --notes "Automated build of the Voice Typer local-model runtime (faster-whisper/CTranslate2 sidecar server). Consumed by https://github.com/mariuszRep/whisper-vibes." \
+            artifacts/*
