@@ -24,6 +24,21 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 Consumers (e.g. the desktop app) should check `GET /health` before starting a new process, and reuse an already-running compatible server on the configured host/port instead of double-starting.
 
+## CLI
+
+The packaged binary (or `python run_sidecar.py`) is a CLI with these subcommands:
+
+| Command | Does |
+|---|---|
+| `serve` (or no subcommand) | Run in the foreground. This is the original, argument-free behavior consumers like Tauri's sidecar spawn rely on — unaffected by everything below. |
+| `install` | Copy the binary to a stable per-user location, auto-detect and swap in the GPU-accelerated build if applicable (see CUDA Behavior below), register it to start at login (Windows: Scheduled Task; Linux: systemd user unit), and start it immediately. |
+| `start` | Start the server in the background (detached, PID-tracked, logs to a file). |
+| `stop` | Stop the running server — tries a clean shutdown via `POST /v1/admin/stop` first, falls back to a direct kill. |
+| `status` | Report whether the server is running and responding to `/health`. |
+| `logs [-n N]` | Print the last `N` lines (default 200; `0` = all) of the server's log file. |
+
+`install`'s startup registration is best-effort: if Task Scheduler/systemd-user-session access is unavailable (locked-down environments, some CI/sandboxes), it logs that and still starts the server for the current session — only auto-start-at-login is affected.
+
 ## Configuration
 
 All settings are environment variables:
@@ -44,6 +59,8 @@ CUDA is optional. When `VOICE_TYPER_DEVICE` is unset, the backend asks CTranslat
 If CUDA is requested but the runtime is incomplete or inference fails, the backend falls back to CPU and exposes the error through `GET /v1/config`. On Windows, CTranslate2 CUDA support requires the CUDA runtime DLLs to be loadable by the backend process, including `cublas64_12.dll`.
 
 If `cublas64_12.dll` is installed but not on `PATH`, set `VOICE_TYPER_CUDA_DLL_DIR` to the directory containing the CUDA DLLs, for example a CUDA Toolkit `bin` directory. The packaged backend also searches common Python NVIDIA package DLL folders and CUDA Toolkit v12 install folders automatically.
+
+**GPU build auto-swap:** `stt-server install` checks the same signal `GET /v1/config` reports (`cuda_available` + `cuda_runtime_ok`). If a CUDA-capable GPU is present but the installed binary is the CPU-only build (no bundled runtime DLLs), it downloads the matching `stt-server-<platform>-gpu` release asset and atomically swaps it in before starting — mirroring `whisper-vibes`'s in-app "Install GPU acceleration" flow. Override the download URL with `STT_SERVER_GPU_ASSET_URL` (useful for local testing against a locally-served file). Windows-only today — no Linux GPU build is published yet.
 
 ## API Contract
 

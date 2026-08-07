@@ -46,6 +46,8 @@ a = Analysis(
         'app.main',
         'app.config',
         'app.transcribe',
+        'app.streaming',
+        'app.cli',
     ],
     hookspath=[],
     runtime_hooks=[],

@@ -51,6 +51,89 @@ jobs:
         if: matrix.platform == 'linux'
         run: venv/bin/python -m PyInstaller --clean --distpath dist voice-typer-backend.spec
 
+      # CLI smoke test against the just-built binary — a broken CLI blocks the
+      # release rather than shipping silently. Runs install (best-effort: Task
+      # Scheduler/systemd user-session registration can fail in headless CI —
+      # the CLI itself degrades gracefully and still starts the server; the
+      # real assertion here is the status poll below, not install's exit code),
+      # then polls status until healthy, checks logs, stops, and confirms stop
+      # took effect.
+      - name: Test CLI (Windows)
+        if: matrix.platform == 'windows'
+        shell: bash
+        run: |
+          BIN="dist/voice-typer-backend.exe"
+          "$BIN" install
+
+          echo "Waiting for stt-server to become healthy..."
+          healthy=0
+          for i in $(seq 1 60); do
+            if "$BIN" status; then
+              healthy=1
+              break
+            fi
+            rc=$?
+            if [ "$rc" -eq 1 ]; then
+              echo "::error::stt-server is not running after install"
+              "$BIN" logs || true
+              exit 1
+            fi
+            sleep 2
+          done
+          if [ "$healthy" -ne 1 ]; then
+            echo "::error::stt-server did not become healthy within 120s"
+            "$BIN" logs || true
+            exit 1
+          fi
+
+          "$BIN" logs -n 20
+
+          "$BIN" stop
+          sleep 2
+          if "$BIN" status; then
+            echo "::error::stt-server still reports running after stop"
+            exit 1
+          fi
+          echo "CLI smoke test passed."
+
+      - name: Test CLI (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          BIN="dist/voice-typer-backend"
+          chmod +x "$BIN"
+          "$BIN" install
+
+          echo "Waiting for stt-server to become healthy..."
+          healthy=0
+          for i in $(seq 1 60); do
+            if "$BIN" status; then
+              healthy=1
+              break
+            fi
+            rc=$?
+            if [ "$rc" -eq 1 ]; then
+              echo "::error::stt-server is not running after install"
+              "$BIN" logs || true
+              exit 1
+            fi
+            sleep 2
+          done
+          if [ "$healthy" -ne 1 ]; then
+            echo "::error::stt-server did not become healthy within 120s"
+            "$BIN" logs || true
+            exit 1
+          fi
+
+          "$BIN" logs -n 20
+
+          "$BIN" stop
+          sleep 2
+          if "$BIN" status; then
+            echo "::error::stt-server still reports running after stop"
+            exit 1
+          fi
+          echo "CLI smoke test passed."
+
       # GPU variant bundles NVIDIA cuBLAS/cuDNN/cuda_runtime DLLs so CUDA works out of the
       # box. Windows-only today, mirroring the prior in-monorepo desktop-build.yml behavior.
       - name: Build GPU-enabled variant (Windows only)
