@@ -32,6 +32,7 @@ The packaged binary (or `python run_sidecar.py`) is a CLI with these subcommands
 |---|---|
 | `serve` (or no subcommand) | Run in the foreground. This is the original, argument-free behavior consumers like Tauri's sidecar spawn rely on — unaffected by everything below. |
 | `install` | Copy the binary to a stable per-user location, auto-detect and swap in the GPU-accelerated build if applicable (see CUDA Behavior below), register it to start at login (Windows: Scheduled Task; Linux: systemd user unit), and start it immediately. |
+| `uninstall` | Stop the server, unregister auto-start, and remove the installed binary/logs/pid file. |
 | `start` | Start the server in the background (detached, PID-tracked, logs to a file). |
 | `stop` | Stop the running server — tries a clean shutdown via `POST /v1/admin/stop` first, falls back to a direct kill. |
 | `status` | Report whether the server is running and responding to `/health`. |

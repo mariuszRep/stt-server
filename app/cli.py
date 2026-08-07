@@ -20,6 +20,7 @@ from app import config
 
 APP_NAME = "stt-server"
 GPU_ASSET_ENV = "STT_SERVER_GPU_ASSET_URL"
+WINDOWS_TASK_NAME = "STTServer"
 
 
 def _is_frozen() -> bool:
@@ -71,11 +72,24 @@ def _read_pid() -> int | None:
 
 def _pid_alive(pid: int) -> bool:
     if platform.system() == "Windows":
-        result = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-            capture_output=True, text=True,
-        )
-        return str(pid) in result.stdout
+        # Query the Win32 API directly rather than shelling out to `tasklist`
+        # and parsing its text output — observed on a GitHub Actions Windows
+        # runner to be both slow (multi-second per call) and occasionally
+        # flaky (a live PID briefly misreported as absent).
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            if not ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == STILL_ACTIVE
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
         return True
@@ -212,19 +226,23 @@ def cmd_stop(args) -> int:
 
 
 def cmd_status(args) -> int:
+    # Try the HTTP health check first — it's fast (short timeout) and
+    # authoritative for "is this actually serving requests", which is what
+    # callers care about. Only fall back to PID-based diagnostics (slower,
+    # and OS-dependent) if the health check itself doesn't succeed.
     pid = _read_pid()
-    running = bool(pid and _pid_alive(pid))
-    health = _http_get(_health_url()) if running else None
+    health = _http_get(_health_url())
+    if health:
+        pid_note = f" (pid {pid})" if pid else ""
+        print(f"{APP_NAME}: running{pid_note}, healthy — model {health.get('model')}.")
+        return 0
 
     if not pid:
         print(f"{APP_NAME}: not installed/started (no pid file at {pid_file()}).")
         return 1
-    if not running:
+    if not _pid_alive(pid):
         print(f"{APP_NAME}: not running (stale pid file for {pid}).")
         return 1
-    if health:
-        print(f"{APP_NAME}: running (pid {pid}), healthy — model {health.get('model')}.")
-        return 0
     print(f"{APP_NAME}: running (pid {pid}), not yet responding to /health (starting up?).")
     return 2
 
@@ -241,12 +259,11 @@ def cmd_logs(args) -> int:
 
 
 def _install_windows(target: Path) -> int:
-    task_name = "STTServer"
     log_path = log_file()
     run_cmd = f'"{target}" serve --log-file "{log_path}"'
     result = subprocess.run(
         [
-            "schtasks", "/Create", "/TN", task_name,
+            "schtasks", "/Create", "/TN", WINDOWS_TASK_NAME,
             "/TR", run_cmd,
             "/SC", "ONLOGON",
             "/RL", "LIMITED",
@@ -264,7 +281,7 @@ def _install_windows(target: Path) -> int:
               f"Run `{APP_NAME} install` again after resolving Task Scheduler permissions, "
               f"or start it manually with `{APP_NAME} start`.")
         return 0
-    print(f"Registered Scheduled Task '{task_name}' — {APP_NAME} will start automatically at login.")
+    print(f"Registered Scheduled Task '{WINDOWS_TASK_NAME}' — {APP_NAME} will start automatically at login.")
     return 0
 
 
@@ -383,3 +400,59 @@ def cmd_install(args) -> int:
     if rc == 0:
         cmd_start(args)
     return rc
+
+
+def _unregister_startup() -> None:
+    system = platform.system()
+    if system == "Windows":
+        subprocess.run(
+            ["schtasks", "/Delete", "/TN", WINDOWS_TASK_NAME, "/F"],
+            capture_output=True,
+        )
+    elif system == "Linux":
+        subprocess.run(["systemctl", "--user", "disable", "--now", f"{APP_NAME}.service"], capture_output=True)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+        unit_path = Path.home() / ".config" / "systemd" / "user" / f"{APP_NAME}.service"
+        try:
+            unit_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def cmd_uninstall(args) -> int:
+    pid = _read_pid()
+    if pid and _pid_alive(pid):
+        cmd_stop(args)
+
+    _unregister_startup()
+
+    d = install_dir()
+    if not d.exists():
+        print(f"{APP_NAME} is not installed (no directory at {d}).")
+        return 0
+
+    self_path = Path(sys.executable).resolve() if _is_frozen() else None
+    running_from_install_dir = bool(self_path and self_path.parent == d.resolve())
+
+    if platform.system() == "Windows" and running_from_install_dir:
+        # Can't delete our own running .exe on Windows (file is locked while
+        # in use). Schedule the cleanup via a short-lived detached helper that
+        # waits for this process to exit, then removes the install directory.
+        bat_path = Path(os.environ.get("TEMP", str(d.parent))) / f"{APP_NAME}-uninstall.bat"
+        bat_path.write_text(
+            "@echo off\r\n"
+            "timeout /t 2 /nobreak >nul\r\n"
+            f'rmdir /s /q "{d}"\r\n'
+            f'del /f /q "{bat_path}"\r\n'
+        )
+        subprocess.Popen(
+            ["cmd", "/c", str(bat_path)],
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+        )
+        print(f"{APP_NAME} stopped and auto-start unregistered. Finishing removal of {d} "
+              f"in the background (can't delete a running executable on Windows) — done in a couple seconds.")
+    else:
+        shutil.rmtree(d, ignore_errors=True)
+        print(f"{APP_NAME} uninstalled — removed {d}.")
+    return 0

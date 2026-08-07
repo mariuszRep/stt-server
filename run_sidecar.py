@@ -15,6 +15,9 @@ def main() -> int:
     install_p = sub.add_parser("install", help="Install the binary and register it to start at login.")
     install_p.set_defaults(func=cli.cmd_install)
 
+    uninstall_p = sub.add_parser("uninstall", help="Stop, unregister auto-start, and remove the installed binary.")
+    uninstall_p.set_defaults(func=cli.cmd_uninstall)
+
     start_p = sub.add_parser("start", help="Start the server in the background.")
     start_p.set_defaults(func=cli.cmd_start)
 
