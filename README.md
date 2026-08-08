@@ -2,7 +2,21 @@
 
 Local-first speech-to-text transcription server using [faster-whisper](https://github.com/SYSTRAN/faster-whisper). This is the standalone local-model runtime component of [Voice Typer](https://github.com/mariuszRep/whisper-vibes), sideloaded by the desktop app as a PyInstaller sidecar. It owns model execution and the public transcription API contract; the app owns UI, capture, and display.
 
-## Setup
+## Quick install
+
+Windows (PowerShell):
+```powershell
+irm https://raw.githubusercontent.com/mariuszRep/stt-server/main/install.ps1 | iex
+```
+
+Linux:
+```bash
+curl -sSL https://raw.githubusercontent.com/mariuszRep/stt-server/main/install.sh | bash
+```
+
+Both download only the CPU-only binary and hand off to `install` (see CLI below) — nothing GPU-related is fetched until `install` itself detects a CUDA-capable GPU and pulls the runtime it needs (see CUDA Behavior). Set `STT_SERVER_VERSION` to pin a specific release instead of the latest.
+
+## Setup (from source)
 
 ```bash
 python -m venv venv
@@ -61,7 +75,7 @@ If CUDA is requested but the runtime is incomplete or inference fails, the backe
 
 If `cublas64_12.dll` is installed but not on `PATH`, set `VOICE_TYPER_CUDA_DLL_DIR` to the directory containing the CUDA DLLs, for example a CUDA Toolkit `bin` directory. The packaged backend also searches common Python NVIDIA package DLL folders and CUDA Toolkit v12 install folders automatically.
 
-**GPU build auto-swap:** `stt-server install` checks the same signal `GET /v1/config` reports (`cuda_available` + `cuda_runtime_ok`). If a CUDA-capable GPU is present but the installed binary is the CPU-only build (no bundled runtime DLLs), it downloads the matching `stt-server-<platform>-gpu` release asset and atomically swaps it in before starting — mirroring `whisper-vibes`'s in-app "Install GPU acceleration" flow. Override the download URL with `STT_SERVER_GPU_ASSET_URL` (useful for local testing against a locally-served file). Windows-only today — no Linux GPU build is published yet.
+**CUDA runtime auto-pull:** `stt-server install` checks the same signal `GET /v1/config` reports (`cuda_available` + `cuda_runtime_ok`). If a CUDA-capable GPU is present but the installed binary can't yet load the CUDA runtime, it downloads a small `stt-server-<platform>-cuda-runtime.zip` (just the cuBLAS/cuDNN/cuda_runtime DLLs — not a second copy of the binary) and extracts it flat into the install directory, right next to the binary, which is already one of the directories searched above — no separate binary swap, no env var wiring needed. Fetched via `curl`/`tar` (both ship built into Windows since the 2018 update). Override the download URL with `STT_SERVER_GPU_ASSET_URL` (useful for local testing against a locally-served file). Windows-only today — no Linux GPU build is published yet.
 
 ## API Contract
 
@@ -131,4 +145,4 @@ No OpenDora changes are required — the contract matches exactly.
 python -m PyInstaller --clean --distpath dist voice-typer-backend.spec
 ```
 
-Set `VOICE_TYPER_BUILD_VARIANT=gpu` before building to bundle NVIDIA cuBLAS/cuDNN/cuda_runtime DLLs (larger binary, CUDA works out of the box). Default (`cpu`, or unset) omits them for a smaller CPU-only build. See `.github/workflows/build.yml` for the CI build/release process.
+Set `VOICE_TYPER_BUILD_VARIANT=gpu` before building to bundle NVIDIA cuBLAS/cuDNN/cuda_runtime DLLs directly into the binary instead (larger binary, CUDA works out of the box, useful for manual/offline builds). Default (`cpu`, or unset) omits them for a smaller CPU-only build. CI (`.github/workflows/build.yml`) only ever builds the `cpu` variant — the CUDA runtime is published separately as `stt-server-windows-cuda-runtime.zip` and pulled on demand by `install` instead (see CUDA Behavior above).

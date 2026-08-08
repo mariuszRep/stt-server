@@ -134,13 +134,44 @@ jobs:
           fi
           echo "CLI smoke test passed."
 
-      # GPU variant bundles NVIDIA cuBLAS/cuDNN/cuda_runtime DLLs so CUDA works out of the
-      # box. Windows-only today, mirroring the prior in-monorepo desktop-build.yml behavior.
-      - name: Build GPU-enabled variant (Windows only)
+      # GPU acceleration is the same code as the CPU build — CUDA works out of the box once
+      # the NVIDIA cuBLAS/cuDNN/cuda_runtime DLLs are present next to the binary (see
+      # app/config.py's _cuda_dll_search_dirs, which already searches the frozen binary's own
+      # directory). So instead of building and publishing an entire second ~650MB binary that's
+      # otherwise byte-identical to the CPU one, package just those DLLs as a small zip that
+      # `stt-server install`'s GPU auto-swap downloads and extracts on demand. Reuses
+      # PyInstaller's own collect_dynamic_libs — the exact mechanism the old GPU build used to
+      # find these DLLs — so the DLL set stays identical to what was already verified working.
+      - name: Package CUDA runtime DLL bundle (Windows only)
         if: matrix.platform == 'windows'
-        env:
-          VOICE_TYPER_BUILD_VARIANT: gpu
-        run: venv_win\Scripts\python.exe -m PyInstaller --clean --distpath dist-gpu --workpath build-gpu voice-typer-backend.spec
+        shell: bash
+        run: |
+          venv_win\Scripts\python.exe - <<'PY'
+          import os
+          import shutil
+          import zipfile
+          from PyInstaller.utils.hooks import collect_dynamic_libs
+
+          stage = "cuda-runtime-stage"
+          os.makedirs(stage, exist_ok=True)
+          for pkg in ("nvidia.cublas", "nvidia.cuda_runtime", "nvidia.cudnn"):
+              try:
+                  libs = collect_dynamic_libs(pkg)
+              except Exception as exc:
+                  print(f"Skipping {pkg}: {exc}")
+                  continue
+              for src, _dest in libs:
+                  shutil.copy2(src, stage)
+                  print(f"Staged {os.path.basename(src)}")
+
+          staged = sorted(os.listdir(stage))
+          if not staged:
+              raise SystemExit("No CUDA runtime DLLs were staged — nvidia-* packages missing from this venv?")
+          with zipfile.ZipFile("stt-server-windows-cuda-runtime.zip", "w", zipfile.ZIP_DEFLATED) as zf:
+              for name in staged:
+                  zf.write(os.path.join(stage, name), arcname=name)
+          print(f"Zipped {len(staged)} DLL(s) into stt-server-windows-cuda-runtime.zip")
+          PY
 
       - name: Stage release assets (Windows)
         if: matrix.platform == 'windows'
@@ -148,7 +179,7 @@ jobs:
         run: |
           mkdir -p release-assets
           cp dist/voice-typer-backend.exe release-assets/stt-server-windows-cpu.exe
-          cp dist-gpu/voice-typer-backend.exe release-assets/stt-server-windows-gpu.exe
+          cp stt-server-windows-cuda-runtime.zip release-assets/stt-server-windows-cuda-runtime.zip
 
       - name: Stage release assets (Linux)
         if: matrix.platform == 'linux'

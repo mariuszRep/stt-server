@@ -328,46 +328,47 @@ def _gpu_asset_url(version: str) -> str | None:
     if override:
         return override
     if platform.system() == "Windows":
-        return f"https://github.com/mariuszRep/stt-server/releases/download/v{version}/stt-server-windows-gpu.exe"
-    return None  # No Linux GPU build published yet — matches today's Windows-only GPU build in build.yml.
+        return f"https://github.com/mariuszRep/stt-server/releases/download/v{version}/stt-server-windows-cuda-runtime.zip"
+    return None  # No Linux GPU runtime bundle published yet — matches today's Windows-only GPU support in build.yml.
 
 
 def _maybe_swap_to_gpu(target: Path) -> Path:
     """If a CUDA-capable GPU is present but the installed binary lacks a
-    working CUDA runtime, download the matching GPU-variant release asset
-    and atomically swap it in. Mirrors whisper-vibes' in-app
+    working CUDA runtime, download the cuBLAS/cuDNN/cuda_runtime DLL bundle
+    and extract it flat into install_dir() (same directory as `target`) —
+    config._cuda_dll_search_dirs() already searches the frozen binary's own
+    directory, so the DLLs are auto-discovered on the next start with no
+    further wiring needed. This is *not* a binary swap: `target` itself never
+    changes, only the DLLs sitting next to it. Mirrors whisper-vibes' in-app
     `download_and_install_gpu_backend` (apps/desktop/src-tauri/src/lib.rs):
-    same env-var override for local testing, same atomic-rename swap,
-    same fallback-to-current-binary-on-failure. Reuses config.CUDA_AVAILABLE/
-    CUDA_RUNTIME_OK directly — the same signal already used by GET /v1/config,
-    not a reimplementation."""
+    same env-var override for local testing, same fallback-to-CPU-on-failure.
+    Reuses config.CUDA_AVAILABLE/CUDA_RUNTIME_OK directly — the same signal
+    already used by GET /v1/config, not a reimplementation.
+
+    Downloads via `curl` and extracts via `tar` (Windows' bundled tar.exe is
+    bsdtar/libarchive, which extracts .zip directly) rather than
+    urllib/zipfile — both tools have shipped built into Windows since the
+    2018 update, so this needs no new Python dependency and no custom
+    HTTP/zip-handling code to maintain."""
     if not (config.CUDA_AVAILABLE and not config.CUDA_RUNTIME_OK):
         return target  # No GPU, or GPU already has a working runtime — nothing to do.
 
     url = _gpu_asset_url(_current_version())
     if not url:
-        print(f"NVIDIA GPU detected, but no GPU-accelerated build is published for {platform.system()} yet — staying on CPU.")
+        print(f"NVIDIA GPU detected, but no CUDA runtime bundle is published for {platform.system()} yet — staying on CPU.")
         return target
 
-    print(f"NVIDIA GPU detected without a working CUDA runtime — downloading the GPU-accelerated build from {url} ...")
-    tmp_path = target.with_name(target.name + ".gpu-download")
+    print(f"NVIDIA GPU detected without a working CUDA runtime — downloading the runtime bundle from {url} ...")
+    dest_dir = target.parent
+    tmp_zip = dest_dir / f"{target.name}.cuda-runtime.zip"
     try:
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            expected = resp.headers.get("Content-Length")
-            with open(tmp_path, "wb") as f:
-                shutil.copyfileobj(resp, f)
-        if expected and tmp_path.stat().st_size != int(expected):
-            raise IOError(f"Downloaded size {tmp_path.stat().st_size} != expected {expected}")
-        if platform.system() != "Windows":
-            tmp_path.chmod(tmp_path.stat().st_mode | 0o111)
-        os.replace(tmp_path, target)
-        print(f"Swapped in the GPU-accelerated build at {target}.")
+        subprocess.run(["curl", "-fsSL", "-o", str(tmp_zip), url], check=True, timeout=120)
+        subprocess.run(["tar", "-xf", str(tmp_zip), "-C", str(dest_dir)], check=True, timeout=60)
+        print(f"CUDA runtime installed alongside {target}.")
     except Exception as exc:
-        print(f"GPU build download/swap failed ({exc}) — staying on the current (CPU) build.")
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        print(f"CUDA runtime download/extract failed ({exc}) — staying on CPU.")
+    finally:
+        tmp_zip.unlink(missing_ok=True)
     return target
 
 
