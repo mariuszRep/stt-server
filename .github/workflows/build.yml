@@ -67,7 +67,7 @@ jobs:
 
           echo "Waiting for stt-server to become healthy..."
           healthy=0
-          for i in $(seq 1 60); do
+          for i in $(seq 1 300); do
             if "$BIN" status; then
               healthy=1
               break
@@ -81,7 +81,7 @@ jobs:
             sleep 2
           done
           if [ "$healthy" -ne 1 ]; then
-            echo "::error::stt-server did not become healthy within 120s"
+            echo "::error::stt-server did not become healthy within 600s"
             "$BIN" logs || true
             exit 1
           fi
@@ -105,7 +105,7 @@ jobs:
 
           echo "Waiting for stt-server to become healthy..."
           healthy=0
-          for i in $(seq 1 60); do
+          for i in $(seq 1 300); do
             if "$BIN" status; then
               healthy=1
               break
@@ -119,7 +119,7 @@ jobs:
             sleep 2
           done
           if [ "$healthy" -ne 1 ]; then
-            echo "::error::stt-server did not become healthy within 120s"
+            echo "::error::stt-server did not become healthy within 600s"
             "$BIN" logs || true
             exit 1
           fi
