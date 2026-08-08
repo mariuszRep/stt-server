@@ -146,7 +146,7 @@ jobs:
         if: matrix.platform == 'windows'
         shell: bash
         run: |
-          venv_win\Scripts\python.exe - <<'PY'
+          venv_win/Scripts/python.exe - <<'PY'
           import os
           import shutil
           import zipfile
