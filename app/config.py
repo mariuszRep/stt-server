@@ -139,6 +139,28 @@ VAD_FILTER = os.environ.get("VOICE_TYPER_VAD_FILTER", "1") not in ("0", "false",
 AUTH_TOKEN = os.environ.get("VOICE_TYPER_AUTH_TOKEN") or None
 
 
+# RAM thresholds are a starting-point heuristic, not tuned against real benchmarks — easy to
+# adjust here in one place since callers (the `detect` CLI command, and potentially `install`
+# later) only ever see the resulting model id, never these thresholds directly.
+_RAM_MODEL_TIERS = (
+    (4096, "Systran/faster-whisper-tiny"),
+    (8192, "Systran/faster-whisper-base"),
+    (16384, "Systran/faster-whisper-small"),
+    (32768, "Systran/faster-whisper-medium"),
+)
+
+
+def recommend_model(total_ram_mb: int | None, cuda_available: bool, cuda_runtime_ok: bool) -> str:
+    if cuda_available and cuda_runtime_ok:
+        return "Systran/faster-whisper-large-v3"
+    if total_ram_mb is None:
+        return MODEL
+    for threshold, model in _RAM_MODEL_TIERS:
+        if total_ram_mb < threshold:
+            return model
+    return "Systran/faster-whisper-medium"
+
+
 def mark_cuda_fallback(error: Exception | str) -> None:
     global DEVICE, DEVICE_SOURCE, COMPUTE_TYPE, CUDA_RUNTIME_OK, CUDA_ERROR
 

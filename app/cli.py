@@ -294,14 +294,18 @@ def cmd_detect(args) -> int:
     # whether/how to start the actual server. GPU fields are already computed as a
     # side effect of `from app import config` above (config.py's module-level
     # CUDA_AVAILABLE/CUDA_RUNTIME_OK detection), not recomputed here.
+    total_ram_mb = _total_ram_mb()
     info = {
         "cuda_available": config.CUDA_AVAILABLE,
         "cuda_runtime_ok": config.CUDA_RUNTIME_OK,
         "cuda_error": config.CUDA_ERROR,
         "cuda_supported_compute_types": config.CUDA_SUPPORTED_COMPUTE_TYPES,
         "cpu_count": os.cpu_count(),
-        "total_ram_mb": _total_ram_mb(),
+        "total_ram_mb": total_ram_mb,
         "platform": platform.system().lower(),
+        "recommended_model": config.recommend_model(
+            total_ram_mb, config.CUDA_AVAILABLE, config.CUDA_RUNTIME_OK
+        ),
     }
     print(json.dumps(info))
     return 0

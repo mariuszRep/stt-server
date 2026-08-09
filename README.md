@@ -51,7 +51,7 @@ The packaged binary (or `python run_sidecar.py`) is a CLI with these subcommands
 | `stop` | Stop the running server — tries a clean shutdown via `POST /v1/admin/stop` first, falls back to a direct kill. |
 | `status` | Report whether the server is running and responding to `/health`. |
 | `logs [-n N]` | Print the last `N` lines (default 200; `0` = all) of the server's log file. |
-| `detect` | Print GPU/CPU/RAM facts as one JSON line and exit — does **not** start the server. GPU fields (`cuda_available`, `cuda_runtime_ok`, `cuda_error`, `cuda_supported_compute_types`) are the same signals `GET /v1/config` reports, just available before any server is running (useful for a caller — e.g. a desktop app's onboarding — deciding what to start with, before starting anything). Also reports `cpu_count` and `total_ram_mb` for model-size recommendations. |
+| `detect` | Print GPU/CPU/RAM facts as one JSON line and exit — does **not** start the server. GPU fields (`cuda_available`, `cuda_runtime_ok`, `cuda_error`, `cuda_supported_compute_types`) are the same signals `GET /v1/config` reports, just available before any server is running (useful for a caller — e.g. a desktop app's onboarding — deciding what to start with, before starting anything). Also reports `cpu_count`, `total_ram_mb`, and `recommended_model` — a suggested model id for this machine (GPU-capable → `large-v3`; otherwise tiered by RAM), computed once here so any caller (CLI or GUI) gets the same recommendation. |
 
 `install`'s startup registration is best-effort: if Task Scheduler/systemd-user-session access is unavailable (locked-down environments, some CI/sandboxes), it logs that and still starts the server for the current session — only auto-start-at-login is affected.
 
