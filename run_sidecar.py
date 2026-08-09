@@ -31,6 +31,12 @@ def main() -> int:
     logs_p.add_argument("-n", "--lines", type=int, default=200, help="Number of trailing lines (0 = all).")
     logs_p.set_defaults(func=cli.cmd_logs)
 
+    detect_p = sub.add_parser(
+        "detect",
+        help="Print GPU/CPU/RAM facts as JSON and exit — does not start the server.",
+    )
+    detect_p.set_defaults(func=cli.cmd_detect)
+
     args = parser.parse_args()
 
     # No subcommand: today's original, argument-free behavior — this is the

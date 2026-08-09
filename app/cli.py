@@ -5,6 +5,7 @@ zero-argument invocation — Tauri's sidecar spawn (whisper-vibes,
 apps/desktop/src-tauri) passes no CLI args, so it is unaffected by
 everything else in this module.
 """
+import ctypes
 import json
 import os
 import platform
@@ -255,6 +256,54 @@ def cmd_logs(args) -> int:
     lines = log_path.read_text(errors="replace").splitlines()
     tail = lines[-args.lines:] if args.lines else lines
     print("\n".join(tail))
+    return 0
+
+
+def _total_ram_mb() -> int | None:
+    try:
+        if platform.system() == "Windows":
+            class _MemoryStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = _MemoryStatusEx()
+            stat.dwLength = ctypes.sizeof(_MemoryStatusEx)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):  # type: ignore[attr-defined]
+                return None
+            return int(stat.ullTotalPhys / (1024 * 1024))
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        return None
+    return None
+
+
+def cmd_detect(args) -> int:
+    # Fast, no-server-start hardware/capability probe — safe to call before deciding
+    # whether/how to start the actual server. GPU fields are already computed as a
+    # side effect of `from app import config` above (config.py's module-level
+    # CUDA_AVAILABLE/CUDA_RUNTIME_OK detection), not recomputed here.
+    info = {
+        "cuda_available": config.CUDA_AVAILABLE,
+        "cuda_runtime_ok": config.CUDA_RUNTIME_OK,
+        "cuda_error": config.CUDA_ERROR,
+        "cuda_supported_compute_types": config.CUDA_SUPPORTED_COMPUTE_TYPES,
+        "cpu_count": os.cpu_count(),
+        "total_ram_mb": _total_ram_mb(),
+        "platform": platform.system().lower(),
+    }
+    print(json.dumps(info))
     return 0
 
 
