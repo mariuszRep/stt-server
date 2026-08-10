@@ -1,0 +1,34 @@
+# CONVENTIONS.md — STT Server
+
+## Scope
+
+Applies to `/home/mariusz/projects/voice-typer/stt-server`.
+
+## Architecture
+
+- Rust remains the server and CLI implementation direction.
+- The server is a local provider-management control plane.
+- Managed provider runtimes perform inference and expose the versioned local provider protocol.
+- The server returns runtime connection descriptors; it does not proxy transcription.
+
+## Required APIs
+
+- Hardware and health discovery.
+- Provider catalog, installation, update, removal, status, and runtime descriptor APIs.
+- Model catalog, download/progress, verification, selection, removal, and compatibility APIs.
+- Recommendations based on detected hardware and installed runtimes.
+
+## Required Conventions
+
+- Loopback is default; remote binding is explicit and authenticated.
+- Provider/model identifiers are validated, not raw paths.
+- Install/update/remove operations are observable and recover safely from partial failure.
+- Runtime descriptors include provider identity, status, protocol/version, transport, endpoint, and capabilities.
+- Validate managed runtimes against the published local provider protocol.
+
+## Forbidden
+
+- No normal batch-transcription endpoint, realtime transcription WebSocket, audio buffer, audio transcoder, or inference adapter in the server data path.
+- No cloud provider API adapter in the server.
+- No invisible model download during inference.
+- No direct application coupling; the server API is usable independently.
