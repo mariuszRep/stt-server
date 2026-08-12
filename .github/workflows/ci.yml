@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# No App or SDK checkout anywhere in this workflow — stt-server builds and
+# tests entirely from its own repository, per CONVENTIONS.md ("never import
+# SDK source by repository-relative path") and the goal's acceptance
+# criteria ("Clean Server CI builds/tests without App or SDK checkouts").
+jobs:
+  rust:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace
+
+      # Unit/integration tests that spawn the real vendored faster-whisper
+      # runtime (crates/runtime/tests/faster_whisper_integration.rs) need its
+      # Python dependencies installed first; every other test runs regardless.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install managed-runtime Python dependencies
+        working-directory: runtimes/faster-whisper
+        run: |
+          python -m venv venv
+          ${{ matrix.os == 'windows-latest' && 'venv\Scripts\pip' || 'venv/bin/pip' }} install -r requirements.txt
+
+      - name: Add managed-runtime venv to PATH
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            echo "$GITHUB_WORKSPACE/runtimes/faster-whisper/venv/Scripts" >> "$GITHUB_PATH"
+          else
+            echo "$GITHUB_WORKSPACE/runtimes/faster-whisper/venv/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Smoke test
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cargo build --release --bin stt
+          chmod +x smoke-test.sh
+          ./smoke-test.sh target/release/stt
+
+      # Assert no batch/realtime transcription route or WebSocket upgrade
+      # ever reappears on the control plane — cheap regression guard on top
+      # of tests/auth.rs's structural assertions.
+      - name: Data-path regression guard
+        shell: bash
+        run: |
+          if grep -RIn "extract::ws" crates/server/src crates/runtime/src; then
+            echo "::error::found a WebSocket extractor reference in the control plane — audio must never cross stt-server"
+            exit 1
+          fi

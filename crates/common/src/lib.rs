@@ -1,7 +1,7 @@
-mod types;
-mod errors;
 mod config;
+mod errors;
+mod types;
 
-pub use types::*;
-pub use errors::*;
 pub use config::*;
+pub use errors::*;
+pub use types::*;

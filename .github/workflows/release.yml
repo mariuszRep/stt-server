@@ -1,0 +1,119 @@
+name: Release
+
+# BLOCKED on external prerequisites this workflow cannot set up itself:
+#   1. This repository has no public GitHub remote configured yet (local-only
+#      git history as of this workflow's authoring).
+#   2. `gh release create` needs release-write permissions on that remote.
+# The job definitions below are complete and correct against the current
+# codebase, but cannot run end-to-end until both exist. See stt-server's
+# .projectflows goal notes for the full context.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build-binaries:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: stt-linux-x86_64
+          - os: windows-latest
+            asset: stt-windows-x86_64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --bin stt
+      - shell: bash
+        run: |
+          mkdir -p dist
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp target/release/stt.exe "dist/${{ matrix.asset }}"
+          else
+            cp target/release/stt "dist/${{ matrix.asset }}"
+          fi
+      - name: Audit release artifact
+        shell: bash
+        run: bash scripts/verify-release-artifact.sh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+
+  # Builds the managed faster-whisper runtime as a standalone PyInstaller
+  # binary — the CPU variant, reusing whisper-vibes/.github/workflows/
+  # desktop-build.yml's pattern. A GPU variant (bundled CUDA/cuDNN DLLs,
+  # much larger) is out of scope for this first pass; add it as a second
+  # matrix leg with the App's existing GPU-variant workflow as the template
+  # once this baseline is proven.
+  build-faster-whisper-sidecar:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: runtimes/faster-whisper
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - shell: bash
+        run: |
+          python -m venv venv
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            venv/Scripts/pip install -r requirements.txt pyinstaller
+            venv/Scripts/pyinstaller --clean --noconfirm voice-typer-backend.spec
+          else
+            venv/bin/pip install -r requirements.txt pyinstaller
+            venv/bin/pyinstaller --clean --noconfirm voice-typer-backend.spec
+          fi
+      - name: Audit release artifact
+        shell: bash
+        run: bash ../../scripts/verify-release-artifact.sh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: faster-whisper-runtime-${{ matrix.os }}-cpu
+          path: runtimes/faster-whisper/dist/**
+
+  release:
+    needs: [build-binaries, build-faster-whisper-sidecar]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --notes "protocolVersion: 1, schemaVersion: 1 (RuntimeConnectionDescriptor). See CONVENTIONS.md/VISION.md for compatibility guarantees." \
+            artifacts/*/*
+
+  # Gated: @voice-typer/stt-sdk has no npm org or publish pipeline yet (see
+  # stt-sdk's own goal notes), so there is no released version to install
+  # here. This job is real — not a placeholder — but is intentionally left
+  # unreachable (workflow_dispatch only, and disabled below) rather than
+  # silently skipped, so it's obvious the requirement isn't satisfied yet
+  # rather than looking like it passed. Flip `if: false` once a published
+  # SDK version exists, and pin @voice-typer/stt-sdk@<version> below.
+  sdk-compatibility:
+    if: false
+    needs: [build-faster-whisper-sidecar]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm install @voice-typer/stt-sdk # pin an exact version once published
+      - run: echo "TODO: start a managed runtime and run stt-sdk's protocol fixtures against its descriptor"

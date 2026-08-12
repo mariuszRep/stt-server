@@ -1,29 +1,6 @@
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
-// ── Model Types ──────────────────────────────────────────────
-
-/// Unique identifier for a loaded model instance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ModelId(pub Uuid);
-
-impl ModelId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-}
-
-impl Default for ModelId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl std::fmt::Display for ModelId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+// ── Model Identity ───────────────────────────────────────────
 
 /// Model identifier (safe, validated string).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -34,7 +11,9 @@ impl ModelIdentifier {
     pub fn new(id: impl Into<String>) -> Result<Self, crate::SttError> {
         let id = id.into();
         if id.is_empty() {
-            return Err(crate::SttError::InvalidModelId("model ID cannot be empty".into()));
+            return Err(crate::SttError::InvalidModelId(
+                "model ID cannot be empty".into(),
+            ));
         }
         if id.len() > 256 {
             return Err(crate::SttError::InvalidModelId("model ID too long".into()));
@@ -65,17 +44,6 @@ impl AsRef<str> for ModelIdentifier {
     }
 }
 
-/// Information about a model (available or loaded).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelInfo {
-    pub id: ModelIdentifier,
-    pub name: String,
-    pub language: Option<String>,
-    pub size_bytes: Option<u64>,
-    pub loaded: bool,
-    pub model_id: Option<ModelId>,
-}
-
 /// Model verification result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelVerification {
@@ -84,182 +52,56 @@ pub struct ModelVerification {
     pub error: Option<String>,
 }
 
-// ── Audio Types ──────────────────────────────────────────────
+// ── Runtime Connection Descriptor ───────────────────────────────
+//
+// Mirrors `@voice-typer/stt-sdk`'s `RuntimeConnectionDescriptor` (see
+// stt-sdk/src/types.ts) field-for-field. This is the sole handoff contract
+// between the control plane and SDK clients: the server never proxies
+// transcription traffic itself, it only issues descriptors that tell a
+// client how to reach a runtime it has started.
 
-/// Audio format for batch transcription input.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AudioFormat {
-    WavPcm,
+/// Schema version of [`RuntimeConnectionDescriptor`]. Must match
+/// `RUNTIME_DESCRIPTOR_SCHEMA_VERSION` in `@voice-typer/stt-sdk`.
+pub const RUNTIME_DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
+
+/// Mirrors the `streaming` block of a managed runtime's `GET /v1/config` response.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamingCapability {
+    pub enabled: bool,
+    pub endpoint: String,
+    pub protocol_version: u32,
+    pub encodings: Vec<String>,
+    pub sample_rates: Vec<u32>,
+    pub resample: bool,
+    pub channels: Vec<u16>,
 }
 
-/// Sample format for realtime PCM input.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SampleFormat {
-    Signed16BitLittleEndian,
+/// Auth material a client must present to the managed runtime, if any.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DescriptorAuth {
+    #[serde(rename = "type")]
+    pub auth_type: String,
+    pub value: String,
 }
 
-/// Audio buffer for batch transcription.
-#[derive(Debug, Clone)]
-pub struct AudioBuffer {
-    pub samples: Vec<f32>,
-    pub sample_rate: u32,
-    pub channels: u16,
-    pub format: AudioFormat,
-}
-
-impl AudioBuffer {
-    /// Create from raw WAV bytes (PCM s16le).
-    pub fn from_wav_bytes(data: &[u8]) -> Result<Self, crate::SttError> {
-        let mut reader = hound::WavReader::new(std::io::Cursor::new(data))
-            .map_err(|e| crate::SttError::AudioError(format!("failed to parse WAV: {e}")))?;
-
-        let spec = reader.spec();
-        if spec.channels != 1 {
-            return Err(crate::SttError::AudioError(format!(
-                "expected mono audio, got {} channels",
-                spec.channels
-            )));
-        }
-        if spec.sample_rate != 16000 {
-            return Err(crate::SttError::AudioError(format!(
-                "expected 16kHz sample rate, got {}",
-                spec.sample_rate
-            )));
-        }
-        if spec.sample_format != hound::SampleFormat::Int {
-            return Err(crate::SttError::AudioError(
-                "expected integer sample format".into(),
-            ));
-        }
-        if spec.bits_per_sample != 16 {
-            return Err(crate::SttError::AudioError(format!(
-                "expected 16-bit samples, got {}-bit",
-                spec.bits_per_sample
-            )));
-        }
-
-        let samples: Vec<f32> = reader
-            .samples::<i16>()
-            .map(|s| s.map(|v| v as f32 / 32768.0))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| crate::SttError::AudioError(format!("failed to read samples: {e}")))?;
-
-        Ok(Self {
-            samples,
-            sample_rate: spec.sample_rate,
-            channels: spec.channels,
-            format: AudioFormat::WavPcm,
-        })
-    }
-
-    /// Duration in seconds.
-    pub fn duration_secs(&self) -> f64 {
-        self.samples.len() as f64 / self.sample_rate as f64
-    }
-}
-
-// ── Transcription Types ──────────────────────────────────────
-
-/// Request for batch transcription.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TranscriptionRequest {
-    pub model: Option<ModelIdentifier>,
-    pub language: Option<String>,
-    pub prompt: Option<String>,
-    pub temperature: Option<f32>,
-}
-
-/// A segment of transcribed text with timing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TranscriptionSegment {
-    pub text: String,
-    pub start_ms: i64,
-    pub end_ms: i64,
-    pub probability: f32,
-}
-
-/// Result of a batch transcription.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TranscriptionResult {
-    pub id: String,
-    pub text: String,
-    pub language: String,
-    pub duration_secs: f64,
-    pub segments: Vec<TranscriptionSegment>,
-}
-
-// ── Realtime Types ───────────────────────────────────────────
-
-/// Session identifier for realtime transcription.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SessionId(pub Uuid);
-
-impl SessionId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-}
-
-impl Default for SessionId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl std::fmt::Display for SessionId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Configuration for a realtime transcription session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RealtimeConfig {
-    pub model: Option<ModelIdentifier>,
-    pub language: Option<String>,
-    pub sample_rate: u32,
-    pub channels: u16,
-    pub sample_format: SampleFormat,
-}
-
-/// A partial transcription result (intermediate).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PartialResult {
-    pub text: String,
-    pub is_final: bool,
-}
-
-/// Messages sent from client to server over WebSocket.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum RealtimeClientMessage {
-    #[serde(rename = "start")]
-    Start { config: RealtimeConfig },
-    #[serde(rename = "binary")]
-    Binary { data: Vec<u8> },
-    #[serde(rename = "complete")]
-    Complete,
-    #[serde(rename = "cancel")]
-    Cancel,
-}
-
-/// Messages sent from server to client over WebSocket.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum RealtimeServerMessage {
-    #[serde(rename = "started")]
-    Started { session_id: SessionId },
-    #[serde(rename = "partial")]
-    Partial { text: String },
-    #[serde(rename = "final")]
-    Final {
-        text: String,
-        segments: Vec<TranscriptionSegment>,
-    },
-    #[serde(rename = "completed")]
-    Completed { session_id: SessionId },
-    #[serde(rename = "error")]
-    Error { code: String, message: String },
+/// Versioned connection descriptor for a local runtime, issued by `stt-server`.
+///
+/// The SDK accepts these descriptors; `stt-server` never proxies audio or
+/// implements a provider client itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeConnectionDescriptor {
+    pub schema_version: u32,
+    pub provider: String,
+    pub protocol: String,
+    pub transport: String,
+    pub base_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub streaming: Option<StreamingCapability>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth: Option<DescriptorAuth>,
 }
 
 // ── Health Types ─────────────────────────────────────────────
@@ -276,4 +118,79 @@ pub struct HealthResponse {
 pub struct ReadinessResponse {
     pub ready: bool,
     pub reason: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact JSON shape `stt-sdk`'s `createProvider()` requires: strict
+    /// literal checks on `schemaVersion`/`protocol`/`provider`, camelCase
+    /// field names, and only `streaming.endpoint` consumed today. Any drift
+    /// here breaks SDK consumers silently, so this is pinned to a literal
+    /// fixture rather than just round-tripped.
+    #[test]
+    fn runtime_connection_descriptor_matches_sdk_contract() {
+        let descriptor = RuntimeConnectionDescriptor {
+            schema_version: RUNTIME_DESCRIPTOR_SCHEMA_VERSION,
+            provider: "faster-whisper".to_string(),
+            protocol: "voice-typer-v1".to_string(),
+            transport: "http".to_string(),
+            base_url: "http://127.0.0.1:51234".to_string(),
+            streaming: Some(StreamingCapability {
+                enabled: true,
+                endpoint: "/v1/audio/stream".to_string(),
+                protocol_version: 1,
+                encodings: vec!["pcm_s16le".to_string()],
+                sample_rates: vec![16000, 44100, 48000],
+                resample: true,
+                channels: vec![1],
+            }),
+            auth: Some(DescriptorAuth {
+                auth_type: "token".to_string(),
+                value: "secret".to_string(),
+            }),
+        };
+
+        let json = serde_json::to_value(&descriptor).unwrap();
+        let expected = serde_json::json!({
+            "schemaVersion": 1,
+            "provider": "faster-whisper",
+            "protocol": "voice-typer-v1",
+            "transport": "http",
+            "baseUrl": "http://127.0.0.1:51234",
+            "streaming": {
+                "enabled": true,
+                "endpoint": "/v1/audio/stream",
+                "protocolVersion": 1,
+                "encodings": ["pcm_s16le"],
+                "sampleRates": [16000, 44100, 48000],
+                "resample": true,
+                "channels": [1]
+            },
+            "auth": { "type": "token", "value": "secret" }
+        });
+
+        assert_eq!(json, expected);
+
+        let round_tripped: RuntimeConnectionDescriptor = serde_json::from_value(json).unwrap();
+        assert_eq!(round_tripped, descriptor);
+    }
+
+    #[test]
+    fn runtime_connection_descriptor_omits_absent_optional_fields() {
+        let descriptor = RuntimeConnectionDescriptor {
+            schema_version: RUNTIME_DESCRIPTOR_SCHEMA_VERSION,
+            provider: "faster-whisper".to_string(),
+            protocol: "voice-typer-v1".to_string(),
+            transport: "http".to_string(),
+            base_url: "http://127.0.0.1:51234".to_string(),
+            streaming: None,
+            auth: None,
+        };
+
+        let json = serde_json::to_value(&descriptor).unwrap();
+        assert!(json.get("streaming").is_none());
+        assert!(json.get("auth").is_none());
+    }
 }

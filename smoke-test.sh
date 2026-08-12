@@ -1,73 +1,59 @@
 #!/usr/bin/env bash
-# Smoke test for stt-server
-# Starts the server, hits health endpoint, confirms 200
+# Smoke test for stt-server's control-plane API.
+# Starts `stt run`, hits the control-plane endpoints, confirms 200s.
+# This only exercises the control plane itself — it never starts a managed
+# runtime or touches transcription traffic, matching the "server never
+# carries audio" boundary the routes are supposed to enforce.
 
 set -euo pipefail
 
 PORT="${PORT:-8080}"
 HOST="${HOST:-127.0.0.1}"
-SERVER_BIN="${1:-target/release/stt-server}"
+STT_BIN="${1:-target/release/stt}"
 
-if [ ! -f "$SERVER_BIN" ]; then
-    echo "ERROR: Server binary not found at $SERVER_BIN"
+if [ ! -f "$STT_BIN" ]; then
+    echo "ERROR: stt binary not found at $STT_BIN"
     echo "Build with: cargo build --release"
     exit 1
 fi
 
 echo "Starting stt-server on $HOST:$PORT..."
-$SERVER_BIN --host "$HOST" --port "$PORT" &
+"$STT_BIN" run --host "$HOST" --port "$PORT" &
 SERVER_PID=$!
+trap 'kill $SERVER_PID 2>/dev/null || true; wait $SERVER_PID 2>/dev/null || true' EXIT
 
 # Wait for server to start
 sleep 2
 
-# Hit health endpoint
+check() {
+    local path="$1"
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" "http://$HOST:$PORT$path" || echo "000")
+    if [ "$http_code" = "200" ]; then
+        echo "PASS: $path returned 200"
+    else
+        echo "FAIL: $path returned $http_code (expected 200)"
+        exit 1
+    fi
+}
+
 echo "Testing /v1/health..."
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://$HOST:$PORT/v1/health" || echo "000")
+check "/v1/health"
 
-if [ "$HTTP_CODE" = "200" ]; then
-    echo "PASS: /v1/health returned 200"
-    HEALTH_BODY=$(curl -s "http://$HOST:$PORT/v1/health")
-    echo "Response: $HEALTH_BODY"
-else
-    echo "FAIL: /v1/health returned $HTTP_CODE (expected 200)"
-    kill $SERVER_PID 2>/dev/null || true
-    exit 1
-fi
-
-# Hit readiness endpoint
 echo "Testing /v1/readiness..."
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://$HOST:$PORT/v1/readiness" || echo "000")
+check "/v1/readiness"
 
-if [ "$HTTP_CODE" = "200" ]; then
-    echo "PASS: /v1/readiness returned 200"
-    READINESS_BODY=$(curl -s "http://$HOST:$PORT/v1/readiness")
-    echo "Response: $READINESS_BODY"
-else
-    echo "FAIL: /v1/readiness returned $HTTP_CODE (expected 200)"
-    kill $SERVER_PID 2>/dev/null || true
-    exit 1
-fi
+echo "Testing /v1/hardware..."
+check "/v1/hardware"
 
-# Hit models endpoint
+echo "Testing /v1/providers..."
+check "/v1/providers"
+
 echo "Testing /v1/models..."
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://$HOST:$PORT/v1/models" || echo "000")
+check "/v1/models"
 
-if [ "$HTTP_CODE" = "200" ]; then
-    echo "PASS: /v1/models returned 200"
-else
-    echo "FAIL: /v1/models returned $HTTP_CODE (expected 200)"
-    kill $SERVER_PID 2>/dev/null || true
-    exit 1
-fi
+echo "Testing /v1/recommendations..."
+check "/v1/recommendations"
 
-# Test non-loopback rejection (if we can bind to 0.0.0.0)
 echo ""
 echo "All smoke tests passed!"
-
-# Cleanup
-kill $SERVER_PID 2>/dev/null || true
-wait $SERVER_PID 2>/dev/null || true
-
-echo "Server stopped."
-exit 0

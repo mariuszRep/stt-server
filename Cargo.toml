@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "crates/common",
-    "crates/adapter",
+    "crates/runtime",
     "crates/server",
     "crates/cli",
 ]
@@ -43,9 +43,6 @@ clap = { version = "4", features = ["derive"] }
 # UUIDs
 uuid = { version = "1", features = ["v4"] }
 
-# Audio processing
-hound = "3.5"
-
 # Platform directories
 dirs = "5"
 
@@ -55,7 +52,7 @@ reqwest = { version = "0.12", features = ["json"] }
 
 # Shared crate
 stt-common = { path = "crates/common" }
-stt-adapter = { path = "crates/adapter" }
+stt-runtime = { path = "crates/runtime" }
 stt-server = { path = "crates/server" }
 
 [profile.release]

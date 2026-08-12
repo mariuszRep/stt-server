@@ -1,142 +1,59 @@
 use clap::{Parser, Subcommand};
-use stt_adapter::EngineAdapter;
 
+mod client;
+mod commands;
 mod run;
+
+use client::Client;
+use commands::{ModelCommands, ProviderCommands};
 
 #[derive(Parser)]
 #[command(name = "stt")]
-#[command(about = "stt-server CLI - Speech-to-Text server management")]
+#[command(about = "Local STT control plane")]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    /// Base URL of a running `stt run` daemon, used by subcommands that
+    /// need its live state (provider/runtime lifecycle, model selection).
+    #[arg(long, global = true, default_value = "http://127.0.0.1:8080")]
+    server_url: String,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the STT server
+    /// Run the control-plane server
     Run(run::RunArgs),
-    /// Manage models
+    /// Print detected local hardware capability
+    Hardware,
+    /// Provider catalog, install, and lifecycle
+    Provider {
+        #[command(subcommand)]
+        command: ProviderCommands,
+    },
+    /// Model catalog and per-provider selection
     Model {
         #[command(subcommand)]
         command: ModelCommands,
     },
-}
-
-#[derive(Subcommand)]
-enum ModelCommands {
-    /// Pull/download a model
-    Pull {
-        /// Model identifier to pull
-        model_id: String,
-        /// Optional output directory
-        #[arg(short, long)]
-        dir: Option<String>,
-    },
-    /// List available models
-    List {
-        /// Show only loaded models
-        #[arg(short, long)]
-        loaded: bool,
-    },
-    /// Remove a model
-    Remove {
-        /// Model identifier to remove
-        model_id: String,
-    },
-    /// Select a loaded model as default
-    Select {
-        /// Model identifier to select
-        model_id: String,
-    },
-    /// Verify a model file
-    Verify {
-        /// Path to model file
-        path: String,
-    },
+    /// Print the recommended provider/model/device for this machine
+    Recommend,
+    /// Print a running provider's connection descriptor
+    Descriptor { provider_id: String },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let client = Client::new(cli.server_url);
 
     match cli.command {
         Commands::Run(args) => run::execute(args).await,
-        Commands::Model { command } => match command {
-            ModelCommands::Pull { model_id, dir } => {
-                model_pull(&model_id, dir.as_deref()).await
-            }
-            ModelCommands::List { loaded } => model_list(loaded).await,
-            ModelCommands::Remove { model_id } => model_remove(&model_id).await,
-            ModelCommands::Select { model_id } => model_select(&model_id).await,
-            ModelCommands::Verify { path } => model_verify(&path).await,
-        },
+        Commands::Hardware => commands::hardware(),
+        Commands::Provider { command } => commands::provider(&client, command).await,
+        Commands::Model { command } => commands::model(&client, command).await,
+        Commands::Recommend => commands::recommend(),
+        Commands::Descriptor { provider_id } => commands::descriptor(&client, &provider_id).await,
     }
-}
-
-async fn model_pull(model_id: &str, _dir: Option<&str>) -> anyhow::Result<()> {
-    println!("Pulling model: {model_id}");
-    println!("Note: Model download not yet implemented. Place model files in the model directory.");
-    Ok(())
-}
-
-async fn model_list(loaded_only: bool) -> anyhow::Result<()> {
-    let adapter = stt_adapter::mock::MockAdapter::new();
-    let models = adapter.list_models().await?;
-
-    if models.is_empty() {
-        println!("No models registered.");
-        return Ok(());
-    }
-
-    for model in &models {
-        if loaded_only && !model.loaded {
-            continue;
-        }
-        let status = if model.loaded { "loaded" } else { "available" };
-        println!(
-            "  {} [{}] {} - {}",
-            model.id,
-            status,
-            model.name,
-            model
-                .size_bytes
-                .map(|s| format!("{} bytes", s))
-                .unwrap_or_else(|| "unknown size".into())
-        );
-    }
-
-    Ok(())
-}
-
-async fn model_remove(model_id: &str) -> anyhow::Result<()> {
-    println!("Removing model: {model_id}");
-    println!("Note: Model removal from disk not yet implemented.");
-    Ok(())
-}
-
-async fn model_select(model_id: &str) -> anyhow::Result<()> {
-    println!("Selecting model: {model_id}");
-    println!("Note: Model selection not yet implemented for standalone CLI.");
-    Ok(())
-}
-
-async fn model_verify(path: &str) -> anyhow::Result<()> {
-    let path = std::path::Path::new(path);
-    let adapter = stt_adapter::mock::MockAdapter::new();
-    let result = adapter.verify_model(path).await?;
-
-    if result.valid {
-        println!("Model is valid.");
-        if let Some(checksum) = &result.checksum {
-            println!("Checksum: {checksum}");
-        }
-    } else {
-        println!(
-            "Model verification failed: {}",
-            result.error.unwrap_or_else(|| "unknown error".into())
-        );
-    }
-
-    Ok(())
 }
