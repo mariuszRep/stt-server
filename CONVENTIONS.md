@@ -24,7 +24,8 @@ Applies to `/home/mariusz/projects/voice-typer/stt-server`.
 - Provider/model identifiers are validated, not raw paths.
 - Install/update/remove operations are observable and recover safely from partial failure.
 - Runtime descriptors include provider identity, status, protocol/version, transport, endpoint, and capabilities.
-- Validate managed runtimes against the published local provider protocol.
+- Consume the published, versioned `stt-sdk` library for shared provider communication and contract validation where it prevents duplication; never import SDK source by repository-relative path.
+- Keep hardware detection, installation, model storage, and process supervision server-owned.
 
 ## Forbidden
 

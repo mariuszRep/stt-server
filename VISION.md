@@ -16,7 +16,7 @@
 
 ## Boundaries
 
-The server is a control plane. It does not own normal batch/realtime transcription APIs, audio processing, model inference, or an audio proxy. Those belong to a managed local provider runtime, which the SDK contacts directly.
+The server is a control plane. It does not own normal batch/realtime transcription APIs, audio processing, model inference, or an audio proxy. Those belong to a managed local provider runtime, which the SDK contacts directly. The server may consume the published SDK library for shared provider contracts and runtime validation, but never SDK source by repository path.
 
 ## Core Workflow
 
