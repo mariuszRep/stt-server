@@ -52,10 +52,23 @@ fn is_valid_runtime_dir(path: &Path) -> bool {
     path.join("run_sidecar.py").is_file() && path.join("app").join("main.py").is_file()
 }
 
-/// Resolve which Python interpreter to use: `python3` (Mac/Linux) first,
-/// falling back to `python` (common on Windows).
+/// `python -m venv` only creates `Scripts\python.exe` on Windows — no
+/// `python3.exe` — but always creates both `bin/python` and `bin/python3`
+/// on Unix. Trying the wrong name first can silently skip right past a
+/// PATH-prepended venv and fall through to an unrelated system
+/// interpreter without the venv's packages installed.
+fn python_candidates() -> [&'static str; 2] {
+    if cfg!(windows) {
+        ["python", "python3"]
+    } else {
+        ["python3", "python"]
+    }
+}
+
+/// Resolve which Python interpreter to use, preferring whichever name a
+/// `venv` on this platform actually provides (see [`python_candidates`]).
 fn resolve_python() -> Result<&'static str, RuntimeError> {
-    for candidate in ["python3", "python"] {
+    for candidate in python_candidates() {
         let found = StdCommand::new(candidate)
             .arg("--version")
             .output()
@@ -166,6 +179,16 @@ mod tests {
             "VOICE_TYPER_MODEL".to_string(),
             "Systran/faster-whisper-tiny".to_string()
         )));
+    }
+
+    #[test]
+    fn python_candidate_order_matches_what_a_stdlib_venv_actually_provides() {
+        let candidates = python_candidates();
+        if cfg!(windows) {
+            assert_eq!(candidates, ["python", "python3"]);
+        } else {
+            assert_eq!(candidates, ["python3", "python"]);
+        }
     }
 
     #[test]
