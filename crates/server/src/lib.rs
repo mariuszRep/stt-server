@@ -15,6 +15,7 @@ use axum::{
     routing::{delete, get, post},
     Router,
 };
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
@@ -60,8 +61,16 @@ pub fn build_router(state: state::AppState) -> Router {
         .route("/v1/hardware", get(routes::get_hardware))
         .route("/v1/providers", get(routes::list_providers))
         .route("/v1/providers/:id/install", post(routes::install_provider))
+        .route(
+            "/v1/providers/:id/install/:variant",
+            delete(routes::uninstall_provider_variant),
+        )
         .route("/v1/providers/:id/update", post(routes::update_provider))
         .route("/v1/providers/:id", delete(routes::uninstall_provider))
+        .route(
+            "/v1/install-operations/:operation_id",
+            get(routes::install_operation_status),
+        )
         .route("/v1/providers/:id/start", post(routes::start_provider))
         .route("/v1/providers/:id/stop", post(routes::stop_provider))
         .route("/v1/providers/:id/status", get(routes::provider_status))
@@ -83,6 +92,18 @@ pub fn build_router(state: state::AppState) -> Router {
         .route("/v1/recommendations", get(routes::recommendations))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .layer(TraceLayer::new_for_http())
+        // Outermost layer: browser clients (the App's dev/web build) call
+        // this control-plane API from a different origin/port than the one
+        // they're served from. Loopback-bound by default and no
+        // cookie/credential auth is used (Bearer tokens are sent explicitly
+        // by the caller), so an open CORS policy carries no more risk than
+        // any other local dev tool listening on loopback.
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
         .with_state(state)
 }
 

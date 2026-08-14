@@ -15,7 +15,9 @@
 
 use std::path::PathBuf;
 
-use stt_runtime::{providers::faster_whisper, ProviderId, RuntimeManager, RuntimeStatus};
+use stt_runtime::{
+    providers::faster_whisper, ProviderId, RuntimeManager, RuntimeStatus, StartOptions,
+};
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -108,14 +110,31 @@ async fn real_faster_whisper_runtime_starts_and_serves_health() {
         .await
         .unwrap();
 
+    let options = StartOptions {
+        device: Some("cpu".to_string()),
+        compute_type: Some("int8".to_string()),
+        ..StartOptions::default()
+    };
     let descriptor = manager
-        .start(&id)
+        .start(&id, &options)
         .await
         .expect("real faster-whisper runtime should become healthy");
 
     assert_eq!(descriptor.provider, "faster-whisper");
     assert_eq!(descriptor.protocol, "voice-typer-v1");
     assert_eq!(manager.status(&id).await, RuntimeStatus::Running);
+
+    // Proves the streaming-descriptor fix end-to-end against the real
+    // runtime (not just the fake test double in manager.rs's unit tests):
+    // the vendored Python backend's own GET /v1/config already returns this
+    // block, so a non-null value here confirms stt-server actually fetches
+    // and forwards it now.
+    let streaming = descriptor
+        .streaming
+        .as_ref()
+        .expect("real runtime should advertise streaming capability");
+    assert_eq!(streaming.endpoint, "/v1/audio/stream");
+    assert!(streaming.enabled);
 
     // start() already blocked on GET /health via the supervisor; re-confirm
     // directly against the descriptor's own base_url as an end-to-end check

@@ -10,16 +10,20 @@ pub type ApiError = (StatusCode, Json<ErrorResponse>);
 /// `stt-runtime`) to a structured HTTP error response.
 pub fn runtime_error_response(err: RuntimeError) -> ApiError {
     let status = match &err {
-        RuntimeError::InvalidProviderId(_) | RuntimeError::ModelNotFound(_) => {
-            StatusCode::BAD_REQUEST
+        RuntimeError::InvalidProviderId(_)
+        | RuntimeError::ModelNotFound(_)
+        | RuntimeError::UnsupportedVariant(_)
+        | RuntimeError::InvalidStartOptions(_) => StatusCode::BAD_REQUEST,
+        RuntimeError::ProviderNotFound(_) | RuntimeError::InstallOperationNotFound(_) => {
+            StatusCode::NOT_FOUND
         }
-        RuntimeError::ProviderNotFound(_) => StatusCode::NOT_FOUND,
         RuntimeError::ProviderNotInstalled(_) | RuntimeError::RuntimeNotRunning(_) => {
             StatusCode::CONFLICT
         }
-        RuntimeError::RuntimeStartFailed(_) | RuntimeError::Io(_) | RuntimeError::Internal(_) => {
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
+        RuntimeError::RuntimeStartFailed(_)
+        | RuntimeError::Io(_)
+        | RuntimeError::DownloadFailed(_)
+        | RuntimeError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     let code = match &err {
         RuntimeError::InvalidProviderId(_) => "INVALID_PROVIDER_ID",
@@ -29,6 +33,10 @@ pub fn runtime_error_response(err: RuntimeError) -> ApiError {
         RuntimeError::RuntimeNotRunning(_) => "RUNTIME_NOT_RUNNING",
         RuntimeError::RuntimeStartFailed(_) => "RUNTIME_START_FAILED",
         RuntimeError::Io(_) => "IO_ERROR",
+        RuntimeError::DownloadFailed(_) => "DOWNLOAD_FAILED",
+        RuntimeError::UnsupportedVariant(_) => "UNSUPPORTED_VARIANT",
+        RuntimeError::InstallOperationNotFound(_) => "INSTALL_OPERATION_NOT_FOUND",
+        RuntimeError::InvalidStartOptions(_) => "INVALID_START_OPTIONS",
         RuntimeError::Internal(_) => "INTERNAL_ERROR",
     };
     (

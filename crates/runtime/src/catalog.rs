@@ -47,6 +47,74 @@ impl std::fmt::Display for ProviderId {
     }
 }
 
+/// A build flavor of a provider's managed runtime — same provider, same
+/// wire protocol, different binary (and, for `Gpu`, a much larger one with
+/// bundled CUDA/cuDNN). Not a plugin system: this project has one provider
+/// today with exactly two flavors, so a closed enum is the right amount of
+/// structure — not a registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeVariant {
+    Cpu,
+    Gpu,
+}
+
+impl RuntimeVariant {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Gpu => "gpu",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "cpu" => Some(Self::Cpu),
+            "gpu" => Some(Self::Gpu),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for RuntimeVariant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// A provider variant's availability on this machine, reported over the
+/// API so a caller can decide whether to offer/recommend installing it
+/// *before* asking for a (possibly large) download.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VariantInfo {
+    pub variant: String,
+    pub compatible: bool,
+    pub recommended: bool,
+    pub reason: Option<String>,
+}
+
+/// GPU is only ever compatible/recommended when an NVIDIA GPU was
+/// detected; CPU is always compatible and recommended only in the absence
+/// of one. Listed either way (never hidden) so a disabled option in a UI
+/// can still show *why* — consistent with "explicit, observable" installs.
+fn evaluate_variant(variant: RuntimeVariant, hardware: &HardwareReport) -> VariantInfo {
+    match variant {
+        RuntimeVariant::Cpu => VariantInfo {
+            variant: variant.as_str().to_string(),
+            compatible: true,
+            recommended: !hardware.has_nvidia_gpu,
+            reason: None,
+        },
+        RuntimeVariant::Gpu => VariantInfo {
+            variant: variant.as_str().to_string(),
+            compatible: hardware.has_nvidia_gpu,
+            recommended: hardware.has_nvidia_gpu,
+            reason: (!hardware.has_nvidia_gpu).then(|| "no NVIDIA GPU detected".to_string()),
+        },
+    }
+}
+
 /// A curated model choice for a provider. For faster-whisper specifically,
 /// this is just the HuggingFace model name the managed runtime is told to
 /// load (`VOICE_TYPER_MODEL`) — the runtime downloads/caches it itself on
@@ -71,6 +139,7 @@ pub struct CatalogEntry {
     pub health_path: &'static str,
     pub models: &'static [ModelEntry],
     pub default_model: &'static str,
+    pub variants: &'static [RuntimeVariant],
 }
 
 pub const CATALOG: &[CatalogEntry] = &[CatalogEntry {
@@ -80,6 +149,7 @@ pub const CATALOG: &[CatalogEntry] = &[CatalogEntry {
     transport: "http",
     health_path: "/health",
     default_model: "Systran/faster-whisper-small",
+    variants: &[RuntimeVariant::Cpu, RuntimeVariant::Gpu],
     models: &[
         ModelEntry {
             id: "Systran/faster-whisper-tiny",
@@ -115,6 +185,7 @@ pub struct ProviderInfo {
     pub transport: String,
     pub compatible: bool,
     pub compatibility_reason: Option<String>,
+    pub variants: Vec<VariantInfo>,
 }
 
 pub fn list_providers(hardware: &HardwareReport) -> Vec<ProviderInfo> {
@@ -129,6 +200,11 @@ pub fn list_providers(hardware: &HardwareReport) -> Vec<ProviderInfo> {
                 transport: entry.transport.to_string(),
                 compatible,
                 compatibility_reason: reason,
+                variants: entry
+                    .variants
+                    .iter()
+                    .map(|v| evaluate_variant(*v, hardware))
+                    .collect(),
             }
         })
         .collect()
@@ -181,5 +257,74 @@ mod tests {
     fn find_provider_returns_faster_whisper() {
         let id = ProviderId::new("faster-whisper").unwrap();
         assert_eq!(find_provider(&id).unwrap().id, "faster-whisper");
+    }
+
+    #[test]
+    fn gpu_variant_incompatible_without_nvidia_gpu() {
+        let hardware = HardwareReport {
+            has_nvidia_gpu: false,
+            gpu_name: None,
+            driver_version: None,
+            cpu_cores: 4,
+            total_ram_bytes: 0,
+        };
+        let info = evaluate_variant(RuntimeVariant::Gpu, &hardware);
+        assert!(!info.compatible);
+        assert!(!info.recommended);
+        assert!(info.reason.is_some());
+
+        let cpu_info = evaluate_variant(RuntimeVariant::Cpu, &hardware);
+        assert!(cpu_info.compatible);
+        assert!(
+            cpu_info.recommended,
+            "cpu should be recommended absent a GPU"
+        );
+    }
+
+    #[test]
+    fn gpu_variant_compatible_and_recommended_with_nvidia_gpu() {
+        let hardware = HardwareReport {
+            has_nvidia_gpu: true,
+            gpu_name: Some("Test GPU".to_string()),
+            driver_version: None,
+            cpu_cores: 4,
+            total_ram_bytes: 0,
+        };
+        let info = evaluate_variant(RuntimeVariant::Gpu, &hardware);
+        assert!(info.compatible);
+        assert!(info.recommended);
+        assert!(info.reason.is_none());
+
+        let cpu_info = evaluate_variant(RuntimeVariant::Cpu, &hardware);
+        assert!(cpu_info.compatible);
+        assert!(
+            !cpu_info.recommended,
+            "gpu should be recommended over cpu when present"
+        );
+    }
+
+    #[test]
+    fn runtime_variant_parse_round_trips_as_str() {
+        assert_eq!(RuntimeVariant::parse("cpu"), Some(RuntimeVariant::Cpu));
+        assert_eq!(RuntimeVariant::parse("gpu"), Some(RuntimeVariant::Gpu));
+        assert_eq!(RuntimeVariant::parse("bogus"), None);
+        assert_eq!(RuntimeVariant::Cpu.as_str(), "cpu");
+        assert_eq!(RuntimeVariant::Gpu.as_str(), "gpu");
+    }
+
+    #[test]
+    fn list_providers_includes_both_variants_for_faster_whisper() {
+        let hardware = HardwareReport {
+            has_nvidia_gpu: false,
+            gpu_name: None,
+            driver_version: None,
+            cpu_cores: 4,
+            total_ram_bytes: 0,
+        };
+        let providers = list_providers(&hardware);
+        let fw = providers.iter().find(|p| p.id == "faster-whisper").unwrap();
+        assert_eq!(fw.variants.len(), 2);
+        assert!(fw.variants.iter().any(|v| v.variant == "cpu"));
+        assert!(fw.variants.iter().any(|v| v.variant == "gpu"));
     }
 }

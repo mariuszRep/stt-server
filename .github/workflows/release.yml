@@ -44,19 +44,41 @@ jobs:
           path: dist/${{ matrix.asset }}
 
   # Builds the managed faster-whisper runtime as a standalone PyInstaller
-  # binary — the CPU variant, reusing whisper-vibes/.github/workflows/
-  # desktop-build.yml's pattern. A GPU variant (bundled CUDA/cuDNN DLLs,
-  # much larger) is out of scope for this first pass; add it as a second
-  # matrix leg with the App's existing GPU-variant workflow as the template
-  # once this baseline is proven.
+  # binary, reusing whisper-vibes/.github/workflows/desktop-build.yml's
+  # VOICE_TYPER_BUILD_VARIANT pattern. GPU (bundled CUDA/cuDNN DLLs, much
+  # larger) is Windows-only — CUDA acceleration only matters for the
+  # Windows Tauri consumer; the CPU variant covers Linux/dev use.
+  #
+  # PyInstaller's spec always names its output `voice-typer-backend[.exe]`
+  # regardless of variant, so without renaming, the cpu and gpu legs on the
+  # same OS would upload two files with an identical name and collide. Each
+  # leg renames its output to `stt-runtime`'s own
+  # `faster-whisper-runtime-{os}-{variant}{ext}` convention
+  # (`crates/runtime/src/providers/faster_whisper.rs::asset_name`) before
+  # upload, which is also the exact filename `download_variant` requests at
+  # install time — this naming is a contract between the two, not cosmetic.
   build-faster-whisper-sidecar:
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            os_slug: linux
+            variant: cpu
+            ext: ""
+          - os: windows-latest
+            os_slug: windows
+            variant: cpu
+            ext: ".exe"
+          - os: windows-latest
+            os_slug: windows
+            variant: gpu
+            ext: ".exe"
     runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: runtimes/faster-whisper
+    env:
+      VOICE_TYPER_BUILD_VARIANT: ${{ matrix.variant }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -72,13 +94,18 @@ jobs:
             venv/bin/pip install -r requirements.txt pyinstaller
             venv/bin/pyinstaller --clean --noconfirm voice-typer-backend.spec
           fi
+      - name: Rename to the faster-whisper-runtime-{os}-{variant} release-asset convention
+        shell: bash
+        run: |
+          mv "dist/voice-typer-backend${{ matrix.ext }}" \
+             "dist/faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}${{ matrix.ext }}"
       - name: Audit release artifact
         shell: bash
         run: bash ../../scripts/verify-release-artifact.sh dist
       - uses: actions/upload-artifact@v4
         with:
-          name: faster-whisper-runtime-${{ matrix.os }}-cpu
-          path: runtimes/faster-whisper/dist/**
+          name: faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}
+          path: runtimes/faster-whisper/dist/faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}${{ matrix.ext }}
 
   release:
     needs: [build-binaries, build-faster-whisper-sidecar]
@@ -116,4 +143,5 @@ jobs:
         with:
           node-version: "20"
       - run: npm install @voice-typer/stt-sdk # pin an exact version once published
-      - run: echo "TODO: start a managed runtime and run stt-sdk's protocol fixtures against its descriptor"
+      - run: |
+          echo "TODO: start a managed runtime and run stt-sdk's protocol fixtures against its descriptor"

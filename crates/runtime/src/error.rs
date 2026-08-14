@@ -24,6 +24,18 @@ pub enum RuntimeError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("download failed: {0}")]
+    DownloadFailed(String),
+
+    #[error("unsupported variant: {0}")]
+    UnsupportedVariant(String),
+
+    #[error("install operation not found: {0}")]
+    InstallOperationNotFound(String),
+
+    #[error("invalid start options: {0}")]
+    InvalidStartOptions(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 }

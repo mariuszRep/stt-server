@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use clap::Args;
 
-use stt_runtime::{providers::faster_whisper, ProviderId, RuntimeManager};
+use stt_runtime::{providers::faster_whisper, ProviderId, RuntimeManager, RuntimeVariant};
 
 #[derive(Args)]
 pub struct RunArgs {
@@ -76,19 +76,29 @@ pub async fn execute(args: RunArgs) -> anyhow::Result<()> {
     let runtime_manager = Arc::new(RuntimeManager::new(idle_timeout));
 
     // Best-effort: register whichever catalog providers are actually
-    // installed locally. A provider that isn't found yet doesn't block
-    // startup — it just isn't start-able until `POST /v1/providers/:id/install`
-    // (or the equivalent CLI command) succeeds.
+    // installed locally (dev source, or a previously-downloaded/cached
+    // variant). A provider that isn't found yet doesn't block startup — it
+    // just isn't start-able until `POST /v1/providers/:id/install` (or the
+    // equivalent CLI command) succeeds. `install_local` is network-free, so
+    // this never delays startup waiting on a download.
     let faster_whisper_id = ProviderId::new("faster-whisper")?;
-    match faster_whisper::install() {
-        Ok(launch) => {
+    let preferred_variant = if runtime_manager.hardware().has_nvidia_gpu {
+        RuntimeVariant::Gpu
+    } else {
+        RuntimeVariant::Cpu
+    };
+    match faster_whisper::install_local(preferred_variant) {
+        Some(launch) => {
             runtime_manager
                 .register_install(&faster_whisper_id, launch)
                 .await;
-            tracing::info!("faster-whisper runtime found and registered");
+            tracing::info!(variant = %preferred_variant, "faster-whisper runtime found and registered");
         }
-        Err(e) => {
-            tracing::warn!("faster-whisper runtime not available yet: {e}");
+        None => {
+            tracing::warn!(
+                "faster-whisper runtime not available locally yet (tried {preferred_variant} variant); \
+                 install it via `stt provider install faster-whisper` or `POST /v1/providers/faster-whisper/install`"
+            );
         }
     }
 

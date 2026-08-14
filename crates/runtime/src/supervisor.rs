@@ -21,6 +21,7 @@ use tokio::time::Instant;
 use tracing::warn;
 
 use crate::error::RuntimeError;
+use windows_job::InstanceJob;
 
 const LOG_TAIL_CAPACITY: usize = 200;
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -64,6 +65,12 @@ pub struct ManagedInstance {
     pub started_at: Instant,
     status: RuntimeStatus,
     log_tail: Arc<StdMutex<VecDeque<String>>>,
+    /// Windows-only, best-effort: a per-instance Job Object so `stop()` can
+    /// kill this process's entire subtree at once instead of just the
+    /// immediate child. `None` on non-Windows, or on Windows if arming it
+    /// failed (falls back to the pre-existing single-PID path). See
+    /// [`windows_job`].
+    job: Option<InstanceJob>,
 }
 
 impl ManagedInstance {
@@ -100,11 +107,21 @@ impl ManagedInstance {
     }
 
     /// Gracefully stop the managed process: SIGTERM (Unix) + grace window,
-    /// then force-kill. Windows has no SIGTERM equivalent reachable without
-    /// extra platform bindings, so it force-kills immediately — a
-    /// documented v1 gap, not a silent one.
+    /// then force-kill. On Windows, if a per-instance Job Object was
+    /// successfully armed at spawn time, terminate the whole job
+    /// immediately instead — there's no graceful-shutdown signal to wait
+    /// for on that platform anyway, and this also reaps any subprocess the
+    /// runtime itself spawned, not just the immediate child.
     pub async fn stop(&mut self) -> Result<(), RuntimeError> {
         self.status = RuntimeStatus::Stopping;
+
+        if let Some(job) = &self.job {
+            job.terminate();
+            let _ = self.child.wait().await;
+            self.status = RuntimeStatus::Stopped;
+            return Ok(());
+        }
+
         terminate(self.pid);
 
         let deadline = Instant::now() + STOP_GRACE_PERIOD;
@@ -139,18 +156,149 @@ fn terminate(pid: u32) {
 #[cfg(not(unix))]
 fn terminate(_pid: u32) {
     // No-op: the stop() grace-period loop falls through to a hard kill.
+    // (Windows instead uses `windows_job::InstanceJob`, when armed, for an
+    // immediate whole-subtree kill — see `ManagedInstance::stop()`.)
 }
 
-/// Bind an ephemeral loopback port, then release it so the child can bind
+/// Per-instance Windows Job Object support. Exists so a managed runtime's
+/// *entire* process subtree — not just the immediate child — reliably dies
+/// on `stop()`, independent of whether the whole control-plane process ever
+/// exits. This is deliberately separate from (and a peer to, not a
+/// replacement for) any outer Job Object a Tauri-hosting process might set
+/// up around the control plane itself: by default, a process that's a
+/// member of a job automatically makes any child it spawns a member of the
+/// same job too (recursively), so an outer job already cascades through
+/// this one on its own close — this module only adds an *explicit*,
+/// on-demand kill for the normal (non-crash) stop path, which an outer job
+/// alone doesn't help with.
+#[cfg(windows)]
+mod windows_job {
+    use tokio::process::Child;
+    use tracing::warn;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    /// A job object holding exactly one managed runtime process (and,
+    /// transitively, anything it spawns).
+    pub struct InstanceJob(HANDLE);
+
+    // SAFETY: `HANDLE` here is an opaque, pointer-sized kernel object
+    // reference with no thread-affinity; the Win32 job-object APIs used on
+    // it are documented as safe to call from any thread.
+    unsafe impl Send for InstanceJob {}
+    unsafe impl Sync for InstanceJob {}
+
+    impl InstanceJob {
+        /// Immediately terminate every process still in this job.
+        pub fn terminate(&self) {
+            // SAFETY: `self.0` is a valid job handle for the lifetime of
+            // `self` (only ever closed in `Drop`, which can't run
+            // concurrently with this `&self` call).
+            unsafe {
+                TerminateJobObject(self.0, 1);
+            }
+        }
+    }
+
+    impl Drop for InstanceJob {
+        fn drop(&mut self) {
+            // `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (set in `arm_job_for_child`
+            // below) means closing this job's last handle kills anything
+            // still in it — a safety net for a panic/early-return path that
+            // skipped `terminate()`. A no-op beyond freeing the handle if
+            // `terminate()` already ran and the job is already empty.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    /// Create a job, set kill-on-close, and assign `child`'s process to it.
+    /// Returns `None` (not an error) on any failure — this is defense in
+    /// depth, not a requirement for the instance to function; a failure is
+    /// logged and the caller falls back to the pre-existing single-PID
+    /// `terminate()`/`kill()` path.
+    pub fn arm_job_for_child(child: &Child) -> Option<InstanceJob> {
+        // `raw_handle()` is `None` only if the child has already been
+        // reaped (`wait()`ed on) — never true for a just-spawned process,
+        // but handled rather than unwrapped for robustness.
+        let Some(process_handle) = child.raw_handle() else {
+            warn!("child has no raw handle (already reaped?); falling back to single-process termination");
+            return None;
+        };
+        let process_handle = process_handle as HANDLE;
+
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() || job == INVALID_HANDLE_VALUE {
+                warn!("CreateJobObjectW failed; falling back to single-process termination");
+                return None;
+            }
+
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of!(info) as *const core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if ok == 0 {
+                warn!("SetInformationJobObject failed; falling back to single-process termination");
+                CloseHandle(job);
+                return None;
+            }
+
+            let ok = AssignProcessToJobObject(job, process_handle);
+            if ok == 0 {
+                warn!(
+                    "AssignProcessToJobObject failed (process may already be in another job); \
+                     falling back to single-process termination"
+                );
+                CloseHandle(job);
+                return None;
+            }
+
+            Some(InstanceJob(job))
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod windows_job {
+    pub struct InstanceJob;
+
+    impl InstanceJob {
+        pub fn terminate(&self) {}
+    }
+
+    pub fn arm_job_for_child(_child: &tokio::process::Child) -> Option<InstanceJob> {
+        None
+    }
+}
+
+/// Bind an ephemeral port on `host`, then release it so the child can bind
 /// it immediately after. There's an unavoidable small race between release
 /// and the child's own bind; acceptable for a local-only, single-user
 /// control plane (retry-on-conflict is the caller's fallback, not handled
-/// here).
-pub fn allocate_loopback_port() -> Result<u16, RuntimeError> {
-    let listener = TcpListener::bind("127.0.0.1:0").map_err(RuntimeError::Io)?;
+/// here). Probing on the actual host the runtime will bind matters: a
+/// loopback-only probe can miss a port already taken on `0.0.0.0` (a
+/// wildcard bind and a loopback bind of the same port can't coexist, but a
+/// loopback probe alone wouldn't see that conflict coming).
+pub fn allocate_port(host: &str) -> Result<u16, RuntimeError> {
+    let listener = TcpListener::bind(format!("{host}:0")).map_err(RuntimeError::Io)?;
     let port = listener.local_addr().map_err(RuntimeError::Io)?.port();
     drop(listener);
     Ok(port)
+}
+
+/// Convenience wrapper for the common (loopback) case.
+pub fn allocate_loopback_port() -> Result<u16, RuntimeError> {
+    allocate_port("127.0.0.1")
 }
 
 /// Spawn a managed runtime process and block until it reports healthy (or
@@ -182,6 +330,7 @@ pub async fn spawn_with_timeout(
     let pid = child
         .id()
         .ok_or_else(|| RuntimeError::RuntimeStartFailed("spawned process has no pid".into()))?;
+    let job = windows_job::arm_job_for_child(&child);
 
     let log_tail = Arc::new(StdMutex::new(VecDeque::with_capacity(LOG_TAIL_CAPACITY)));
 
@@ -216,6 +365,7 @@ pub async fn spawn_with_timeout(
         started_at: Instant::now(),
         status: RuntimeStatus::Running,
         log_tail,
+        job,
     })
 }
 

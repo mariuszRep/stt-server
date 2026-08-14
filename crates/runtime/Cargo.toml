@@ -10,12 +10,21 @@ tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
 uuid.workspace = true
 sysinfo = "0.32"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

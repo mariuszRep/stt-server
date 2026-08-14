@@ -4,6 +4,15 @@ use crate::SttError;
 
 const LOOPBACK_HOSTS: [&str; 3] = ["127.0.0.1", "::1", "localhost"];
 
+/// Whether `host` is one of the recognized loopback spellings. Shared by
+/// `ServerConfig::validate` (the control plane's own bind host) and
+/// `stt-runtime`'s managed-runtime `bind_host` guardrails (CONVENTIONS.md:
+/// "Loopback is default; remote binding is explicit and authenticated"),
+/// so both layers agree on exactly what counts as "still local."
+pub fn is_loopback_host(host: &str) -> bool {
+    LOOPBACK_HOSTS.contains(&host)
+}
+
 /// Server configuration.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -47,7 +56,7 @@ impl ServerConfig {
     /// Validate the configuration. Non-loopback binding is rejected unless
     /// both `allow_remote` is set and a non-empty `auth_token` is present.
     pub fn validate(&self) -> Result<(), SttError> {
-        let is_loopback = LOOPBACK_HOSTS.contains(&self.host.as_str());
+        let is_loopback = is_loopback_host(&self.host);
         if !is_loopback {
             if !self.allow_remote {
                 return Err(SttError::ConfigError(format!(
@@ -79,6 +88,13 @@ impl ServerConfig {
 /// Default model directory based on platform.
 pub fn default_model_dir() -> PathBuf {
     dirs_or_fallback().join("stt-server").join("models")
+}
+
+/// Where downloaded managed-runtime artifacts (e.g. a packaged
+/// faster-whisper build fetched for a given variant) are cached on disk.
+/// Same `dirs::data_local_dir()` convention as [`default_model_dir`].
+pub fn default_runtime_cache_dir() -> PathBuf {
+    dirs_or_fallback().join("stt-server").join("runtimes")
 }
 
 fn dirs_or_fallback() -> PathBuf {
@@ -140,5 +156,14 @@ mod tests {
             ..ServerConfig::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn is_loopback_host_recognizes_all_three_spellings_and_nothing_else() {
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("::1"));
+        assert!(is_loopback_host("localhost"));
+        assert!(!is_loopback_host("0.0.0.0"));
+        assert!(!is_loopback_host("192.168.1.5"));
     }
 }
