@@ -57,11 +57,13 @@ runtime. Provider ids are validated strings (no path traversal).
 | GET | `/v1/health` | Control-plane health |
 | GET | `/v1/readiness` | Control-plane readiness |
 | GET | `/v1/hardware` | Detected hardware capability |
-| GET | `/v1/providers` | Curated provider catalog + hardware compatibility |
-| POST | `/v1/providers/:id/install` | Confirm/register a provider's artifact |
+| GET | `/v1/providers` | Curated provider catalog + hardware compatibility, incl. per-variant `compatible`/`recommended` |
+| POST | `/v1/providers/:id/install` | Install `{"variant": "cpu"\|"gpu"}` (default `"cpu"`) — instant if already local, else `202` + `operationId` |
+| DELETE | `/v1/providers/:id/install/:variant` | Remove a previously-downloaded variant's cached copy (never the vendored dev copy) |
+| GET | `/v1/install-operations/:operation_id` | Poll an in-flight/finished variant download (`downloading`/`complete`/`failed`) |
 | POST | `/v1/providers/:id/update` | Alias of `install` (no versioned releases yet) |
 | DELETE | `/v1/providers/:id` | Uninstall (stops it first if running) |
-| POST | `/v1/providers/:id/start` | Start, block until healthy, return the descriptor |
+| POST | `/v1/providers/:id/start` | Start, block until healthy, return the descriptor. Body: `{device, computeType, bindHost, authToken}`, all optional |
 | POST | `/v1/providers/:id/stop` | Stop |
 | GET | `/v1/providers/:id/status` | Current `RuntimeStatus` |
 | GET | `/v1/providers/:id/logs?tail=N` | Recent captured stdout/stderr lines |
@@ -76,6 +78,39 @@ runtime. Provider ids are validated strings (no path traversal).
 completeness but return an explicit "automatic" response for faster-whisper — that runtime
 downloads/caches its own models via HuggingFace on first use, so there is no separate file
 for the control plane to manage.
+
+### GPU vs CPU variant installs
+
+Every install targets a specific build: `"cpu"` (default — small, always compatible) or
+`"gpu"` (bundles CUDA/cuDNN, much larger). Installing one never evicts the other — they're
+cached side by side, so switching back and forth doesn't force a re-download. A caller that
+never sends a body gets today's instant, network-free `"cpu"` behavior unchanged.
+
+```bash
+# Kicks off a background download if the gpu build isn't cached yet
+curl -X POST http://127.0.0.1:8080/v1/providers/faster-whisper/install \
+  -H 'Content-Type: application/json' -d '{"variant":"gpu"}'
+# => 202 {"status":"downloading","providerId":"faster-whisper","variant":"gpu","operationId":"..."}
+
+curl http://127.0.0.1:8080/v1/install-operations/<operationId>
+# => {"status":"downloading","downloadedBytes":...,"totalBytes":...} until "complete"/"failed"
+```
+
+### LAN mode (non-loopback binding)
+
+Loopback is the default and requires nothing extra. Binding a managed runtime to the network
+needs two explicit opt-ins — one at the control plane's own launch, one per start request —
+so a caller of the (still loopback-only) admin API can't unilaterally expose anything the
+operator didn't sanction:
+
+1. Launch the daemon itself with `stt run --allow-remote` (the control plane's own HTTP API
+   still binds loopback — this flag only sanctions the *managed runtime* binding non-loopback
+   later).
+2. Request it per-start: `POST /v1/providers/:id/start {"bindHost": "0.0.0.0", "authToken": "..."}`
+   — `authToken` is required whenever `bindHost` isn't loopback. The returned descriptor's
+   `baseUrl` always stays `127.0.0.1` (that's what the *local* caller — e.g. a desktop app on
+   the same machine — uses); the LAN-reachable address is a separate fact for a separate
+   audience that this control plane deliberately doesn't try to guess.
 
 ### Runtime connection descriptor
 
@@ -103,14 +138,15 @@ A managed runtime nobody is using doesn't stay resident: `stt run --idle-timeout
 ## CLI
 
 ```bash
-stt run [--port 8080] [--idle-timeout-secs 600]
+stt run [--port 8080] [--idle-timeout-secs 600] [--allow-remote] [--auth-token <token>]
 
 stt hardware
 stt recommend
 
 stt provider list
-stt provider install faster-whisper
-stt provider start faster-whisper
+stt provider install faster-whisper [--variant cpu|gpu]   # default cpu; blocks until any download completes
+stt provider remove-variant faster-whisper --variant gpu  # reclaim disk space; never touches a vendored dev copy
+stt provider start faster-whisper [--device ...] [--compute-type ...] [--bind-host 0.0.0.0] [--auth-token <token>]
 stt provider status faster-whisper
 stt provider logs faster-whisper --tail 50
 stt provider stop faster-whisper

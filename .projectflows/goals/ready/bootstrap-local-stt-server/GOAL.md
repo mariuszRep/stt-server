@@ -5,10 +5,10 @@ description: Convert stt-server into an independent Rust control plane that mana
 status: ready
 type: refactor
 scope: stt-server/crates, stt-server/sdk, stt-server release and CI configuration
-attempt: 0
+attempt: 1
 max_attempts: 5
-last_result: none
-next_action: Inventory execution-path Rust code, define the management API and runtime descriptor contract, then replace control-plane violations before packaging the Server for independent release.
+last_result: partial
+next_action: Push a version tag, verify release.yml runs end-to-end on GitHub Actions (Linux + Windows) and produces real release assets (stt binaries, CPU/GPU faster-whisper runtimes), then re-evaluate against acceptance criterion 8 for done.
 success_criteria:
   - Server exposes local provider, model, hardware, recommendation, lifecycle, logs, and runtime-descriptor APIs.
   - Server never accepts, proxies, buffers, transcodes, or infers normal transcription audio.
@@ -72,6 +72,15 @@ The current Rust workspace is organized around `EngineAdapter` inference: it exp
 - Containers, remote/LAN deployment product features, and new audio-processing features.
 - An audio proxy or an STT API in the Server control-plane process.
 
+> **Scope note (attempt 1):** "remote/LAN deployment product features" above was listed
+> out of scope when this goal was written, but LAN-mode binding (`stt run --allow-remote`
+> at daemon launch + per-request `bindHost`/`authToken` on `POST /providers/:id/start`,
+> descriptor `baseUrl` always staying loopback) was implemented during attempt 1. This was
+> a deliberate, explicit expansion agreed with the user mid-session (asked directly: "keep
+> LAN support, expand scope" rather than drop it as a regression) — not a scope violation
+> discovered after the fact. Recorded here so a future reader isn't confused by the
+> contradiction between this section and the shipped code.
+
 ## Acceptance Criteria
 
 1. The Server exposes documented management APIs for hardware, providers, models, recommendations, lifecycle, health/logs, and runtime descriptors.
@@ -92,6 +101,14 @@ The current Rust workspace is organized around `EngineAdapter` inference: it exp
 - Not done if CI requires source from a sibling repository or substitutes a path/workspace SDK dependency for a published artifact.
 
 ## Architecture Notes
+
+> **Stale as of the attempt below.** All file:line citations in this section describe the
+> pre-refactor tree (before `crates/adapter` was renamed to `crates/runtime`, routes were
+> split into `crates/server/src/routes/`, and the control-plane conversion landed). Left
+> unedited as a historical record rather than re-derived against new line numbers, which
+> would just go stale again the next time the code moves. See `crates/runtime/`,
+> `crates/server/src/routes/`, and `crates/server/src/lib.rs`'s `build_router()` for the
+> current shape.
 
 - Current Server routing exposes inference endpoints: `crates/server/src/lib.rs:15-27`.
 - Current batch request handler delegates to `EngineAdapter`: `crates/server/src/routes.rs:100-186`.
@@ -118,7 +135,41 @@ The current Rust workspace is organized around `EngineAdapter` inference: it exp
 
 ## Attempts
 
-No attempts yet.
+### Attempt 1 — partial
+
+Implemented, tested, committed, and pushed to `origin/main` (commit `6898382` and the
+preceding control-plane-conversion commits on this branch), but not yet released, so
+acceptance criterion 8 remains unmet:
+
+- Control-plane conversion: transcription data-path routes removed, `crates/adapter`
+  renamed to `crates/runtime`, routes split into `crates/server/src/routes/`.
+- Management APIs: hardware, provider catalog (with per-variant compatibility/recommendation),
+  install/update/remove, model catalog/select, start/stop/status/logs/heartbeat,
+  recommendations, runtime descriptor — all implemented and covered by tests.
+- Runtime descriptor contract (`RuntimeConnectionDescriptor`) defined in `crates/common`,
+  pinned against `stt-sdk`'s TypeScript type via a fixture test.
+- Packaged-vs-raw-source faster-whisper detection (`RuntimeKind`), so a real installed build
+  (PyInstaller `--onefile`) and a local dev checkout both work through the same install path.
+- GPU-variant install mechanism: `RuntimeVariant::{Cpu,Gpu}`, coexisting caches (no
+  auto-eviction), async download + `GET /v1/install-operations/:id` progress polling.
+- LAN-mode binding — see the Out of Scope note above; explicit user-directed scope expansion.
+- Windows per-instance Job Object fix for `stop()` (`supervisor.rs`), verified via
+  `cargo check --target x86_64-pc-windows-gnu` cross-target type-checking (no Windows machine
+  available in the session that built this).
+- `release.yml`/CI: workflow exists and was fixed (asset-naming collision between CPU/GPU
+  variants, plus an unrelated pre-existing YAML syntax bug that would have broken the whole
+  file), but has never actually run — no git tags or GitHub Releases exist on
+  `mariuszRep/stt-server` yet.
+- 61 tests (unit + integration), clippy, and fmt all pass on the Linux sandbox this was built
+  in; a real Windows build/run was not possible there (no cross-compilation toolchain, no
+  Windows machine) — see Risks/Unknowns.
+
+Not done: acceptance criterion 8 (tagged public-repository CI produces public platform
+artifacts) — requires pushing a real version tag and watching `release.yml` succeed on GitHub
+Actions, which this session couldn't do (no working git push credentials in that
+environment). Also not independently re-verified: acceptance criterion 6 (embedded
+`stt-server/sdk` removal) — not touched in this attempt, assumed already satisfied by the
+earlier control-plane-conversion commits but not re-checked here.
 
 ## Do Not Repeat
 
@@ -126,11 +177,26 @@ None yet.
 
 ## Verification Log
 
-No verification yet.
+- `cargo test --workspace`: 61 passed, 0 failed (unit tests across `stt-common`,
+  `stt-runtime`, `stt-server`; plus a real integration test that spawns the vendored
+  faster-whisper runtime and exercises health/config/streaming against it).
+- `cargo clippy --workspace --all-targets`: clean.
+- `cargo fmt --check`: clean.
+- `cargo check --workspace --target x86_64-pc-windows-gnu`: clean (type-checks the
+  `cfg(windows)` Job Object code without a Windows toolchain/linker).
+- Manual smoke test: real local `cargo build --release --bin stt` + `scripts/verify-release-artifact.sh`
+  against the resulting binary — passed.
+- Manual end-to-end LAN-mode test: started the real control plane with `--allow-remote`,
+  installed+started faster-whisper with `bindHost: "0.0.0.0"` + an explicit `authToken`, and
+  confirmed via `ss -ltnp` that the managed runtime process was actually listening on
+  `0.0.0.0`, not just loopback — and that the token was actually enforced.
+- Not run: any check against a real GitHub Actions run (blocked on push access from that
+  session) or a real Windows machine.
 
 ## Final Outcome
 
-Pending.
+Not yet — see `next_action`. Substantially implemented and locally verified; blocked on a
+real tagged release to satisfy the last acceptance criterion.
 
 ## Ready For Execution
 

@@ -2,7 +2,7 @@
 
 ## Scope
 
-Applies to `/home/mariusz/projects/voice-typer/stt-server`.
+Applies to `stt-server` (https://github.com/mariuszRep/stt-server).
 
 ## Architecture
 
@@ -23,6 +23,7 @@ Applies to `/home/mariusz/projects/voice-typer/stt-server`.
 - Loopback is default; remote binding is explicit and authenticated.
 - Provider/model identifiers are validated, not raw paths.
 - Install/update/remove operations are observable and recover safely from partial failure.
+- A provider install may target a specific hardware-variant build (e.g. CPU vs GPU); variants are cached independently (installing one never evicts another), and an install that requires a large download reports observable async progress rather than blocking silently.
 - Runtime descriptors include provider identity, status, protocol/version, transport, endpoint, and capabilities.
 - Consume the published, versioned `stt-sdk` library for shared provider communication and contract validation where it prevents duplication; never import SDK source by repository-relative path.
 - Keep hardware detection, installation, model storage, and process supervision server-owned.
