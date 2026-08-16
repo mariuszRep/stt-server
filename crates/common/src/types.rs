@@ -54,14 +54,14 @@ pub struct ModelVerification {
 
 // ── Runtime Connection Descriptor ───────────────────────────────
 //
-// Mirrors `@voice-typer/stt-sdk`'s `RuntimeConnectionDescriptor` (see
+// Mirrors `@open-vibe-ai/stt-sdk`'s `RuntimeConnectionDescriptor` (see
 // stt-sdk/src/types.ts) field-for-field. This is the sole handoff contract
 // between the control plane and SDK clients: the server never proxies
 // transcription traffic itself, it only issues descriptors that tell a
 // client how to reach a runtime it has started.
 
 /// Schema version of [`RuntimeConnectionDescriptor`]. Must match
-/// `RUNTIME_DESCRIPTOR_SCHEMA_VERSION` in `@voice-typer/stt-sdk`.
+/// `RUNTIME_DESCRIPTOR_SCHEMA_VERSION` in `@open-vibe-ai/stt-sdk`.
 pub const RUNTIME_DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
 
 /// Mirrors the `streaming` block of a managed runtime's `GET /v1/config` response.

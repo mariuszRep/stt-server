@@ -125,7 +125,7 @@ fn resolve_python() -> Result<&'static str, RuntimeError> {
 /// Confirm a usable runtime (packaged or raw source) is available locally
 /// and build its launch spec. Returns [`RuntimeError::ProviderNotInstalled`],
 /// not a panic or a silent no-op, when it isn't — explicit and typed,
-/// matching how `@voice-typer/stt-sdk` handles not-yet-implemented adapters.
+/// matching how `@open-vibe-ai/stt-sdk` handles not-yet-implemented adapters.
 pub fn install() -> Result<LaunchBuilder, RuntimeError> {
     let runtime_dir = locate_runtime_dir().ok_or_else(|| {
         RuntimeError::ProviderNotInstalled(format!(

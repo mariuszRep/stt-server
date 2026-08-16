@@ -126,13 +126,13 @@ jobs:
             --notes "protocolVersion: 1, schemaVersion: 1 (RuntimeConnectionDescriptor). See CONVENTIONS.md/VISION.md for compatibility guarantees." \
             artifacts/*/*
 
-  # Gated: @voice-typer/stt-sdk has no npm org or publish pipeline yet (see
+  # Gated: @open-vibe-ai/stt-sdk has no npm org or publish pipeline yet (see
   # stt-sdk's own goal notes), so there is no released version to install
   # here. This job is real — not a placeholder — but is intentionally left
   # unreachable (workflow_dispatch only, and disabled below) rather than
   # silently skipped, so it's obvious the requirement isn't satisfied yet
   # rather than looking like it passed. Flip `if: false` once a published
-  # SDK version exists, and pin @voice-typer/stt-sdk@<version> below.
+  # SDK version exists, and pin @open-vibe-ai/stt-sdk@<version> below.
   sdk-compatibility:
     if: false
     needs: [build-faster-whisper-sidecar]
@@ -142,6 +142,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - run: npm install @voice-typer/stt-sdk # pin an exact version once published
+      - run: npm install @open-vibe-ai/stt-sdk # pin an exact version once published
       - run: |
           echo "TODO: start a managed runtime and run stt-sdk's protocol fixtures against its descriptor"
