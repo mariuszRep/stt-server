@@ -107,15 +107,16 @@ def transcribe(audio_path: str, prompt: str | None = None) -> str:
     )
     with _infer_lock:
         queue_wait = time.perf_counter() - started_at
-        model = get_model(config.DEVICE, config.COMPUTE_TYPE)
         try:
+            model = get_model(config.DEVICE, config.COMPUTE_TYPE)
             infer_start = time.perf_counter()
             return _run(model, audio_path, initial_prompt)
         except Exception as exc:
             # CUDA device-count detection can report a device whose runtime
-            # (cuBLAS/cuDNN DLLs) isn't actually loadable - ctranslate2 only
-            # discovers this on first inference, not at model construction.
-            # Fall back to CPU rather than leaving the backend permanently broken.
+            # (cuBLAS/cuDNN DLLs) isn't actually loadable - ctranslate2 can
+            # discover this either at model construction (get_model, now
+            # inside this try) or on first inference. Fall back to CPU
+            # rather than leaving the backend permanently broken.
             if config.DEVICE == "cpu":
                 raise
             print(f"[voice-typer] CUDA inference failed, falling back to CPU: {exc}", flush=True)

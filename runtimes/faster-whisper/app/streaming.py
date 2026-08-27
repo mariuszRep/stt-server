@@ -218,7 +218,17 @@ async def create_session(
     prompt: str | None = None,
 ) -> StreamingSession:
     session_id = str(uuid.uuid4())
-    model = get_model(config.DEVICE, config.COMPUTE_TYPE)
+    try:
+        model = get_model(config.DEVICE, config.COMPUTE_TYPE)
+    except Exception as exc:
+        if config.DEVICE == "cpu":
+            raise
+        print(
+            f"[voice-typer] CUDA model load failed while starting a streaming session, falling back to CPU: {exc}",
+            flush=True,
+        )
+        config.mark_cuda_fallback(exc)
+        model = get_model("cpu", "int8")
     return StreamingSession(
         session_id=session_id,
         model=model,

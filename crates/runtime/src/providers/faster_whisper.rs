@@ -91,6 +91,24 @@ pub fn detect_runtime_kind(dir: &Path) -> Option<RuntimeKind> {
     None
 }
 
+/// Filename `voice-typer-backend.spec` writes next to the built exe,
+/// containing the bare build-variant string ("cpu"/"gpu"). `config.py`
+/// reads the exact same file for the same reason on the Python side.
+const PACKAGED_VARIANT_SENTINEL_FILENAME: &str = "variant.txt";
+
+/// Best-effort read of the sentinel next to a packaged exe. `None` covers
+/// every "can't confirm" case uniformly (file absent — a pre-this-fix build
+/// or a manually dropped dev/test exe; unreadable; unparseable): callers
+/// treat "can't confirm" as "assume it matches," preserving the existing
+/// leniency `install_local`'s doc comment already grants a vendored dev
+/// copy — this only *adds* a check when there's a positive signal to check
+/// against.
+fn read_packaged_variant_sentinel(runtime_dir: &Path) -> Option<RuntimeVariant> {
+    let contents =
+        std::fs::read_to_string(runtime_dir.join(PACKAGED_VARIANT_SENTINEL_FILENAME)).ok()?;
+    RuntimeVariant::parse(contents.trim())
+}
+
 /// `python -m venv` only creates `Scripts\python.exe` on Windows — no
 /// `python3.exe` — but always creates both `bin/python` and `bin/python3`
 /// on Unix. Trying the wrong name first can silently skip right past a
@@ -207,7 +225,15 @@ pub fn install_local(variant: RuntimeVariant) -> Option<LaunchBuilder> {
     if let Some(runtime_dir) = locate_runtime_dir() {
         match detect_runtime_kind(&runtime_dir) {
             Some(RuntimeKind::Packaged(exe_path)) => {
-                return Some(packaged_launch_builder(exe_path, runtime_dir));
+                match read_packaged_variant_sentinel(&runtime_dir) {
+                    Some(found) if found != variant => {
+                        // Labeled, and it's the other flavor (e.g. a desktop
+                        // install's fixed cpu-only bundled resource) — never
+                        // silently substitute it for what was asked for. Fall
+                        // through to the variant-scoped cache check below.
+                    }
+                    _ => return Some(packaged_launch_builder(exe_path, runtime_dir)),
+                }
             }
             Some(RuntimeKind::RawSource) => {
                 if let Ok(python) = resolve_python() {
@@ -690,6 +716,150 @@ mod tests {
         }
 
         assert!(result.is_none());
+    }
+
+    /// Sets up a fake "packaged" runtime directory (via `RUNTIME_DIR_ENV_VAR`)
+    /// containing a dummy exe and, if `sentinel` is `Some`, a `variant.txt`
+    /// next to it. Returns the directory so the caller can clean it up.
+    fn write_fake_packaged_runtime_dir(name_suffix: &str, sentinel: Option<&str>) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "stt-packaged-test-{name_suffix}-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(packaged_executable_name()), b"fake exe").unwrap();
+        if let Some(variant) = sentinel {
+            std::fs::write(dir.join(PACKAGED_VARIANT_SENTINEL_FILENAME), variant).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn install_local_falls_through_to_a_cached_variant_when_the_packaged_exe_sentinel_says_the_other_variant(
+    ) {
+        let _guard = lock_env_test();
+        let packaged_dir = write_fake_packaged_runtime_dir("mismatch", Some("cpu"));
+
+        let cache_root = std::env::temp_dir().join(format!(
+            "stt-cache-test-sentinel-mismatch-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let variant_dir = cache_root.join("faster-whisper").join("gpu");
+        std::fs::create_dir_all(&variant_dir).unwrap();
+        std::fs::write(
+            variant_dir.join(asset_name(RuntimeVariant::Gpu)),
+            b"fake gpu exe",
+        )
+        .unwrap();
+
+        // SAFETY: test-only env var mutation, scoped to this single test.
+        unsafe {
+            std::env::set_var(RUNTIME_DIR_ENV_VAR, &packaged_dir);
+            std::env::set_var(RUNTIME_CACHE_DIR_ENV_VAR, &cache_root);
+        }
+
+        let builder = install_local(RuntimeVariant::Gpu);
+
+        unsafe {
+            std::env::remove_var(RUNTIME_DIR_ENV_VAR);
+            std::env::remove_var(RUNTIME_CACHE_DIR_ENV_VAR);
+        }
+        std::fs::remove_dir_all(&packaged_dir).ok();
+        std::fs::remove_dir_all(&cache_root).ok();
+
+        let builder = builder.expect(
+            "expected the cached gpu variant to be found, not the packaged cpu-sentinel exe",
+        );
+        let launch = builder(5123, "tok-abc", None, &StartOptions::default());
+        assert!(
+            launch
+                .program
+                .to_string_lossy()
+                .contains(&asset_name(RuntimeVariant::Gpu)),
+            "expected the gpu cache asset, got {:?}",
+            launch.program
+        );
+    }
+
+    #[test]
+    fn install_local_returns_none_when_packaged_sentinel_mismatches_and_no_cache_exists() {
+        let _guard = lock_env_test();
+        let packaged_dir = write_fake_packaged_runtime_dir("no-cache", Some("cpu"));
+        let cache_root = std::env::temp_dir().join(format!(
+            "stt-cache-test-no-cache-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+
+        // SAFETY: test-only env var mutation, scoped to this single test.
+        unsafe {
+            std::env::set_var(RUNTIME_DIR_ENV_VAR, &packaged_dir);
+            std::env::set_var(RUNTIME_CACHE_DIR_ENV_VAR, &cache_root);
+        }
+
+        let result = install_local(RuntimeVariant::Gpu);
+
+        unsafe {
+            std::env::remove_var(RUNTIME_DIR_ENV_VAR);
+            std::env::remove_var(RUNTIME_CACHE_DIR_ENV_VAR);
+        }
+        std::fs::remove_dir_all(&packaged_dir).ok();
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn install_local_still_returns_the_packaged_exe_when_its_sentinel_matches() {
+        let _guard = lock_env_test();
+        let packaged_dir = write_fake_packaged_runtime_dir("match", Some("gpu"));
+
+        // SAFETY: test-only env var mutation, scoped to this single test.
+        unsafe {
+            std::env::set_var(RUNTIME_DIR_ENV_VAR, &packaged_dir);
+        }
+
+        let builder = install_local(RuntimeVariant::Gpu);
+
+        unsafe {
+            std::env::remove_var(RUNTIME_DIR_ENV_VAR);
+        }
+        std::fs::remove_dir_all(&packaged_dir).ok();
+
+        let builder = builder.expect("expected the packaged exe to still be returned");
+        let launch = builder(5123, "tok-abc", None, &StartOptions::default());
+        assert!(launch
+            .program
+            .to_string_lossy()
+            .contains(packaged_executable_name()));
+    }
+
+    #[test]
+    fn install_local_still_returns_the_packaged_exe_when_no_sentinel_is_present() {
+        let _guard = lock_env_test();
+        let packaged_dir = write_fake_packaged_runtime_dir("no-sentinel", None);
+
+        // SAFETY: test-only env var mutation, scoped to this single test.
+        unsafe {
+            std::env::set_var(RUNTIME_DIR_ENV_VAR, &packaged_dir);
+        }
+
+        let builder = install_local(RuntimeVariant::Gpu);
+
+        unsafe {
+            std::env::remove_var(RUNTIME_DIR_ENV_VAR);
+        }
+        std::fs::remove_dir_all(&packaged_dir).ok();
+
+        let builder = builder.expect(
+            "a packaged exe with no sentinel at all (pre-fix build / dev copy) should still be leniently accepted",
+        );
+        let launch = builder(5123, "tok-abc", None, &StartOptions::default());
+        assert!(launch
+            .program
+            .to_string_lossy()
+            .contains(packaged_executable_name()));
     }
 
     /// Real end-to-end download test: serves a small fake asset over a

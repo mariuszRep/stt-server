@@ -173,7 +173,13 @@ earlier control-plane-conversion commits but not re-checked here.
 
 ## Do Not Repeat
 
-None yet.
+- A provider "install found locally" check (`install_local`) must never trust a found packaged
+  exe as satisfying a specific variant request without confirming it (variant sentinel next to
+  the exe) — `locate_runtime_dir()`'s search also matches a real installed app's fixed
+  bundled-resource path, which is always exactly one variant. Real-world consequence before the
+  fix: a machine with an NVIDIA GPU would register "gpu" in logs/API responses while actually
+  launching the CPU-only build, which then crashed on `device=cuda` since the CPU build never
+  bundles cuBLAS/cuDNN.
 
 ## Verification Log
 

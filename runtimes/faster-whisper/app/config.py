@@ -113,9 +113,29 @@ def _cuda_runtime_status() -> tuple[bool, str | None]:
     return True, None
 
 
+def _own_build_variant() -> str | None:
+    """This process's own build variant ('cpu'/'gpu'), read with certainty
+    from the sentinel `voice-typer-backend.spec` writes next to the frozen
+    exe (`faster_whisper.rs::install_local` reads the identical file for the
+    identical reason on the Rust side). `None` when not frozen (raw source
+    has no build-variant concept) or when the sentinel is missing (a
+    pre-this-fix build) — both fall back to the DLL-probe-only behavior
+    below, unchanged.
+    """
+    if not getattr(sys, "frozen", False):
+        return None
+    sentinel = Path(sys.executable).resolve().parent / "variant.txt"
+    try:
+        value = sentinel.read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        return None
+    return value if value in ("cpu", "gpu") else None
+
+
 HOST = os.environ.get("VOICE_TYPER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("VOICE_TYPER_PORT", "8000"))
 MODEL = os.environ.get("VOICE_TYPER_MODEL", "Systran/faster-whisper-small")
+BUILD_VARIANT = _own_build_variant()
 CUDA_AVAILABLE = _cuda_available()
 CUDA_SUPPORTED_COMPUTE_TYPES = _cuda_supported_compute_types()
 CUDA_RUNTIME_OK, CUDA_ERROR = _cuda_runtime_status()
@@ -125,7 +145,17 @@ REQUESTED_DEVICE_SOURCE = "manual" if _device_env else "auto"
 REQUESTED_COMPUTE_TYPE = os.environ.get("VOICE_TYPER_COMPUTE_TYPE") or (
     "float16" if REQUESTED_DEVICE == "cuda" else "int8"
 )
-if REQUESTED_DEVICE == "cuda" and not CUDA_RUNTIME_OK:
+if REQUESTED_DEVICE == "cuda" and (BUILD_VARIANT == "cpu" or not CUDA_RUNTIME_OK):
+    if BUILD_VARIANT == "cpu" and CUDA_RUNTIME_OK:
+        # The DLL probe above can be fooled by a stray system-wide CUDA
+        # Toolkit install / PATH entry into reporting a runtime that looks
+        # usable even though *this* build never bundled it — the sentinel
+        # is authoritative and overrides that regardless.
+        CUDA_RUNTIME_OK = False
+        CUDA_ERROR = (
+            "This is a CPU-only build (BUILD_VARIANT=cpu); CUDA is "
+            "unavailable regardless of what's on PATH."
+        )
     DEVICE = "cpu"
     DEVICE_SOURCE = "fallback"
     COMPUTE_TYPE = "int8"

@@ -121,10 +121,19 @@ pub enum InstallOutcome {
 /// never evicted.
 const MAX_FINISHED_INSTALL_OPERATIONS: usize = 8;
 
+/// A provider's registered launch spec plus the variant it was resolved
+/// for. Tracked so `start()` can validate a requested `device` is actually
+/// achievable by what's currently registered — impossible before, since
+/// only the `LaunchBuilder` itself was kept.
+struct InstalledProvider {
+    variant: RuntimeVariant,
+    launch: LaunchBuilder,
+}
+
 pub struct RuntimeManager {
     hardware: HardwareReport,
     instances: Mutex<HashMap<String, RunningEntry>>,
-    installed: Mutex<HashMap<String, LaunchBuilder>>,
+    installed: Mutex<HashMap<String, InstalledProvider>>,
     selected_models: Mutex<HashMap<String, String>>,
     /// Synchronous (not `tokio::sync::Mutex`) because it's also updated
     /// from a plain, non-async progress callback passed into
@@ -158,11 +167,16 @@ impl RuntimeManager {
 
     /// Register how to launch a provider once its artifact is available
     /// locally. Overwrites any previous registration for the same id.
-    pub async fn register_install(&self, id: &ProviderId, launch: LaunchBuilder) {
-        self.installed
-            .lock()
-            .await
-            .insert(id.as_str().to_string(), launch);
+    pub async fn register_install(
+        &self,
+        id: &ProviderId,
+        variant: RuntimeVariant,
+        launch: LaunchBuilder,
+    ) {
+        self.installed.lock().await.insert(
+            id.as_str().to_string(),
+            InstalledProvider { variant, launch },
+        );
     }
 
     pub async fn is_installed(&self, id: &ProviderId) -> bool {
@@ -188,7 +202,7 @@ impl RuntimeManager {
         }
 
         if let Some(launch) = faster_whisper::install_local(variant) {
-            self.register_install(id, launch).await;
+            self.register_install(id, variant, launch).await;
             return Ok(InstallOutcome::Installed {
                 provider_id: id.to_string(),
                 variant: variant.as_str().to_string(),
@@ -250,7 +264,7 @@ impl RuntimeManager {
 
             match result {
                 Ok(launch) => {
-                    manager.register_install(&id_owned, launch).await;
+                    manager.register_install(&id_owned, variant, launch).await;
                     let mut installs = manager.installs.lock().expect("installs mutex poisoned");
                     if let Some(state) = installs.get_mut(&op_id) {
                         state.status = InstallOperationStatus::Complete;
@@ -370,6 +384,20 @@ impl RuntimeManager {
             }
         }
 
+        if matches!(options.device.as_deref(), Some("cuda")) {
+            let installed = self.installed.lock().await;
+            if let Some(entry) = installed.get(id.as_str()) {
+                if entry.variant != RuntimeVariant::Gpu {
+                    return Err(RuntimeError::InvalidStartOptions(format!(
+                        "device \"cuda\" was requested but the currently-registered {id} build is the {} variant, which cannot run CUDA inference; install the gpu variant first",
+                        entry.variant
+                    )));
+                }
+            }
+            // Not installed at all: the installed.get(...) lookup below still
+            // raises ProviderNotInstalled as it already does.
+        }
+
         let port = supervisor::allocate_port(bind_host)?;
         let auth_token = options
             .auth_token
@@ -378,10 +406,10 @@ impl RuntimeManager {
         let selected_model = self.selected_model(id).await;
         let launch = {
             let installed = self.installed.lock().await;
-            let builder = installed
+            let entry = installed
                 .get(id.as_str())
                 .ok_or_else(|| RuntimeError::ProviderNotInstalled(id.to_string()))?;
-            builder(port, &auth_token, selected_model.as_deref(), options)
+            (entry.launch)(port, &auth_token, selected_model.as_deref(), options)
         };
 
         let instance = supervisor::spawn(
@@ -688,7 +716,9 @@ mod tests {
     ) -> RuntimeManager {
         let manager = RuntimeManager::new(idle_timeout);
         let id = ProviderId::new("faster-whisper").unwrap();
-        manager.register_install(&id, fake_launch()).await;
+        manager
+            .register_install(&id, RuntimeVariant::Cpu, fake_launch())
+            .await;
         manager
     }
 
@@ -839,7 +869,7 @@ mod tests {
         let id = ProviderId::new("faster-whisper").unwrap();
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         manager
-            .register_install(&id, recording_launch(calls.clone()))
+            .register_install(&id, RuntimeVariant::Cpu, recording_launch(calls.clone()))
             .await;
 
         let options = StartOptions {
@@ -889,12 +919,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_rejects_cuda_device_when_the_registered_variant_is_cpu() {
+        // `manager_with_faster_whisper_installed` registers with `RuntimeVariant::Cpu`.
+        let manager = manager_with_faster_whisper_installed(None).await;
+        let id = ProviderId::new("faster-whisper").unwrap();
+        let options = StartOptions {
+            device: Some("cuda".to_string()),
+            ..StartOptions::default()
+        };
+        assert!(matches!(
+            manager.start(&id, &options).await,
+            Err(RuntimeError::InvalidStartOptions(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn start_accepts_cuda_device_when_the_registered_variant_is_gpu() {
+        let manager = RuntimeManager::new(None);
+        let id = ProviderId::new("faster-whisper").unwrap();
+        manager
+            .register_install(&id, RuntimeVariant::Gpu, fake_launch())
+            .await;
+        let options = StartOptions {
+            device: Some("cuda".to_string()),
+            ..StartOptions::default()
+        };
+        assert!(manager.start(&id, &options).await.is_ok());
+        manager.stop(&id).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn start_accepts_wildcard_bind_host_with_an_auth_token_and_keeps_descriptor_loopback() {
         let manager = RuntimeManager::new(None);
         let id = ProviderId::new("faster-whisper").unwrap();
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         manager
-            .register_install(&id, recording_launch(calls.clone()))
+            .register_install(&id, RuntimeVariant::Cpu, recording_launch(calls.clone()))
             .await;
 
         let options = StartOptions {
@@ -922,7 +982,11 @@ mod tests {
         let manager = RuntimeManager::new(None);
         let id = ProviderId::new("faster-whisper").unwrap();
         manager
-            .register_install(&id, fake_launch_with_streaming_config())
+            .register_install(
+                &id,
+                RuntimeVariant::Cpu,
+                fake_launch_with_streaming_config(),
+            )
             .await;
 
         let descriptor = manager.start(&id, &StartOptions::default()).await.unwrap();

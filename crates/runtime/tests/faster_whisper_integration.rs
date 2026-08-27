@@ -16,7 +16,8 @@
 use std::path::PathBuf;
 
 use stt_runtime::{
-    providers::faster_whisper, ProviderId, RuntimeManager, RuntimeStatus, StartOptions,
+    providers::faster_whisper, ProviderId, RuntimeManager, RuntimeStatus, RuntimeVariant,
+    StartOptions,
 };
 
 fn workspace_root() -> PathBuf {
@@ -99,7 +100,10 @@ async fn real_faster_whisper_runtime_starts_and_serves_health() {
 
     let manager = RuntimeManager::new(None);
     let id = ProviderId::new("faster-whisper").unwrap();
-    manager.register_install(&id, launch).await;
+    // Raw source has no real variant concept; Cpu just satisfies the signature.
+    manager
+        .register_install(&id, RuntimeVariant::Cpu, launch)
+        .await;
 
     // Use the smallest curated model so this doesn't hang waiting on a large
     // HuggingFace download; faster-whisper downloads/caches it on first

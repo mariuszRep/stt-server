@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os
+from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 
@@ -65,3 +66,10 @@ exe = EXE(
     upx=False,
     console=True,
 )
+
+# Sentinel read by both faster_whisper.rs::install_local (to confirm a found
+# packaged exe actually matches the variant it's being asked for) and
+# config.py's own device-resolution gate (to know its own build variant with
+# certainty, independent of any DLL probe).
+Path("dist").mkdir(parents=True, exist_ok=True)
+Path("dist/variant.txt").write_text(build_variant, encoding="utf-8")

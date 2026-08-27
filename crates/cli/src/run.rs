@@ -90,7 +90,7 @@ pub async fn execute(args: RunArgs) -> anyhow::Result<()> {
     match faster_whisper::install_local(preferred_variant) {
         Some(launch) => {
             runtime_manager
-                .register_install(&faster_whisper_id, launch)
+                .register_install(&faster_whisper_id, preferred_variant, launch)
                 .await;
             tracing::info!(variant = %preferred_variant, "faster-whisper runtime found and registered");
         }
