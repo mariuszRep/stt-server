@@ -2,22 +2,13 @@
 name: bootstrap-local-stt-server
 title: Bootstrap and Publish the Local STT Server Control Plane
 description: Convert stt-server into an independent Rust control plane that manages local STT provider runtimes and returns versioned descriptors without carrying transcription traffic.
-status: in_progress
+status: done
 type: refactor
 scope: stt-server/crates, stt-server/sdk, stt-server release and CI configuration
 attempt: 2
 max_attempts: 5
 last_result: passed
-next_action: |
-  Implementation and verification are complete (see Attempt 2 in `## Attempts` and its
-  Verification Log entry) — every item in the previous next_action is done and evidenced with
-  real Windows testing. The only remaining step is operational, not implementation: bump the
-  workspace version (0.1.1 -> 0.2.0 — a minor bump, since previously-stub endpoints now have
-  real, differently-shaped behavior), commit, and push a `v0.2.0` tag so `release.yml` produces
-  real public release assets that `whisper-vibes`'s `STT_SERVER_VERSION` can pin to for
-  `cascading-provider-uninstall`'s Phase 2. Pushing the tag publishes a public GitHub Release —
-  gated on explicit user confirmation before that push happens. Once the tag is pushed and
-  `release.yml` succeeds, move this goal to `done/`.
+next_action: null
 success_criteria:
   - Server exposes local provider, model, hardware, recommendation, lifecycle, logs, and runtime-descriptor APIs.
   - Server never accepts, proxies, buffers, transcodes, or infers normal transcription audio.
@@ -342,9 +333,17 @@ earlier control-plane-conversion commits but not re-checked here.
   `%LOCALAPPDATA%\stt-server\` was untouched throughout. The real shared directory is the
   intended target for Phase 2 (`cascading-provider-uninstall`)'s own end-to-end test, not this
   goal's.
-- Not run: a check against a real GitHub Actions run for a tag beyond `v0.1.1` (this attempt's
-  own release hasn't been tagged/pushed yet — see `next_action`/pending user confirmation
-  before pushing a new public tag).
+- **Release cut, with explicit user confirmation obtained before pushing anything**: version
+  bumped to `0.2.0` (`Cargo.toml` workspace version), committed
+  (`6d91dc9` on `main`), pushed, tagged `v0.2.0`, tag pushed. `release.yml` ran end-to-end on
+  GitHub Actions and succeeded across every matrix leg: `build-binaries` (Linux + Windows),
+  `build-faster-whisper-sidecar` (Linux cpu; Windows cpu + gpu). Confirmed via
+  `gh release view v0.2.0 --repo mariuszRep/stt-server`: a real, published (non-draft)
+  public release at `https://github.com/mariuszRep/stt-server/releases/tag/v0.2.0` with all
+  five expected assets present (`stt-windows-x86_64.exe`, `stt-linux-x86_64`,
+  `faster-whisper-runtime-windows-cpu.exe`, `faster-whisper-runtime-windows-gpu.exe`,
+  `faster-whisper-runtime-linux-cpu`) — exactly what `whisper-vibes`'s `stage-stt-runtime.mjs`
+  expects to download for `STT_SERVER_VERSION=0.2.0`.
 
 ## Final Outcome
 
@@ -352,9 +351,10 @@ Success. All five `next_action` items implemented and verified with real evidenc
 downloads, real binaries, real filesystem state, real Windows hardware) — see `## Attempts`
 Attempt 2 and the Attempt 2 section of `## Verification Log` above. All prior acceptance
 criteria (1–8) remain satisfied; this attempt specifically closes the remaining gap in scope
-item 2 (real per-model lifecycle) that Attempt 1 left stubbed. Pending only: version bump +
-tagged release (next step, gated on explicit user confirmation before the tag is pushed, since
-that publishes a public GitHub Release).
+item 2 (real per-model lifecycle) that Attempt 1 left stubbed. A real `v0.2.0` release is now
+published on `mariuszRep/stt-server` with all expected platform artifacts — `whisper-vibes`'s
+`cascading-provider-uninstall` goal (Phase 2 of the same broader task) can now pin
+`STT_SERVER_VERSION` to it.
 
 ## Ready For Execution
 
