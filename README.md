@@ -72,12 +72,17 @@ runtime. Provider ids are validated strings (no path traversal).
 | GET | `/v1/models` | Curated model catalog across all providers |
 | POST | `/v1/models/select` | `{providerId, modelId}` — picked up on next `start` |
 | GET | `/v1/models/selected?provider=:id` | Currently selected model |
+| POST | `/v1/models/pull?provider=:id&model=:id` | Download a model's weights into stt-server's own model directory — instant `200` if already cached, else `202` + `operationId` to poll |
+| POST | `/v1/models/verify?provider=:id&model=:id` | Pure filesystem check: are this model's weights actually present on disk |
+| DELETE | `/v1/models/remove?provider=:id&model=:id` | Delete a model's cached weights, reclaiming disk space |
 | GET | `/v1/recommendations` | Hardware-driven provider/model/device suggestion |
 
-`POST /v1/models/:id/pull`, `/verify`, and `DELETE /v1/models/:id` exist for API
-completeness but return an explicit "automatic" response for faster-whisper — that runtime
-downloads/caches its own models via HuggingFace on first use, so there is no separate file
-for the control plane to manage.
+Model weights are stored under `<data root>/models/<provider-id>/<model-id>/` (see
+`stt_common::default_model_dir`/`default_data_root`) — an explicit, stt-server-owned
+location passed to the managed runtime as `download_root`, not the OS-default HuggingFace
+cache. `pull`/`verify`/`remove` are real filesystem operations, not stubs; `provider`/`model`
+are query params (not `:id` path segments) because model ids like
+`"Systran/faster-whisper-small"` contain their own `/`.
 
 ### GPU vs CPU variant installs
 
@@ -154,14 +159,21 @@ stt provider stop faster-whisper
 stt model list
 stt model select --provider faster-whisper --model Systran/faster-whisper-tiny
 stt model selected --provider faster-whisper
+stt model pull --provider faster-whisper --model Systran/faster-whisper-tiny    # blocks until downloaded; requires a provider variant already installed
+stt model verify --provider faster-whisper --model Systran/faster-whisper-tiny
+stt model remove --provider faster-whisper --model Systran/faster-whisper-tiny  # reclaim disk space
 
 stt descriptor faster-whisper
+
+stt reset --yes   # wipe every on-disk artifact stt-server manages (provider binaries + model weights) — no daemon needed
 ```
 
-`hardware`, `recommend`, and `provider|model list` run entirely in-process (no daemon
-needed). Every other subcommand talks over HTTP to an already-running `stt run` (`--server-url`,
-default `http://127.0.0.1:8080`) — that daemon process is the only place a provider's running
-state actually lives.
+`hardware`, `recommend`, `provider|model list`, and `reset` run entirely in-process (no
+daemon needed) — `reset` is a pure filesystem operation, deliberately independent of a live
+`stt run`, so an installer's uninstall hook can call the equivalent cleanup without spinning
+one up first. Every other subcommand talks over HTTP to an already-running `stt run`
+(`--server-url`, default `http://127.0.0.1:8080`) — that daemon process is the only place a
+provider's running state actually lives.
 
 ## Development
 

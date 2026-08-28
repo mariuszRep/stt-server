@@ -74,7 +74,12 @@ def get_model(device: str, compute_type: str) -> WhisperModel:
             f"[voice-typer] loading model={config.MODEL} device={device} compute_type={compute_type}",
             flush=True,
         )
-        _model = WhisperModel(config.MODEL, device=device, compute_type=compute_type)
+        _model = WhisperModel(
+            config.MODEL,
+            device=device,
+            compute_type=compute_type,
+            download_root=config.MODEL_DIR,
+        )
         _model_device = device
         _model_compute_type = compute_type
         _model_name = config.MODEL

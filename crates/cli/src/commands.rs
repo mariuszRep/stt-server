@@ -79,6 +79,29 @@ pub enum ModelCommands {
         #[arg(long)]
         provider: String,
     },
+    /// Download a model's weights into stt-server's own structured model
+    /// directory (blocks until done). Requires a provider variant to
+    /// already be installed.
+    Pull {
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        model: String,
+    },
+    /// Confirm a model's weights are actually present on disk
+    Verify {
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        model: String,
+    },
+    /// Delete a model's cached weights, reclaiming disk space
+    Remove {
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        model: String,
+    },
 }
 
 fn print_json(value: &serde_json::Value) {
@@ -93,6 +116,27 @@ pub fn hardware() -> anyhow::Result<()> {
 pub fn recommend() -> anyhow::Result<()> {
     let hardware = stt_runtime::hardware::detect();
     print_json(&serde_json::to_value(stt_runtime::recommend(&hardware))?);
+    Ok(())
+}
+
+/// Wipe every on-disk artifact stt-server manages (cached provider
+/// binaries and downloaded model weights) in one pure filesystem
+/// operation — deliberately independent of a running `stt run` daemon
+/// (calls `stt_common::purge_all_local_state` directly, never `Client`),
+/// so an installer's uninstall hook or a "clean-slate test" workflow can
+/// use it without spinning one up first. Destructive, so it requires
+/// `--yes` rather than acting on a bare `stt reset`.
+pub fn reset(yes: bool) -> anyhow::Result<()> {
+    let root = stt_common::resolved_data_root();
+    if !yes {
+        anyhow::bail!(
+            "this deletes {} and everything under it (cached provider binaries and \
+             downloaded model weights) — re-run with --yes to confirm",
+            root.display()
+        );
+    }
+    let removed = stt_common::purge_all_local_state()?;
+    println!("removed {}", removed.display());
     Ok(())
 }
 
@@ -126,15 +170,16 @@ pub fn provider_list() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Post to an install/update endpoint and, if the server kicked off a
-/// background download (`202 Accepted`, `status: "downloading"`), poll
-/// `/v1/install-operations/:id` to completion — the old synchronous "block
-/// until done" UX layered on top of the new non-blocking HTTP API.
-async fn install_and_wait(client: &Client, path: &str, variant: &str) -> anyhow::Result<Value> {
-    let response = client
-        .post(path, Some(json!({ "variant": variant })))
-        .await?;
-
+/// Poll `/v1/install-operations/:id` to completion. Shared by provider
+/// variant installs and model pulls — both are tracked through the same
+/// `InstallOperationState` table server-side, so one polling loop works for
+/// either kind; only the initial-response handling and `label` printed
+/// while waiting differ between callers.
+async fn wait_for_operation(
+    client: &Client,
+    response: Value,
+    label: &str,
+) -> anyhow::Result<Value> {
     if response.get("status").and_then(Value::as_str) != Some("downloading") {
         return Ok(response);
     }
@@ -142,10 +187,10 @@ async fn install_and_wait(client: &Client, path: &str, variant: &str) -> anyhow:
     let operation_id = response
         .get("operationId")
         .and_then(Value::as_str)
-        .context("server response was missing operationId for a downloading install")?
+        .context("server response was missing operationId for a downloading operation")?
         .to_string();
 
-    eprintln!("downloading {variant} build...");
+    eprintln!("downloading {label}...");
     loop {
         let state = client
             .get(&format!("/v1/install-operations/{operation_id}"))
@@ -173,12 +218,60 @@ async fn install_and_wait(client: &Client, path: &str, variant: &str) -> anyhow:
                 let error = state
                     .get("error")
                     .and_then(Value::as_str)
-                    .unwrap_or("download failed");
-                anyhow::bail!("install failed: {error}");
+                    .unwrap_or("operation failed");
+                anyhow::bail!("operation failed: {error}");
             }
-            other => anyhow::bail!("unexpected install operation status: {other}"),
+            other => anyhow::bail!("unexpected operation status: {other}"),
         }
     }
+}
+
+/// Post to an install/update endpoint and, if the server kicked off a
+/// background download (`202 Accepted`, `status: "downloading"`), poll it
+/// to completion — the old synchronous "block until done" UX layered on top
+/// of the new non-blocking HTTP API.
+async fn install_and_wait(client: &Client, path: &str, variant: &str) -> anyhow::Result<Value> {
+    let response = client
+        .post(path, Some(json!({ "variant": variant })))
+        .await?;
+    wait_for_operation(client, response, &format!("{variant} build")).await
+}
+
+/// `POST /v1/models/pull?provider=&model=` and, if the server kicked off a
+/// background download (`202 Accepted`, `status: "downloading"`), poll it to
+/// completion — mirrors `install_and_wait` for models.
+async fn pull_model_and_wait(
+    client: &Client,
+    provider: &str,
+    model: &str,
+) -> anyhow::Result<Value> {
+    let path = format!(
+        "/v1/models/pull?provider={}&model={}",
+        urlencoding_component(provider),
+        urlencoding_component(model)
+    );
+    let response = client.post(&path, None).await?;
+    wait_for_operation(client, response, model).await
+}
+
+/// Minimal query-string component encoder (no external crate dependency):
+/// percent-encodes everything outside the RFC 3986 "unreserved" set. Model
+/// ids like `"Systran/faster-whisper-small"` contain `/`, which must be
+/// encoded here since it's a query *value*, not a path segment — an
+/// unencoded `/` in a query value is harmless to most servers but encoding
+/// it is the only fully spec-correct behavior, and provider ids are cheap
+/// to run through the same helper for consistency.
+fn urlencoding_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 pub async fn provider(client: &Client, cmd: ProviderCommands) -> anyhow::Result<()> {
@@ -285,6 +378,31 @@ pub async fn model(client: &Client, cmd: ModelCommands) -> anyhow::Result<()> {
                 .get(&format!("/v1/models/selected?provider={provider}"))
                 .await?,
         ),
+        ModelCommands::Pull { provider, model } => {
+            print_json(&pull_model_and_wait(client, &provider, &model).await?)
+        }
+        ModelCommands::Verify { provider, model } => print_json(
+            &client
+                .post(
+                    &format!(
+                        "/v1/models/verify?provider={}&model={}",
+                        urlencoding_component(&provider),
+                        urlencoding_component(&model)
+                    ),
+                    None,
+                )
+                .await?,
+        ),
+        ModelCommands::Remove { provider, model } => {
+            client
+                .delete(&format!(
+                    "/v1/models/remove?provider={}&model={}",
+                    urlencoding_component(&provider),
+                    urlencoding_component(&model)
+                ))
+                .await?;
+            println!("removed {model} for {provider}");
+        }
     }
     Ok(())
 }

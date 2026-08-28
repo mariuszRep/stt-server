@@ -41,6 +41,15 @@ enum Commands {
     Recommend,
     /// Print a running provider's connection descriptor
     Descriptor { provider_id: String },
+    /// Wipe every on-disk artifact stt-server manages (cached provider
+    /// binaries, downloaded model weights) — a pure filesystem operation,
+    /// no running daemon required
+    Reset {
+        /// Required to actually delete anything; omitting it prints what
+        /// would be removed instead
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[tokio::main]
@@ -55,5 +64,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::Model { command } => commands::model(&client, command).await,
         Commands::Recommend => commands::recommend(),
         Commands::Descriptor { provider_id } => commands::descriptor(&client, &provider_id).await,
+        Commands::Reset { yes } => commands::reset(yes),
     }
 }

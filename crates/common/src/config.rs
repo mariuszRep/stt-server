@@ -85,20 +85,61 @@ impl ServerConfig {
     }
 }
 
+/// Root of every on-disk artifact `stt-server` manages for itself —
+/// downloaded model weights and cached provider runtime binaries alike.
+/// This is the single confirmed root an installer's uninstall hook (or any
+/// other daemon-independent cleanup) can safely wipe wholesale, since
+/// nothing else is ever written here.
+pub fn default_data_root() -> PathBuf {
+    dirs_or_fallback().join("stt-server")
+}
+
 /// Default model directory based on platform.
 pub fn default_model_dir() -> PathBuf {
-    dirs_or_fallback().join("stt-server").join("models")
+    default_data_root().join("models")
 }
 
 /// Where downloaded managed-runtime artifacts (e.g. a packaged
 /// faster-whisper build fetched for a given variant) are cached on disk.
 /// Same `dirs::data_local_dir()` convention as [`default_model_dir`].
 pub fn default_runtime_cache_dir() -> PathBuf {
-    dirs_or_fallback().join("stt-server").join("runtimes")
+    default_data_root().join("runtimes")
 }
 
 fn dirs_or_fallback() -> PathBuf {
     dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Overrides [`default_data_root`] for tests, so a purge test never touches
+/// the real user's `%LOCALAPPDATA%\stt-server\`.
+pub const DATA_ROOT_ENV_VAR: &str = "STT_DATA_ROOT";
+
+/// The data root actually in effect — [`DATA_ROOT_ENV_VAR`] if set,
+/// [`default_data_root`] otherwise. `pub` (not just used internally by
+/// [`purge_all_local_state`]) specifically so a caller that wants to *tell
+/// the user* what's about to be deleted — e.g. `stt reset`'s confirmation
+/// prompt — shows the real target, not [`default_data_root`]'s unconditional
+/// answer, which would silently disagree with the override during tests and
+/// confuse whoever's reading the message.
+pub fn resolved_data_root() -> PathBuf {
+    std::env::var(DATA_ROOT_ENV_VAR)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| default_data_root())
+}
+
+/// Wipe every on-disk artifact `stt-server` manages — model weights and
+/// cached provider runtime binaries alike — in one pure filesystem
+/// operation. Deliberately independent of `RuntimeManager`/`AppState`/HTTP:
+/// an installer's uninstall hook (or a user running `stt reset`) must be
+/// able to call this without first spinning up a whole daemon. Idempotent:
+/// `Ok` if the root was already absent. Returns the root it operated on, so
+/// a caller can report exactly what was (or would have been) removed.
+pub fn purge_all_local_state() -> std::io::Result<PathBuf> {
+    let root = resolved_data_root();
+    if root.is_dir() {
+        std::fs::remove_dir_all(&root)?;
+    }
+    Ok(root)
 }
 
 #[cfg(test)]
@@ -165,5 +206,43 @@ mod tests {
         assert!(is_loopback_host("localhost"));
         assert!(!is_loopback_host("0.0.0.0"));
         assert!(!is_loopback_host("192.168.1.5"));
+    }
+
+    // Serializes tests that mutate the process-wide DATA_ROOT_ENV_VAR — same
+    // rationale as stt-runtime's ENV_TEST_LOCK (crates/runtime's default
+    // test harness runs #[test] functions concurrently on separate threads
+    // within the same process).
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn purge_all_local_state_removes_the_whole_data_root_and_is_idempotent() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let root =
+            std::env::temp_dir().join(format!("stt-purge-test-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(root.join("models").join("faster-whisper")).unwrap();
+        std::fs::create_dir_all(root.join("runtimes").join("faster-whisper")).unwrap();
+        std::fs::write(root.join("models/faster-whisper/marker"), b"x").unwrap();
+
+        // SAFETY: test-only env var mutation, scoped to this single test.
+        unsafe {
+            std::env::set_var(DATA_ROOT_ENV_VAR, &root);
+        }
+
+        purge_all_local_state().unwrap();
+        assert!(!root.exists());
+
+        // Idempotent: purging an already-absent root is not an error.
+        purge_all_local_state().unwrap();
+
+        unsafe {
+            std::env::remove_var(DATA_ROOT_ENV_VAR);
+        }
+    }
+
+    #[test]
+    fn default_model_dir_and_runtime_cache_dir_nest_under_the_same_data_root() {
+        let root = default_data_root();
+        assert_eq!(default_model_dir(), root.join("models"));
+        assert_eq!(default_runtime_cache_dir(), root.join("runtimes"));
     }
 }

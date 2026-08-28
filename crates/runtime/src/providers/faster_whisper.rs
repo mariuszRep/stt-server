@@ -270,6 +270,134 @@ pub fn remove_cached_variant(variant: RuntimeVariant) -> Result<(), RuntimeError
     Ok(())
 }
 
+/// Overrides where downloaded model weights are cached
+/// (`stt_common::default_model_dir()` otherwise). Mainly for tests, so a
+/// download/verify/remove test never touches the real user's data-local
+/// directory.
+pub const MODEL_CACHE_DIR_ENV_VAR: &str = "STT_FASTER_WHISPER_MODEL_DIR";
+
+/// On-disk directory a given model's weights live in — a flat, predictable
+/// `<model-root>/faster-whisper/<model-id>/` layout (deliberately *not*
+/// HuggingFace's own hashed `hub/models--org--name/snapshots/<hash>/` cache
+/// scheme), passed straight through as `download_root` so `verify`/`remove`
+/// can operate on it directly without knowing anything about HF's internal
+/// layout. `model_id` values like `"Systran/faster-whisper-small"` contain
+/// their own `/`, which `PathBuf::join` treats as another path component —
+/// harmless here since ids only ever come from the curated catalog, never
+/// caller-supplied paths.
+pub fn cached_model_dir(model_id: &str) -> PathBuf {
+    let root = std::env::var(MODEL_CACHE_DIR_ENV_VAR)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| stt_common::default_model_dir());
+    root.join("faster-whisper").join(model_id)
+}
+
+/// The one file whose presence/size actually proves a model finished
+/// downloading — always part of a CTranslate2-converted faster-whisper
+/// model's HF repo, regardless of model size or which repo it came from.
+const MODEL_WEIGHTS_FILENAME: &str = "model.bin";
+
+/// Whether `model_id`'s weights are present on disk, and their size if so.
+/// A pure filesystem check — no subprocess, no network — mirroring how
+/// `remove_cached_variant` needs neither to clean up.
+pub fn verify_cached_model(model_id: &str) -> Result<Option<u64>, RuntimeError> {
+    let weights = cached_model_dir(model_id).join(MODEL_WEIGHTS_FILENAME);
+    match std::fs::metadata(&weights) {
+        Ok(meta) if meta.len() > 0 => Ok(Some(meta.len())),
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(RuntimeError::Io(e)),
+    }
+}
+
+/// Delete a previously-downloaded model's cached directory. Idempotent —
+/// `Ok` if it was never downloaded, matching `remove_cached_variant`'s
+/// spirit.
+pub fn remove_cached_model(model_id: &str) -> Result<(), RuntimeError> {
+    let dir = cached_model_dir(model_id);
+    if dir.is_dir() {
+        std::fs::remove_dir_all(&dir).map_err(RuntimeError::Io)?;
+    }
+    Ok(())
+}
+
+/// Locate any usable local copy of the runtime, packaged or raw source,
+/// regardless of which hardware variant it is. Unlike [`install_local`],
+/// variant doesn't matter here: a plain model-weight download exercises
+/// none of CTranslate2/CUDA, so whichever copy happens to be present
+/// (preferring a vendored dev copy, then a cached CPU build, then GPU) can
+/// run it. Returns the program, base args, and working directory needed to
+/// spawn it.
+fn resolve_download_runtime() -> Option<(PathBuf, Vec<String>, PathBuf)> {
+    if let Some(runtime_dir) = locate_runtime_dir() {
+        match detect_runtime_kind(&runtime_dir) {
+            Some(RuntimeKind::Packaged(exe_path)) => return Some((exe_path, vec![], runtime_dir)),
+            Some(RuntimeKind::RawSource) => {
+                if let Ok(python) = resolve_python() {
+                    return Some((
+                        PathBuf::from(python),
+                        vec!["run_sidecar.py".to_string()],
+                        runtime_dir,
+                    ));
+                }
+            }
+            None => {}
+        }
+    }
+
+    for variant in [RuntimeVariant::Cpu, RuntimeVariant::Gpu] {
+        let cached = cached_variant_exe_path(variant);
+        if cached.is_file() {
+            let dir = cached
+                .parent()
+                .expect("cached_variant_exe_path always has a parent")
+                .to_path_buf();
+            return Some((cached, vec![], dir));
+        }
+    }
+
+    None
+}
+
+/// Download `model_id`'s weights into `output_dir` by spawning the local
+/// runtime in its `download-model` mode (see `run_sidecar.py`) and waiting
+/// for it to exit — no HTTP server is started, no CUDA/CTranslate2 model is
+/// constructed, just the underlying HuggingFace fetch. Requires a provider
+/// variant to already be installed locally: there's no other way to get a
+/// Python + faster-whisper environment capable of running the fetch, so a
+/// clean error is returned rather than attempting to auto-install one
+/// (auto-installing a variant just to pull a model would be a surprising
+/// side effect of what's meant to be an explicit, curated action).
+pub async fn download_model(model_id: &str, output_dir: &Path) -> Result<(), RuntimeError> {
+    let (program, mut args, cwd) = resolve_download_runtime().ok_or_else(|| {
+        RuntimeError::ProviderNotInstalled(
+            "no local faster-whisper runtime found — install a provider variant first \
+             (e.g. `stt provider install faster-whisper`) before pulling a model"
+                .to_string(),
+        )
+    })?;
+    args.push("download-model".to_string());
+    args.push(model_id.to_string());
+    args.push(output_dir.to_string_lossy().to_string());
+
+    std::fs::create_dir_all(output_dir).map_err(RuntimeError::Io)?;
+
+    let output = tokio::process::Command::new(&program)
+        .args(&args)
+        .current_dir(&cwd)
+        .output()
+        .await
+        .map_err(RuntimeError::Io)?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(RuntimeError::DownloadFailed(format!(
+            "model download for {model_id} failed: {stderr}"
+        )));
+    }
+    Ok(())
+}
+
 /// Progress of an in-flight release-asset download.
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadProgress {
@@ -347,10 +475,17 @@ pub async fn download_variant(
     Ok(packaged_launch_builder(dest, dest_dir))
 }
 
-/// Env vars every launch form shares: host/port/auth/model/device/compute_type,
-/// the `VOICE_TYPER_*` contract both the packaged exe and `run_sidecar.py`
-/// read identically. `VOICE_TYPER_HOST` follows `options.bind_host` (default
-/// loopback) so LAN mode actually binds where the caller asked —
+/// Env vars every launch form shares: host/port/auth/model/model
+/// dir/device/compute_type, the `VOICE_TYPER_*` contract both the packaged
+/// exe and `run_sidecar.py` read identically. `VOICE_TYPER_MODEL_DIR` is
+/// `cached_model_dir(model)` — an explicit, stt-server-owned download
+/// location passed to `WhisperModel(download_root=...)` instead of letting
+/// weights land wherever the OS-default HuggingFace cache happens to be,
+/// per CONVENTIONS.md's "no invisible model download" rule: the location is
+/// now explicit and inspectable even though the lazy download-on-first-use
+/// behavior itself is unchanged. `VOICE_TYPER_HOST` follows
+/// `options.bind_host` (default loopback) so LAN mode actually binds where
+/// the caller asked —
 /// `RuntimeManager::start` has already validated it's either loopback or the
 /// wildcard `"0.0.0.0"` before this runs.
 fn build_env(
@@ -365,6 +500,10 @@ fn build_env(
     ];
     if let Some(model) = selected_model {
         env.push(("VOICE_TYPER_MODEL".to_string(), model.to_string()));
+        env.push((
+            "VOICE_TYPER_MODEL_DIR".to_string(),
+            cached_model_dir(model).to_string_lossy().to_string(),
+        ));
     }
     if let Some(device) = &options.device {
         env.push(("VOICE_TYPER_DEVICE".to_string(), device.clone()));
@@ -489,6 +628,10 @@ mod tests {
             "VOICE_TYPER_MODEL".to_string(),
             "Systran/faster-whisper-tiny".to_string()
         )));
+        assert!(
+            launch.env.iter().any(|(k, _)| k == "VOICE_TYPER_MODEL_DIR"),
+            "expected an explicit VOICE_TYPER_MODEL_DIR alongside VOICE_TYPER_MODEL"
+        );
     }
 
     #[test]
@@ -888,7 +1031,12 @@ mod tests {
         .unwrap();
 
         let port = crate::supervisor::allocate_loopback_port().unwrap();
-        let mut server = tokio::process::Command::new("python3")
+        // `python_candidates()[0]` (not a literal "python3"): a plain
+        // Windows venv only ever provides `python.exe`, and a literal
+        // "python3" resolves to Windows's "app execution alias" stub
+        // instead of erroring outright, which silently exits without
+        // binding the port rather than failing loudly at spawn time.
+        let mut server = tokio::process::Command::new(python_candidates()[0])
             .args([
                 "-m",
                 "http.server",
@@ -963,5 +1111,89 @@ mod tests {
 
         std::fs::remove_dir_all(&serve_dir).ok();
         std::fs::remove_dir_all(&cache_root).ok();
+    }
+
+    #[test]
+    fn cached_model_dir_nests_under_the_model_root_and_honors_the_env_override() {
+        let _guard = lock_env_test();
+        let root = std::env::temp_dir().join(format!(
+            "stt-model-dir-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        // SAFETY: test-only env var mutation, scoped to this single test.
+        unsafe {
+            std::env::set_var(MODEL_CACHE_DIR_ENV_VAR, &root);
+        }
+        let dir = cached_model_dir("Systran/faster-whisper-tiny");
+        unsafe {
+            std::env::remove_var(MODEL_CACHE_DIR_ENV_VAR);
+        }
+        assert_eq!(
+            dir,
+            root.join("faster-whisper")
+                .join("Systran")
+                .join("faster-whisper-tiny")
+        );
+    }
+
+    #[test]
+    fn verify_and_remove_cached_model_round_trip_against_real_files() {
+        let _guard = lock_env_test();
+        let root = std::env::temp_dir().join(format!(
+            "stt-model-verify-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        // SAFETY: test-only env var mutation, scoped to this single test.
+        unsafe {
+            std::env::set_var(MODEL_CACHE_DIR_ENV_VAR, &root);
+        }
+
+        assert_eq!(verify_cached_model("some/model").unwrap(), None);
+        remove_cached_model("some/model")
+            .expect("removing an absent model is a no-op, not an error");
+
+        let dir = cached_model_dir("some/model");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(MODEL_WEIGHTS_FILENAME), b"fake weights").unwrap();
+
+        assert_eq!(
+            verify_cached_model("some/model").unwrap(),
+            Some(b"fake weights".len() as u64)
+        );
+
+        remove_cached_model("some/model").unwrap();
+        assert_eq!(verify_cached_model("some/model").unwrap(), None);
+        assert!(!dir.exists());
+
+        unsafe {
+            std::env::remove_var(MODEL_CACHE_DIR_ENV_VAR);
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn verify_cached_model_treats_an_empty_weights_file_as_not_verified() {
+        let _guard = lock_env_test();
+        let root = std::env::temp_dir().join(format!(
+            "stt-model-verify-empty-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        // SAFETY: test-only env var mutation, scoped to this single test.
+        unsafe {
+            std::env::set_var(MODEL_CACHE_DIR_ENV_VAR, &root);
+        }
+        let dir = cached_model_dir("some/model");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(MODEL_WEIGHTS_FILENAME), b"").unwrap();
+
+        assert_eq!(verify_cached_model("some/model").unwrap(), None);
+
+        unsafe {
+            std::env::remove_var(MODEL_CACHE_DIR_ENV_VAR);
+        }
+        std::fs::remove_dir_all(&root).ok();
     }
 }

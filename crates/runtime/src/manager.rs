@@ -93,11 +93,26 @@ pub enum InstallOperationStatus {
 pub struct InstallOperationState {
     pub operation_id: String,
     pub provider_id: String,
-    pub variant: String,
+    /// `Some` for a provider-variant install, `None` for a model pull —
+    /// exactly one of `variant`/`model_id` is ever set, distinguishing which
+    /// kind of download this operation is without a separate `kind` enum.
+    pub variant: Option<String>,
+    pub model_id: Option<String>,
     pub status: InstallOperationStatus,
     pub downloaded_bytes: u64,
     pub total_bytes: Option<u64>,
     pub error: Option<String>,
+}
+
+/// Result of [`RuntimeManager::begin_model_pull`]: either the model's
+/// weights were already present on disk (instant, no network — the common
+/// case for a model pulled in an earlier session), or a download was kicked
+/// off in the background, pollable via the same `/v1/install-operations/:id`
+/// mechanism [`RuntimeManager::begin_install`] uses.
+#[derive(Debug, Clone)]
+pub enum ModelPullOutcome {
+    Cached,
+    Downloading { operation_id: String },
 }
 
 /// Result of [`RuntimeManager::begin_install`]: either the requested
@@ -216,7 +231,7 @@ impl RuntimeManager {
             let installs = self.installs.lock().expect("installs mutex poisoned");
             if let Some(existing) = installs.values().find(|op| {
                 op.provider_id == id.as_str()
-                    && op.variant == variant.as_str()
+                    && op.variant.as_deref() == Some(variant.as_str())
                     && matches!(op.status, InstallOperationStatus::Downloading)
             }) {
                 return Ok(InstallOutcome::Downloading {
@@ -235,7 +250,8 @@ impl RuntimeManager {
                 InstallOperationState {
                     operation_id: operation_id.clone(),
                     provider_id: id.to_string(),
-                    variant: variant.as_str().to_string(),
+                    variant: Some(variant.as_str().to_string()),
+                    model_id: None,
                     status: InstallOperationStatus::Downloading,
                     downloaded_bytes: 0,
                     total_bytes: None,
@@ -309,14 +325,129 @@ impl RuntimeManager {
         faster_whisper::remove_cached_variant(variant)
     }
 
-    /// Remove a provider's install registration, stopping it first if running.
+    /// Remove a provider's install registration, stopping it first if
+    /// running, *and* cascade-delete every cached variant binary on disk —
+    /// not just whichever variant happened to be registered. A full
+    /// provider uninstall means "get rid of this provider entirely"; a
+    /// stray cached GPU binary from earlier testing that was never
+    /// re-registered this session would otherwise silently survive it,
+    /// which is exactly the class of leftover-state bug this exists to
+    /// close (compare `uninstall_variant`, which correctly real-cleans a
+    /// single variant already — this brings whole-provider uninstall up to
+    /// the same standard rather than leaving it memory-only).
     pub async fn uninstall(&self, id: &ProviderId) -> Result<(), RuntimeError> {
         let _ = self.stop(id).await; // fine if it wasn't running
         let mut installed = self.installed.lock().await;
         if installed.remove(id.as_str()).is_none() {
             return Err(RuntimeError::ProviderNotInstalled(id.to_string()));
         }
+        drop(installed);
+        for variant in [RuntimeVariant::Cpu, RuntimeVariant::Gpu] {
+            faster_whisper::remove_cached_variant(variant)?;
+        }
         Ok(())
+    }
+
+    /// Download `model_id`'s weights for `id`, reusing the same
+    /// `InstallOperationState` progress-polling table `begin_install` uses
+    /// (`GET /v1/install-operations/:id` works for either kind unchanged).
+    /// Only `faster-whisper` is a real provider today, same dispatch
+    /// rationale as `begin_install`.
+    pub async fn begin_model_pull(
+        self: &Arc<Self>,
+        id: &ProviderId,
+        model_id: &str,
+    ) -> Result<ModelPullOutcome, RuntimeError> {
+        let entry = catalog::find_provider(id)?;
+        catalog::find_model(entry, model_id)
+            .ok_or_else(|| RuntimeError::ModelNotFound(model_id.to_string()))?;
+        if id.as_str() != "faster-whisper" {
+            return Err(RuntimeError::ProviderNotFound(id.to_string()));
+        }
+
+        if faster_whisper::verify_cached_model(model_id)?.is_some() {
+            return Ok(ModelPullOutcome::Cached);
+        }
+
+        {
+            let installs = self.installs.lock().expect("installs mutex poisoned");
+            if let Some(existing) = installs.values().find(|op| {
+                op.provider_id == id.as_str()
+                    && op.model_id.as_deref() == Some(model_id)
+                    && matches!(op.status, InstallOperationStatus::Downloading)
+            }) {
+                return Ok(ModelPullOutcome::Downloading {
+                    operation_id: existing.operation_id.clone(),
+                });
+            }
+        }
+
+        let operation_id = Uuid::new_v4().to_string();
+        {
+            let mut installs = self.installs.lock().expect("installs mutex poisoned");
+            evict_finished_operations_if_over_capacity(&mut installs);
+            installs.insert(
+                operation_id.clone(),
+                InstallOperationState {
+                    operation_id: operation_id.clone(),
+                    provider_id: id.to_string(),
+                    variant: None,
+                    model_id: Some(model_id.to_string()),
+                    status: InstallOperationStatus::Downloading,
+                    downloaded_bytes: 0,
+                    total_bytes: None,
+                    error: None,
+                },
+            );
+        }
+
+        let manager = Arc::clone(self);
+        let model_id_owned = model_id.to_string();
+        let op_id = operation_id.clone();
+        tokio::spawn(async move {
+            let output_dir = faster_whisper::cached_model_dir(&model_id_owned);
+            let result = faster_whisper::download_model(&model_id_owned, &output_dir).await;
+            match result {
+                Ok(()) => {
+                    let mut installs = manager.installs.lock().expect("installs mutex poisoned");
+                    if let Some(state) = installs.get_mut(&op_id) {
+                        state.status = InstallOperationStatus::Complete;
+                    }
+                }
+                Err(e) => {
+                    warn!(model = %model_id_owned, error = %e, "model download failed");
+                    let mut installs = manager.installs.lock().expect("installs mutex poisoned");
+                    if let Some(state) = installs.get_mut(&op_id) {
+                        state.status = InstallOperationStatus::Failed;
+                        state.error = Some(e.to_string());
+                    }
+                }
+            }
+        });
+
+        Ok(ModelPullOutcome::Downloading { operation_id })
+    }
+
+    /// Whether `model_id`'s weights are present on disk for `id`, and their
+    /// size if so. A pure filesystem check — no subprocess, no network.
+    pub fn verify_model(
+        &self,
+        id: &ProviderId,
+        model_id: &str,
+    ) -> Result<Option<u64>, RuntimeError> {
+        let entry = catalog::find_provider(id)?;
+        catalog::find_model(entry, model_id)
+            .ok_or_else(|| RuntimeError::ModelNotFound(model_id.to_string()))?;
+        faster_whisper::verify_cached_model(model_id)
+    }
+
+    /// Delete a previously-downloaded model's cached weights. Idempotent —
+    /// `Ok` if it was never downloaded.
+    pub fn remove_model(&self, id: &ProviderId, model_id: &str) -> Result<(), RuntimeError> {
+        let entry = catalog::find_provider(id)?;
+        catalog::find_model(entry, model_id)
+            .ok_or_else(|| RuntimeError::ModelNotFound(model_id.to_string()))?;
+        faster_whisper::remove_cached_model(model_id)
     }
 
     /// Select which curated model a provider should load on its next
@@ -612,6 +743,19 @@ async fn fetch_streaming_capability(port: u16) -> Option<StreamingCapability> {
 mod tests {
     use super::*;
 
+    /// `python -m venv` only creates `Scripts\python.exe` on Windows — no
+    /// `python3.exe` — matching `providers::faster_whisper::python_candidates`'s
+    /// same rationale. These fake-runtime test helpers need a name
+    /// guaranteed to resolve to a real interpreter, not Windows's
+    /// `python3.exe` "app execution alias" stub.
+    fn python_bin() -> &'static str {
+        if cfg!(windows) {
+            "python"
+        } else {
+            "python3"
+        }
+    }
+
     /// The `faster-whisper` catalog entry's health path is `/health`, so the
     /// fake runtime needs an actual file there for `http.server` to serve
     /// (unlike supervisor.rs's tests, which use `/` directly). No `/v1/config`
@@ -624,7 +768,7 @@ mod tests {
             std::fs::create_dir_all(&dir).expect("create fake runtime temp dir");
             std::fs::write(dir.join("health"), b"ok").expect("write fake health file");
             Launch {
-                program: "python3".into(),
+                program: python_bin().into(),
                 args: vec![
                     "-m".into(),
                     "http.server".into(),
@@ -665,7 +809,7 @@ mod tests {
             )
             .expect("write fake config file");
             Launch {
-                program: "python3".into(),
+                program: python_bin().into(),
                 args: vec![
                     "-m".into(),
                     "http.server".into(),
@@ -695,7 +839,7 @@ mod tests {
             std::fs::create_dir_all(&dir).expect("create fake runtime temp dir");
             std::fs::write(dir.join("health"), b"ok").expect("write fake health file");
             Launch {
-                program: "python3".into(),
+                program: python_bin().into(),
                 args: vec![
                     "-m".into(),
                     "http.server".into(),
@@ -847,6 +991,116 @@ mod tests {
             manager.selected_model(&id).await,
             Some("Systran/faster-whisper-tiny".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn verify_and_remove_model_validate_against_the_catalog() {
+        let manager = manager_with_faster_whisper_installed(None).await;
+        let id = ProviderId::new("faster-whisper").unwrap();
+
+        assert!(matches!(
+            manager.verify_model(&id, "not-a-real-model"),
+            Err(RuntimeError::ModelNotFound(_))
+        ));
+        assert!(matches!(
+            manager.remove_model(&id, "not-a-real-model"),
+            Err(RuntimeError::ModelNotFound(_))
+        ));
+
+        let bogus_provider = ProviderId::new("not-a-real-provider").unwrap();
+        assert!(matches!(
+            manager.verify_model(&bogus_provider, "Systran/faster-whisper-tiny"),
+            Err(RuntimeError::ProviderNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn verify_and_remove_model_round_trip_against_real_cached_weights() {
+        let manager = manager_with_faster_whisper_installed(None).await;
+        let id = ProviderId::new("faster-whisper").unwrap();
+        let model_id = "Systran/faster-whisper-tiny";
+
+        // Acquired after the only `.await` in this test (registering the
+        // fake install above touches none of the env vars this guards) so
+        // the lock never spans an await point.
+        let _guard = faster_whisper::lock_env_test();
+        let root = std::env::temp_dir().join(format!(
+            "stt-manager-model-verify-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        // SAFETY: test-only env var mutation, scoped to this single test.
+        unsafe {
+            std::env::set_var(faster_whisper::MODEL_CACHE_DIR_ENV_VAR, &root);
+        }
+
+        assert_eq!(manager.verify_model(&id, model_id).unwrap(), None);
+        manager.remove_model(&id, model_id).unwrap(); // no-op, not an error
+
+        let dir = faster_whisper::cached_model_dir(model_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.bin"), b"fake weights").unwrap();
+        assert!(manager.verify_model(&id, model_id).unwrap().is_some());
+
+        manager.remove_model(&id, model_id).unwrap();
+        assert_eq!(manager.verify_model(&id, model_id).unwrap(), None);
+
+        unsafe {
+            std::env::remove_var(faster_whisper::MODEL_CACHE_DIR_ENV_VAR);
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    // `begin_model_pull` reads `MODEL_CACHE_DIR_ENV_VAR` synchronously
+    // inside the awaited call itself, so unlike the other env-var-guarded
+    // tests here, `_guard` genuinely must span that one `.await` — this is
+    // a `#[tokio::test]`'s default single-threaded runtime, so holding a
+    // std `Mutex` across it can't deadlock (no other task on the same
+    // thread contends for it); it only ever blocks a *different OS thread*
+    // running a different test that needs the same process-wide env var.
+    #[allow(clippy::await_holding_lock)]
+    async fn begin_model_pull_returns_cached_instantly_when_weights_already_present() {
+        let _guard = faster_whisper::lock_env_test();
+        let manager = std::sync::Arc::new(manager_with_faster_whisper_installed(None).await);
+        let id = ProviderId::new("faster-whisper").unwrap();
+        let model_id = "Systran/faster-whisper-tiny";
+
+        let root = std::env::temp_dir().join(format!(
+            "stt-manager-model-pull-cached-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        // SAFETY: test-only env var mutation, scoped to this single test.
+        unsafe {
+            std::env::set_var(faster_whisper::MODEL_CACHE_DIR_ENV_VAR, &root);
+        }
+        let dir = faster_whisper::cached_model_dir(model_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.bin"), b"fake weights").unwrap();
+
+        let outcome = manager.begin_model_pull(&id, model_id).await.unwrap();
+
+        unsafe {
+            std::env::remove_var(faster_whisper::MODEL_CACHE_DIR_ENV_VAR);
+        }
+        std::fs::remove_dir_all(&root).ok();
+
+        assert!(
+            matches!(outcome, ModelPullOutcome::Cached),
+            "expected already-cached weights to short-circuit the download, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_model_pull_rejects_an_unknown_model() {
+        let manager = std::sync::Arc::new(manager_with_faster_whisper_installed(None).await);
+        let id = ProviderId::new("faster-whisper").unwrap();
+
+        assert!(matches!(
+            manager.begin_model_pull(&id, "not-a-real-model").await,
+            Err(RuntimeError::ModelNotFound(_))
+        ));
     }
 
     #[tokio::test]
@@ -1067,7 +1321,7 @@ mod tests {
         .unwrap();
 
         let port = supervisor::allocate_loopback_port().unwrap();
-        let server = tokio::process::Command::new("python3")
+        let server = tokio::process::Command::new(python_bin())
             .args([
                 "-m",
                 "http.server",
@@ -1250,6 +1504,58 @@ mod tests {
         assert!(
             found_after_uninstall.is_none(),
             "expected the cached copy to be gone after uninstall_variant"
+        );
+    }
+
+    #[tokio::test]
+    // Regression test for the cascade-delete fix: a full provider
+    // uninstall used to only clear the in-memory registration
+    // (`installed.remove(...)`), leaving cached variant binaries on disk
+    // untouched — including a variant that was never re-registered this
+    // session (e.g. a stray GPU binary from earlier testing). This proves
+    // *both* variants' cache directories are gone afterward, not just
+    // whichever one happened to be the registered launch. `_guard` must
+    // span `uninstall(...).await` (it reads `RUNTIME_CACHE_DIR_ENV_VAR`
+    // internally) — safe under `#[tokio::test]`'s single-threaded runtime,
+    // see the identical justification on `begin_model_pull_returns_cached_instantly_when_weights_already_present`.
+    #[allow(clippy::await_holding_lock)]
+    async fn uninstall_cascades_and_removes_every_cached_variant_not_just_the_registered_one() {
+        let _guard = faster_whisper::lock_env_test();
+        let cache_root = std::env::temp_dir().join(format!(
+            "stt-uninstall-cascade-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        for variant in [RuntimeVariant::Cpu, RuntimeVariant::Gpu] {
+            let dir = cache_root.join("faster-whisper").join(variant.as_str());
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("fake-exe"), b"fake").unwrap();
+        }
+
+        // SAFETY: test-only env var mutation, scoped to this single test.
+        unsafe {
+            std::env::set_var(faster_whisper::RUNTIME_CACHE_DIR_ENV_VAR, &cache_root);
+        }
+
+        let manager = manager_with_faster_whisper_installed(None).await; // registers only the Cpu variant
+        let id = ProviderId::new("faster-whisper").unwrap();
+        manager.uninstall(&id).await.unwrap();
+
+        let cpu_survived = cache_root.join("faster-whisper").join("cpu").exists();
+        let gpu_survived = cache_root.join("faster-whisper").join("gpu").exists();
+
+        unsafe {
+            std::env::remove_var(faster_whisper::RUNTIME_CACHE_DIR_ENV_VAR);
+        }
+        std::fs::remove_dir_all(&cache_root).ok();
+
+        assert!(
+            !cpu_survived,
+            "expected the registered cpu variant's cache to be gone"
+        );
+        assert!(
+            !gpu_survived,
+            "expected the never-registered gpu variant's stray cache to be gone too"
         );
     }
 }

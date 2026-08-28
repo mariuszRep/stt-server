@@ -135,6 +135,14 @@ def _own_build_variant() -> str | None:
 HOST = os.environ.get("VOICE_TYPER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("VOICE_TYPER_PORT", "8000"))
 MODEL = os.environ.get("VOICE_TYPER_MODEL", "Systran/faster-whisper-small")
+# Explicit, stt-server-owned download location for this model's weights
+# (crates/runtime/src/providers/faster_whisper.rs::cached_model_dir) instead
+# of whatever the OS-default HuggingFace cache happens to be — the
+# CONVENTIONS.md "no invisible model download" rule requires the location
+# be explicit and inspectable. `None` (unset) falls back to faster_whisper's
+# own default cache resolution, which only real-world callers outside the
+# managed-runtime launch path (build_env always sets this) would hit.
+MODEL_DIR = os.environ.get("VOICE_TYPER_MODEL_DIR") or None
 BUILD_VARIANT = _own_build_variant()
 CUDA_AVAILABLE = _cuda_available()
 CUDA_SUPPORTED_COMPUTE_TYPES = _cuda_supported_compute_types()

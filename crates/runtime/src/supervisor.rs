@@ -407,12 +407,27 @@ async fn wait_for_health(url: &str, timeout: Duration) -> Result<(), RuntimeErro
 mod tests {
     use super::*;
 
+    /// `python -m venv` only creates `Scripts\python.exe` on Windows — no
+    /// `python3.exe` — but always creates both `bin/python` and `bin/python3`
+    /// on Unix (same rationale as `providers::faster_whisper::python_candidates`).
+    /// These fake-runtime test helpers need a name that's guaranteed to
+    /// resolve to a real interpreter, not Windows's `python3.exe` "app
+    /// execution alias" stub (which exists on `PATH` even with no real
+    /// Python installed and errors instead of running anything).
+    fn python_bin() -> &'static str {
+        if cfg!(windows) {
+            "python"
+        } else {
+            "python3"
+        }
+    }
+
     /// Stands in for a managed runtime process without depending on the
-    /// real (Python) one: `python3 -m http.server` answers 200 on `/` for
+    /// real (Python) one: `python -m http.server` answers 200 on `/` for
     /// any GET, which is enough to exercise spawn/health-poll/logs/stop.
     fn fake_runtime_spec(port: u16) -> SpawnSpec {
         SpawnSpec {
-            program: "python3".into(),
+            program: python_bin().into(),
             args: vec![
                 "-m".into(),
                 "http.server".into(),
@@ -459,7 +474,7 @@ mod tests {
         // This process never binds the port or answers /health, so every
         // health-poll attempt fails until the (short, test-only) timeout.
         let spec = SpawnSpec {
-            program: "python3".into(),
+            program: python_bin().into(),
             args: vec![
                 "-u".into(), // unbuffered stdout, so the log reader sees the print immediately
                 "-c".into(),

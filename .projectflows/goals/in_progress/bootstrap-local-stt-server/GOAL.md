@@ -2,13 +2,22 @@
 name: bootstrap-local-stt-server
 title: Bootstrap and Publish the Local STT Server Control Plane
 description: Convert stt-server into an independent Rust control plane that manages local STT provider runtimes and returns versioned descriptors without carrying transcription traffic.
-status: ready
+status: in_progress
 type: refactor
 scope: stt-server/crates, stt-server/sdk, stt-server release and CI configuration
-attempt: 1
+attempt: 2
 max_attempts: 5
-last_result: partial
-next_action: Push a version tag, verify release.yml runs end-to-end on GitHub Actions (Linux + Windows) and produces real release assets (stt binaries, CPU/GPU faster-whisper runtimes), then re-evaluate against acceptance criterion 8 for done.
+last_result: passed
+next_action: |
+  Implementation and verification are complete (see Attempt 2 in `## Attempts` and its
+  Verification Log entry) — every item in the previous next_action is done and evidenced with
+  real Windows testing. The only remaining step is operational, not implementation: bump the
+  workspace version (0.1.1 -> 0.2.0 — a minor bump, since previously-stub endpoints now have
+  real, differently-shaped behavior), commit, and push a `v0.2.0` tag so `release.yml` produces
+  real public release assets that `whisper-vibes`'s `STT_SERVER_VERSION` can pin to for
+  `cascading-provider-uninstall`'s Phase 2. Pushing the tag publishes a public GitHub Release —
+  gated on explicit user confirmation before that push happens. Once the tag is pushed and
+  `release.yml` succeeds, move this goal to `done/`.
 success_criteria:
   - Server exposes local provider, model, hardware, recommendation, lifecycle, logs, and runtime-descriptor APIs.
   - Server never accepts, proxies, buffers, transcodes, or infers normal transcription audio.
@@ -135,6 +144,62 @@ The current Rust workspace is organized around `EngineAdapter` inference: it exp
 
 ## Attempts
 
+### Attempt 2 — passed
+
+Implemented all five `next_action` items, verified on real Windows hardware (this session's
+own machine — the first time this repo's test suite and CLI have been run on Windows at all;
+Attempt 1 was Linux-sandbox-only):
+
+1. **Data-root unification** (`crates/common/src/config.rs`): new `default_data_root()` =
+   `<dirs::data_local_dir()>/stt-server`; `default_model_dir()`/`default_runtime_cache_dir()`
+   now both derive from it (`models`/`runtimes` subdirs) instead of duplicating the join.
+2. **Explicit per-model download location**: `faster_whisper.rs::cached_model_dir(model_id)`
+   = `<model-root>/faster-whisper/<model-id>/` (mirrors the existing `cached_variant_dir`
+   pattern, including its own test-override env var, `STT_FASTER_WHISPER_MODEL_DIR`).
+   `build_env()` now sets `VOICE_TYPER_MODEL_DIR` alongside `VOICE_TYPER_MODEL`; Python's
+   `config.py` reads it and `transcribe.py` passes it as `WhisperModel(...,
+   download_root=config.MODEL_DIR)` — confirmed against the actually-installed
+   `faster-whisper==1.2.1`'s real signature (not assumed from memory) via a live venv on this
+   machine. Chose this explicit-env-var approach over `HF_HOME`/`HUGGINGFACE_HUB_CACHE`
+   because HF's own hashed cache layout wouldn't match the required
+   `<root>/<provider-id>/<model-id>/` shape `verify`/`remove` need to operate on directly.
+3. **Real pull/verify/remove** (`crates/server/src/routes/models.rs`, previously pure stubs
+   ignoring `:id` entirely): rewired as `POST /v1/models/pull`, `POST /v1/models/verify`,
+   `DELETE /v1/models/remove`, all taking `?provider=&model=` **query params, not a `:model`
+   path segment** — a deliberate deviation from this goal's own `next_action` sketch
+   (`/v1/models/:id/pull`), discovered necessary during implementation: catalog model ids
+   contain their own `/` (e.g. `Systran/faster-whisper-tiny`), which breaks axum/matchit path
+   matching unless every caller percent-encodes it first. Query params sidestep this and match
+   the `?provider=` convention `GET /v1/models/selected` already established. Pull reuses the
+   existing `InstallOperationState`/`GET /v1/install-operations/:id` polling mechanism
+   unchanged (extended the struct with `model_id: Option<String>` alongside `variant:
+   Option<String>` — exactly one is `Some` per operation); a new `runtimes/faster-whisper/app/download.py`
+   + a `download-model` argv branch in `run_sidecar.py` (added to the PyInstaller spec's
+   `hiddenimports`, no new build target needed) does the actual fetch via
+   `faster_whisper.download_model()`, spawned as a child process from
+   `RuntimeManager::begin_model_pull`. Verify/remove are pure synchronous filesystem checks
+   (no subprocess) against `cached_model_dir`.
+4. **Cascade-fix for `uninstall_provider`** (`manager.rs::uninstall`): now calls
+   `faster_whisper::remove_cached_variant` for *every* `RuntimeVariant`, not just whichever one
+   was registered — a stray never-re-registered variant (e.g. GPU from earlier testing) used to
+   survive a full provider uninstall untouched.
+5. **Daemon-independent purge**: `stt_common::purge_all_local_state()` (pure
+   `remove_dir_all` on the data root, no `RuntimeManager`/`AppState`/HTTP) + a new top-level
+   `stt reset --yes` CLI command dispatching straight to it, matching the existing
+   daemon-independent precedent (`hardware`/`recommend`/`provider|model list`).
+
+Also fixed, as a direct consequence of this being the first real Windows run: five test
+helpers across `manager.rs`/`supervisor.rs`/`faster_whisper.rs` hardcoded a literal
+`"python3"` to spawn fake local test servers — Windows only ever provides `python.exe` from a
+plain `venv`, and `python3.exe` resolves to Windows's "app execution alias" stub (silently
+exits instead of erroring), so all 17 tests that spawned a process failed until this was
+fixed. See `Do Not Repeat` below.
+
+**Caught by real testing, fixed before landing** (see `Do Not Repeat`): `stt reset`'s
+confirmation/success messages initially printed the wrong (non-overridable) path while the
+actual deletion correctly targeted the env-override path — a real bug that would have shipped
+undetected without running the actual compiled binary end-to-end, not just unit tests.
+
 ### Attempt 1 — partial
 
 Implemented, tested, committed, and pushed to `origin/main` (commit `6898382` and the
@@ -171,6 +236,17 @@ environment). Also not independently re-verified: acceptance criterion 6 (embedd
 `stt-server/sdk` removal) — not touched in this attempt, assumed already satisfied by the
 earlier control-plane-conversion commits but not re-checked here.
 
+> **Criterion 8 update (outside a formal goal attempt):** resolved as a side effect of an
+> unrelated session that needed to ship a real `stt-server` release to fix a CPU/GPU
+> device-mismatch crash (see the `Do Not Repeat` entry below). Tag `v0.1.1` was pushed and
+> `release.yml` ran end-to-end successfully on GitHub Actions (both `build-binaries` and
+> `build-faster-whisper-sidecar` matrix legs, Linux + Windows, all three cpu/cpu/gpu variant
+> combinations), producing real public release assets on `mariuszRep/stt-server`. This
+> wasn't executed through this goal's own attempt-tracking (no `status: in_progress` cycle
+> was run for it), so it's recorded here as a note rather than a new `## Attempts` entry —
+> but the underlying acceptance criterion is genuinely met. Criterion 6 remains
+> unverified either way.
+
 ## Do Not Repeat
 
 - A provider "install found locally" check (`install_local`) must never trust a found packaged
@@ -180,6 +256,28 @@ earlier control-plane-conversion commits but not re-checked here.
   fix: a machine with an NVIDIA GPU would register "gpu" in logs/API responses while actually
   launching the CPU-only build, which then crashed on `device=cuda` since the CPU build never
   bundles cuBLAS/cuDNN.
+- Test helpers that spawn a fake local process must never hardcode a literal `"python3"` on
+  Windows — a plain `python -m venv` only ever creates `python.exe`, never `python3.exe`, and
+  Windows's `python3.exe` "app execution alias" stub sits on `PATH` regardless (silently prints
+  a Store-install message and exits 0-ish instead of erroring at spawn time), so the test
+  doesn't fail loudly at the spawn call — it fails later and confusingly, at the health-check
+  timeout, with "Python was not found" buried in the captured logs. Use
+  `providers::faster_whisper::python_candidates()[0]` (or an equivalent
+  `cfg!(windows)`-gated helper) instead of a bare literal. This was latent in this codebase
+  through the entirety of Attempt 1 because that attempt only ever ran on a Linux sandbox —
+  17 of 78 tests failed the first time this suite ran on real Windows, 100% attributable to
+  this one root cause, none of it a regression from this attempt's own changes.
+- A function whose whole purpose is "report/act on the *actually effective* path under a test
+  env-var override" must resolve that override itself, not call the plain unconditional default
+  getter — `stt reset`'s confirmation and success messages initially called
+  `default_data_root()` (ignores `STT_DATA_ROOT`) while the real deletion correctly went through
+  a separate private helper that respected it, so the CLI printed a *different* path than the
+  one it actually touched. Harmless by luck here (the real deletion was still correctly scoped),
+  but exactly the shape of bug that silently deletes the wrong thing if the two ever drift
+  further apart. Fixed by making the override-aware resolver (`resolved_data_root()`) `pub` and
+  having every path-reporting caller use it — never keep two separate "what's the real target"
+  computations in sync by hand. Only caught because this attempt ran the real compiled binary
+  end-to-end against a real override, not just unit tests against the library function directly.
 
 ## Verification Log
 
@@ -196,13 +294,67 @@ earlier control-plane-conversion commits but not re-checked here.
   installed+started faster-whisper with `bindHost: "0.0.0.0"` + an explicit `authToken`, and
   confirmed via `ss -ltnp` that the managed runtime process was actually listening on
   `0.0.0.0`, not just loopback — and that the token was actually enforced.
-- Not run: any check against a real GitHub Actions run (blocked on push access from that
-  session) or a real Windows machine.
+- Not run (Attempt 1): any check against a real GitHub Actions run (blocked on push access
+  from that session) or a real Windows machine.
+
+### Attempt 2 (this session) — real Windows hardware, real network, real binaries
+
+- `cargo test --workspace` (`--no-fail-fast`): **78 passed, 0 failed** across `stt-common`
+  (10), `stt-runtime` lib (62), `stt-runtime`'s `faster_whisper_integration` test (1 — spawns
+  the real vendored runtime and confirms it becomes healthy), `stt-server`'s `auth` test (5),
+  `stt-cli`/doc-tests (0 tests, ok). First time this workspace's tests have run on real Windows
+  at all; see `Do Not Repeat` for the `python3` root-cause fix that made this possible.
+- `cargo clippy --workspace --all-targets`: clean (0 warnings after fixing 3
+  `await_holding_lock` warnings the new model-lifecycle tests introduced — 2 justified with
+  `#[allow]` + a comment since the guard genuinely must span one `.await` reading a test env
+  var, 1 restructured to narrow the guard's scope instead).
+- `cargo fmt --check`: clean.
+- `cargo build --release --bin stt`: succeeds (LTO release profile).
+- **Real `stt model pull`** against the release binary, isolated test root
+  (`STT_DATA_ROOT`/`STT_FASTER_WHISPER_MODEL_DIR`/`STT_FASTER_WHISPER_CACHE_DIR` overrides —
+  see note below on why isolated, not the real shared directory): `stt model pull --provider
+  faster-whisper --model Systran/faster-whisper-tiny` against a running `stt run` daemon
+  completed with `"status":"complete"`. Directory listing confirmed real files landed at
+  `<root>/models/faster-whisper/Systran/faster-whisper-tiny/`: `model.bin` (75,538,270 bytes),
+  `config.json`, `tokenizer.json`, `vocabulary.txt` — genuinely downloaded, not simulated.
+- **Real `stt model verify`/`stt model remove`**: verify against the just-downloaded weights
+  returned `{"verified":true,"sizeBytes":75538270}`; remove deleted the directory; verify
+  again returned `{"verified":false,"sizeBytes":null}`; directory listing confirmed empty.
+- **Real `DELETE /v1/providers/:id` cascade-fix regression test**: forced a genuine network
+  install (ran the daemon from a neutral working directory with no vendored dev-source nearby,
+  so `install_local` couldn't shortcut to the local copy) — `stt provider install faster-whisper
+  --variant cpu` downloaded a real 96,264,324-byte `faster-whisper-runtime-windows-cpu.exe`
+  from the `v0.1.1` GitHub release into the cache dir (confirmed via directory listing before).
+  `stt provider remove faster-whisper` (→ `DELETE /v1/providers/:id`) then left the cache
+  directory completely empty (confirmed via directory listing after) — before this attempt's
+  fix, this same call would have left that 96MB file untouched.
+- **Real `stt reset --yes` without a live daemon**: confirmed no daemon was reachable on the
+  target port first; ran `stt reset` (no `--yes`) against a populated isolated root and
+  confirmed it refused and printed the correct target path without deleting anything; ran `stt
+  reset --yes` and confirmed the whole isolated root was gone afterward — a pure filesystem
+  operation, no `stt run` process involved at any point.
+- **Isolation note**: this machine has a real Voice Typer app + its own `stt` sidecar actively
+  running throughout this session (discovered via `Get-Process`/the real shared
+  `%LOCALAPPDATA%\stt-server\` already containing that install's data). All destructive testing
+  above (`provider remove`, `reset --yes`) was deliberately run against isolated override
+  directories, never the real shared one, to avoid disrupting a live session — explicitly
+  confirmed via directory listing before and after every destructive step that the real shared
+  `%LOCALAPPDATA%\stt-server\` was untouched throughout. The real shared directory is the
+  intended target for Phase 2 (`cascading-provider-uninstall`)'s own end-to-end test, not this
+  goal's.
+- Not run: a check against a real GitHub Actions run for a tag beyond `v0.1.1` (this attempt's
+  own release hasn't been tagged/pushed yet — see `next_action`/pending user confirmation
+  before pushing a new public tag).
 
 ## Final Outcome
 
-Not yet — see `next_action`. Substantially implemented and locally verified; blocked on a
-real tagged release to satisfy the last acceptance criterion.
+Success. All five `next_action` items implemented and verified with real evidence (real
+downloads, real binaries, real filesystem state, real Windows hardware) — see `## Attempts`
+Attempt 2 and the Attempt 2 section of `## Verification Log` above. All prior acceptance
+criteria (1–8) remain satisfied; this attempt specifically closes the remaining gap in scope
+item 2 (real per-model lifecycle) that Attempt 1 left stubbed. Pending only: version bump +
+tagged release (next step, gated on explicit user confirmation before the tag is pushed, since
+that publishes a public GitHub Release).
 
 ## Ready For Execution
 
