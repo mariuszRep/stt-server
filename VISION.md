@@ -31,3 +31,15 @@ The server is a control plane. It does not own normal batch/realtime transcripti
 - Provider/model installation is explicit and observable.
 - Only curated compatible provider/runtime/model combinations are offered.
 - The server may manage, but must not carry, normal transcription data traffic.
+
+## Key Decisions
+
+- 2026-08-30 — Provider engines are added via a pluggable architecture (see `CONVENTIONS.md`'s
+  selection criteria and Provider Engine Architecture sections), not one-off hardcoded
+  integrations. Planned roster: faster-whisper (priority, already shipped), whisper.cpp, and
+  sherpa-onnx, extensible to further engines beyond those three. faster-whisper continues to be
+  the engine serving Whisper models specifically — sherpa-onnx's own ONNX-exported Whisper path
+  has a documented accuracy regression versus faster-whisper on identical audio
+  ([k2-fsa/sherpa-onnx#2900](https://github.com/k2-fsa/sherpa-onnx/issues/2900)), so it is
+  additive for model families neither other engine can run (NVIDIA Parakeet/Canary, Moonshine,
+  SenseVoice, Zipformer/Paraformer), not a replacement for faster-whisper.

@@ -34,3 +34,28 @@ Applies to `stt-server` (https://github.com/mariuszRep/stt-server).
 - No cloud provider API adapter in the server.
 - No invisible model download during inference.
 - No direct application coupling; the server API is usable independently.
+
+## Provider Engine Architecture
+
+- Provider/engine lifecycle logic is trait-based and pluggable (a `ProviderEngine` implementation
+  per engine, dispatched through a registry), never a hardcoded per-engine `if`/`match` chain in
+  `RuntimeManager`. Adding an engine is a catalog entry plus one new adapter module — not a
+  parallel reimplementation of install/cache/uninstall machinery.
+- **Engine selection criteria** — a new engine is only added when it has: an actively-maintained
+  *official* upstream Git repository (not a fork, mirror, or single-maintainer experimental
+  project); genuine, broad community adoption (not just technical merit in isolation); a
+  redistribution-compatible license (MIT/Apache/BSD-style preferred), verified against the
+  project's actual current `LICENSE` file at selection time, never assumed.
+- **Minimize binaries the server itself builds and hosts.** An engine's adapter should fetch
+  release assets from *its own upstream* project's official releases by default. The server only
+  builds and hosts its own binary for an engine when no official upstream release exists at all —
+  this is the exception (faster-whisper needs it because CTranslate2/faster-whisper ships only a
+  pip package, no standalone executable), not the default expectation for every future engine.
+
+## API Completeness
+
+The HTTP API is the primary control surface and should expose as much of the server's
+functionality as reasonably possible. The CLI is a thin convenience wrapper over the same
+operations, not a separate capability surface. Consuming applications must drive the server via
+the API; they must never shell out to CLI subcommands to reach a capability the API doesn't yet
+cover — that gap is a signal to extend the API, not a reason for a client to depend on the CLI.
