@@ -265,7 +265,9 @@ mod tests {
             has_nvidia_gpu: false,
             gpu_name: None,
             driver_version: None,
+            vram_bytes: None,
             cpu_cores: 4,
+            cpu_architecture: "x86_64".to_string(),
             total_ram_bytes: 0,
         };
         let info = evaluate_variant(RuntimeVariant::Gpu, &hardware);
@@ -287,7 +289,9 @@ mod tests {
             has_nvidia_gpu: true,
             gpu_name: Some("Test GPU".to_string()),
             driver_version: None,
+            vram_bytes: Some(8 * 1024 * 1024 * 1024),
             cpu_cores: 4,
+            cpu_architecture: "x86_64".to_string(),
             total_ram_bytes: 0,
         };
         let info = evaluate_variant(RuntimeVariant::Gpu, &hardware);
@@ -318,7 +322,9 @@ mod tests {
             has_nvidia_gpu: false,
             gpu_name: None,
             driver_version: None,
+            vram_bytes: None,
             cpu_cores: 4,
+            cpu_architecture: "x86_64".to_string(),
             total_ram_bytes: 0,
         };
         let providers = list_providers(&hardware);
