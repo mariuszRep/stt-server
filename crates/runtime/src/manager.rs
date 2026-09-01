@@ -172,6 +172,23 @@ impl RuntimeManager {
         }
     }
 
+    /// Test-only: same as `new`, but with a caller-supplied `HardwareReport`
+    /// instead of live `hardware::detect()` — needed so hardware-preference
+    /// resolution tests (`preferred_variant`'s downstream effect on
+    /// `begin_install`) are deterministic regardless of whether the machine
+    /// actually running the test suite has a real NVIDIA GPU.
+    #[cfg(test)]
+    pub(crate) fn new_with_hardware(hardware: HardwareReport, idle_timeout: Option<Duration>) -> Self {
+        Self {
+            hardware,
+            instances: Mutex::new(HashMap::new()),
+            installed: Mutex::new(HashMap::new()),
+            selected_models: Mutex::new(HashMap::new()),
+            installs: StdMutex::new(HashMap::new()),
+            idle_timeout,
+        }
+    }
+
     pub fn hardware(&self) -> &HardwareReport {
         &self.hardware
     }
@@ -198,31 +215,95 @@ impl RuntimeManager {
         self.installed.lock().await.contains_key(id.as_str())
     }
 
-    /// Install `variant` of a provider: instant/local if already present
-    /// (a vendored dev copy, or a previously-downloaded copy of exactly
-    /// this variant), otherwise kicks off a background download and
-    /// returns immediately with an operation id to poll. Only one provider
-    /// exists in the catalog today (`faster-whisper`); this dispatches on
-    /// id via a `match` rather than a plugin trait, same rationale as
+    /// Install a provider — or, when `variant` is `None`, resolve "no
+    /// opinion" without ever guessing "cpu": if this provider is already
+    /// registered, that registration wins untouched (no-op, no overwrite —
+    /// this is the fix for the bug where a caller-side "no opinion" default
+    /// of literal "cpu" silently downgraded a correct boot-time GPU
+    /// registration); otherwise this machine's own hardware preference
+    /// (`catalog::preferred_variant`) decides. `Some(v)` is always honored
+    /// verbatim regardless of what's already registered — an explicit ask
+    /// (e.g. a user flipping Settings' GPU toggle) must always be able to
+    /// switch variants.
+    ///
+    /// Instant/local if the resolved variant is already present (a vendored
+    /// dev copy, or a previously-downloaded copy of exactly that variant),
+    /// otherwise kicks off a background download and returns immediately
+    /// with an operation id to poll. Only one provider exists in the
+    /// catalog today (`faster-whisper`); this dispatches on id via a
+    /// `match` rather than a plugin trait, same rationale as
     /// `crates/server/src/routes/providers.rs`'s pre-existing per-provider
     /// dispatch — not worth an abstraction for a single entry.
     pub async fn begin_install(
         self: &Arc<Self>,
         id: &ProviderId,
-        variant: RuntimeVariant,
+        variant: Option<RuntimeVariant>,
     ) -> Result<InstallOutcome, RuntimeError> {
         catalog::find_provider(id)?;
         if id.as_str() != "faster-whisper" {
             return Err(RuntimeError::ProviderNotFound(id.to_string()));
         }
 
-        if let Some(launch) = faster_whisper::install_local(variant) {
-            self.register_install(id, variant, launch).await;
-            return Ok(InstallOutcome::Installed {
-                provider_id: id.to_string(),
-                variant: variant.as_str().to_string(),
-            });
+        // One critical section covers "is something already registered" and,
+        // for the common already-cached-locally case, the registration
+        // itself — so a concurrent `begin_install` call for the same
+        // provider can't slip an explicit registration in between this
+        // decision and a write that's supposed to respect it. Written
+        // directly through the held guard (not via `register_install`,
+        // which would re-acquire this same non-reentrant `tokio::sync::Mutex`
+        // and deadlock). `install_local` is a synchronous, network-free
+        // filesystem check (never a download), so holding the lock across it
+        // costs no more than `start()` already pays holding this same lock
+        // across a launch-builder read.
+        //
+        // Known, accepted gap: a `None` call that falls into the download
+        // path below releases the lock before the background download
+        // finishes (holding it across a multi-gigabyte network fetch would
+        // serialize every other install/start call behind it). A concurrent
+        // explicit `Some(v)` call could register in that window and later be
+        // silently overwritten when this download completes — a
+        // pre-existing race today too (two concurrent explicit installs of
+        // *different* variants already race the same way), not a new
+        // regression.
+        enum Decision {
+            AlreadyRegistered(RuntimeVariant),
+            InstalledNow(RuntimeVariant),
+            NeedsDownload(RuntimeVariant),
         }
+        let decision = {
+            let mut installed = self.installed.lock().await;
+            let existing_variant = installed.get(id.as_str()).map(|entry| entry.variant);
+            match (variant, existing_variant) {
+                (None, Some(existing)) => Decision::AlreadyRegistered(existing),
+                (opinion, _) => {
+                    let effective =
+                        opinion.unwrap_or_else(|| catalog::preferred_variant(&self.hardware));
+                    match faster_whisper::install_local(effective) {
+                        Some(launch) => {
+                            installed.insert(
+                                id.as_str().to_string(),
+                                InstalledProvider {
+                                    variant: effective,
+                                    launch,
+                                },
+                            );
+                            Decision::InstalledNow(effective)
+                        }
+                        None => Decision::NeedsDownload(effective),
+                    }
+                }
+            }
+        };
+
+        let variant = match decision {
+            Decision::AlreadyRegistered(v) | Decision::InstalledNow(v) => {
+                return Ok(InstallOutcome::Installed {
+                    provider_id: id.to_string(),
+                    variant: v.as_str().to_string(),
+                });
+            }
+            Decision::NeedsDownload(v) => v,
+        };
 
         // Reuse an already-in-flight download for the same (provider,
         // variant) instead of starting a duplicate one — mirrors `start()`'s
@@ -1271,7 +1352,7 @@ mod tests {
         let manager = Arc::new(RuntimeManager::new(None));
         let id = ProviderId::new("does-not-exist").unwrap();
         assert!(matches!(
-            manager.begin_install(&id, RuntimeVariant::Cpu).await,
+            manager.begin_install(&id, Some(RuntimeVariant::Cpu)).await,
             Err(RuntimeError::ProviderNotFound(_))
         ));
     }
@@ -1378,7 +1459,7 @@ mod tests {
 
         let manager = Arc::new(RuntimeManager::new(None));
         let id = ProviderId::new("faster-whisper").unwrap();
-        let outcome = manager.begin_install(&id, RuntimeVariant::Cpu).await;
+        let outcome = manager.begin_install(&id, Some(RuntimeVariant::Cpu)).await;
 
         unsafe {
             std::env::remove_var(faster_whisper::RELEASE_BASE_URL_ENV_VAR);
@@ -1418,7 +1499,7 @@ mod tests {
         let manager = Arc::new(RuntimeManager::new(None));
         let id = ProviderId::new("faster-whisper").unwrap();
         let outcome = manager
-            .begin_install(&id, RuntimeVariant::Cpu)
+            .begin_install(&id, Some(RuntimeVariant::Cpu))
             .await
             .unwrap();
         let operation_id = match outcome {
@@ -1453,6 +1534,182 @@ mod tests {
             "expected the download to complete, got {final_state:?}"
         );
         assert!(manager.is_installed(&id).await);
+    }
+
+    #[tokio::test]
+    async fn begin_install_with_no_variant_and_an_existing_gpu_registration_is_a_no_op() {
+        let manager = Arc::new(RuntimeManager::new(None));
+        let id = ProviderId::new("faster-whisper").unwrap();
+        manager
+            .register_install(&id, RuntimeVariant::Gpu, fake_launch())
+            .await;
+
+        // No variant opinion, but faster-whisper is already registered as
+        // gpu: must report the existing registration back unchanged, never
+        // silently fall back to a fresh hardware-preference resolution —
+        // this is the exact "client sends 'cpu' as its 'no opinion' default"
+        // bug this fix closes.
+        let outcome = manager.begin_install(&id, None).await.unwrap();
+
+        assert!(matches!(
+            outcome,
+            InstallOutcome::Installed { ref variant, .. } if variant == "gpu"
+        ));
+        assert_eq!(
+            manager.installed.lock().await.get(id.as_str()).unwrap().variant,
+            RuntimeVariant::Gpu,
+            "the existing gpu registration must survive an opinion-free install call untouched"
+        );
+    }
+
+    #[tokio::test]
+    // Held across `.await` deliberately: this guard serializes tests
+    // that mutate process-wide env vars, and each `#[tokio::test]` here runs
+    // on its own single-threaded (current_thread) runtime, so holding it
+    // through the awaits below just serializes those tests, it can't starve
+    // unrelated async work on another task.
+    #[allow(clippy::await_holding_lock)]
+    async fn begin_install_with_no_variant_and_nothing_registered_prefers_gpu_when_hardware_reports_an_nvidia_gpu(
+    ) {
+        let _guard = faster_whisper::lock_env_test();
+        let (mut server, serve_dir, cache_root, base_url) =
+            spawn_fake_release_server(RuntimeVariant::Gpu).await;
+        unsafe {
+            std::env::set_var(faster_whisper::RELEASE_BASE_URL_ENV_VAR, &base_url);
+            std::env::set_var(faster_whisper::RUNTIME_CACHE_DIR_ENV_VAR, &cache_root);
+            std::env::set_var(faster_whisper::RUNTIME_DIR_ENV_VAR, "/nonexistent/for/sure");
+        }
+        let _ = faster_whisper::download_variant(RuntimeVariant::Gpu, |_| {})
+            .await
+            .expect("pre-populating the gpu cache should succeed against the local fake server");
+
+        let hardware = HardwareReport {
+            has_nvidia_gpu: true,
+            gpu_name: Some("Test GPU".to_string()),
+            driver_version: None,
+            vram_bytes: None,
+            cpu_cores: 4,
+            cpu_architecture: "x86_64".to_string(),
+            total_ram_bytes: 0,
+        };
+        let manager = Arc::new(RuntimeManager::new_with_hardware(hardware, None));
+        let id = ProviderId::new("faster-whisper").unwrap();
+
+        let outcome = manager.begin_install(&id, None).await.unwrap();
+
+        unsafe {
+            std::env::remove_var(faster_whisper::RELEASE_BASE_URL_ENV_VAR);
+            std::env::remove_var(faster_whisper::RUNTIME_CACHE_DIR_ENV_VAR);
+            std::env::remove_var(faster_whisper::RUNTIME_DIR_ENV_VAR);
+        }
+        let _ = server.kill().await;
+        std::fs::remove_dir_all(&serve_dir).ok();
+        std::fs::remove_dir_all(&cache_root).ok();
+
+        assert!(matches!(
+            outcome,
+            InstallOutcome::Installed { ref variant, .. } if variant == "gpu"
+        ));
+    }
+
+    #[tokio::test]
+    // Held across `.await` deliberately: this guard serializes tests
+    // that mutate process-wide env vars, and each `#[tokio::test]` here runs
+    // on its own single-threaded (current_thread) runtime, so holding it
+    // through the awaits below just serializes those tests, it can't starve
+    // unrelated async work on another task.
+    #[allow(clippy::await_holding_lock)]
+    async fn begin_install_with_no_variant_and_nothing_registered_prefers_cpu_without_an_nvidia_gpu(
+    ) {
+        let _guard = faster_whisper::lock_env_test();
+        let (mut server, serve_dir, cache_root, base_url) =
+            spawn_fake_release_server(RuntimeVariant::Cpu).await;
+        unsafe {
+            std::env::set_var(faster_whisper::RELEASE_BASE_URL_ENV_VAR, &base_url);
+            std::env::set_var(faster_whisper::RUNTIME_CACHE_DIR_ENV_VAR, &cache_root);
+            std::env::set_var(faster_whisper::RUNTIME_DIR_ENV_VAR, "/nonexistent/for/sure");
+        }
+        let _ = faster_whisper::download_variant(RuntimeVariant::Cpu, |_| {})
+            .await
+            .expect("pre-populating the cpu cache should succeed against the local fake server");
+
+        let hardware = HardwareReport {
+            has_nvidia_gpu: false,
+            gpu_name: None,
+            driver_version: None,
+            vram_bytes: None,
+            cpu_cores: 4,
+            cpu_architecture: "x86_64".to_string(),
+            total_ram_bytes: 0,
+        };
+        let manager = Arc::new(RuntimeManager::new_with_hardware(hardware, None));
+        let id = ProviderId::new("faster-whisper").unwrap();
+
+        let outcome = manager.begin_install(&id, None).await.unwrap();
+
+        unsafe {
+            std::env::remove_var(faster_whisper::RELEASE_BASE_URL_ENV_VAR);
+            std::env::remove_var(faster_whisper::RUNTIME_CACHE_DIR_ENV_VAR);
+            std::env::remove_var(faster_whisper::RUNTIME_DIR_ENV_VAR);
+        }
+        let _ = server.kill().await;
+        std::fs::remove_dir_all(&serve_dir).ok();
+        std::fs::remove_dir_all(&cache_root).ok();
+
+        assert!(matches!(
+            outcome,
+            InstallOutcome::Installed { ref variant, .. } if variant == "cpu"
+        ));
+    }
+
+    #[tokio::test]
+    // Held across `.await` deliberately: this guard serializes tests
+    // that mutate process-wide env vars, and each `#[tokio::test]` here runs
+    // on its own single-threaded (current_thread) runtime, so holding it
+    // through the awaits below just serializes those tests, it can't starve
+    // unrelated async work on another task.
+    #[allow(clippy::await_holding_lock)]
+    async fn begin_install_with_an_explicit_variant_always_overwrites_an_existing_registration() {
+        let _guard = faster_whisper::lock_env_test();
+        let (mut server, serve_dir, cache_root, base_url) =
+            spawn_fake_release_server(RuntimeVariant::Cpu).await;
+        unsafe {
+            std::env::set_var(faster_whisper::RELEASE_BASE_URL_ENV_VAR, &base_url);
+            std::env::set_var(faster_whisper::RUNTIME_CACHE_DIR_ENV_VAR, &cache_root);
+            std::env::set_var(faster_whisper::RUNTIME_DIR_ENV_VAR, "/nonexistent/for/sure");
+        }
+        let _ = faster_whisper::download_variant(RuntimeVariant::Cpu, |_| {})
+            .await
+            .expect("pre-populating the cpu cache should succeed against the local fake server");
+
+        let manager = Arc::new(RuntimeManager::new(None));
+        let id = ProviderId::new("faster-whisper").unwrap();
+        manager
+            .register_install(&id, RuntimeVariant::Gpu, fake_launch())
+            .await;
+
+        // Simulates a user explicitly flipping Settings from gpu to cpu:
+        // even though gpu is already registered, an explicit ask must still
+        // switch it.
+        let outcome = manager
+            .begin_install(&id, Some(RuntimeVariant::Cpu))
+            .await
+            .unwrap();
+        // A follow-up opinion-free call should now report the *new*
+        // registration (cpu), proving the explicit call really overwrote it.
+        let followup = manager.begin_install(&id, None).await.unwrap();
+
+        unsafe {
+            std::env::remove_var(faster_whisper::RELEASE_BASE_URL_ENV_VAR);
+            std::env::remove_var(faster_whisper::RUNTIME_CACHE_DIR_ENV_VAR);
+            std::env::remove_var(faster_whisper::RUNTIME_DIR_ENV_VAR);
+        }
+        let _ = server.kill().await;
+        std::fs::remove_dir_all(&serve_dir).ok();
+        std::fs::remove_dir_all(&cache_root).ok();
+
+        assert!(matches!(outcome, InstallOutcome::Installed { ref variant, .. } if variant == "cpu"));
+        assert!(matches!(followup, InstallOutcome::Installed { ref variant, .. } if variant == "cpu"));
     }
 
     #[tokio::test]

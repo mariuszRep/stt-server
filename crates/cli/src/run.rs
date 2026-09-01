@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use clap::Args;
 
-use stt_runtime::{providers::faster_whisper, ProviderId, RuntimeManager, RuntimeVariant};
+use stt_runtime::{preferred_variant, providers::faster_whisper, ProviderId, RuntimeManager};
 
 #[derive(Args)]
 pub struct RunArgs {
@@ -82,11 +82,7 @@ pub async fn execute(args: RunArgs) -> anyhow::Result<()> {
     // equivalent CLI command) succeeds. `install_local` is network-free, so
     // this never delays startup waiting on a download.
     let faster_whisper_id = ProviderId::new("faster-whisper")?;
-    let preferred_variant = if runtime_manager.hardware().has_nvidia_gpu {
-        RuntimeVariant::Gpu
-    } else {
-        RuntimeVariant::Cpu
-    };
+    let preferred_variant = preferred_variant(runtime_manager.hardware());
     match faster_whisper::install_local(preferred_variant) {
         Some(launch) => {
             runtime_manager

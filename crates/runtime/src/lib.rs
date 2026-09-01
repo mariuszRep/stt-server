@@ -7,7 +7,8 @@ pub mod recommend;
 pub mod supervisor;
 
 pub use catalog::{
-    CatalogEntry, ModelEntry, ProviderId, ProviderInfo, RuntimeVariant, VariantInfo, CATALOG,
+    preferred_variant, CatalogEntry, ModelEntry, ProviderId, ProviderInfo, RuntimeVariant,
+    VariantInfo, CATALOG,
 };
 pub use error::RuntimeError;
 pub use hardware::HardwareReport;
