@@ -178,7 +178,10 @@ impl RuntimeManager {
     /// `begin_install`) are deterministic regardless of whether the machine
     /// actually running the test suite has a real NVIDIA GPU.
     #[cfg(test)]
-    pub(crate) fn new_with_hardware(hardware: HardwareReport, idle_timeout: Option<Duration>) -> Self {
+    pub(crate) fn new_with_hardware(
+        hardware: HardwareReport,
+        idle_timeout: Option<Duration>,
+    ) -> Self {
         Self {
             hardware,
             instances: Mutex::new(HashMap::new()),
@@ -1556,7 +1559,13 @@ mod tests {
             InstallOutcome::Installed { ref variant, .. } if variant == "gpu"
         ));
         assert_eq!(
-            manager.installed.lock().await.get(id.as_str()).unwrap().variant,
+            manager
+                .installed
+                .lock()
+                .await
+                .get(id.as_str())
+                .unwrap()
+                .variant,
             RuntimeVariant::Gpu,
             "the existing gpu registration must survive an opinion-free install call untouched"
         );
@@ -1708,8 +1717,12 @@ mod tests {
         std::fs::remove_dir_all(&serve_dir).ok();
         std::fs::remove_dir_all(&cache_root).ok();
 
-        assert!(matches!(outcome, InstallOutcome::Installed { ref variant, .. } if variant == "cpu"));
-        assert!(matches!(followup, InstallOutcome::Installed { ref variant, .. } if variant == "cpu"));
+        assert!(
+            matches!(outcome, InstallOutcome::Installed { ref variant, .. } if variant == "cpu")
+        );
+        assert!(
+            matches!(followup, InstallOutcome::Installed { ref variant, .. } if variant == "cpu")
+        );
     }
 
     #[tokio::test]
