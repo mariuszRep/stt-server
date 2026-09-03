@@ -636,9 +636,7 @@ impl RuntimeManager {
             .json(&AdminModelBody { model: model_id })
             .send()
             .await
-            .map_err(|e| {
-                RuntimeError::ModelSwitchFailed(format!("could not reach {url}: {e}"))
-            })?;
+            .map_err(|e| RuntimeError::ModelSwitchFailed(format!("could not reach {url}: {e}")))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
