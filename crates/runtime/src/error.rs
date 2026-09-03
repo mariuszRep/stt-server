@@ -36,6 +36,9 @@ pub enum RuntimeError {
     #[error("invalid start options: {0}")]
     InvalidStartOptions(String),
 
+    #[error("model switch failed: {0}")]
+    ModelSwitchFailed(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 }

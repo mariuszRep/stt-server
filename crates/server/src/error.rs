@@ -23,6 +23,7 @@ pub fn runtime_error_response(err: RuntimeError) -> ApiError {
         RuntimeError::RuntimeStartFailed(_)
         | RuntimeError::Io(_)
         | RuntimeError::DownloadFailed(_)
+        | RuntimeError::ModelSwitchFailed(_)
         | RuntimeError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     let code = match &err {
@@ -37,6 +38,7 @@ pub fn runtime_error_response(err: RuntimeError) -> ApiError {
         RuntimeError::UnsupportedVariant(_) => "UNSUPPORTED_VARIANT",
         RuntimeError::InstallOperationNotFound(_) => "INSTALL_OPERATION_NOT_FOUND",
         RuntimeError::InvalidStartOptions(_) => "INVALID_START_OPTIONS",
+        RuntimeError::ModelSwitchFailed(_) => "MODEL_SWITCH_FAILED",
         RuntimeError::Internal(_) => "INTERNAL_ERROR",
     };
     (

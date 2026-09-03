@@ -3,7 +3,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use stt_runtime::{ModelPullOutcome, ProviderId, CATALOG};
+use stt_runtime::{ModelPullOutcome, ProviderId, SwitchModelOutcome, CATALOG};
 
 use crate::error::{runtime_error_response, ApiError};
 use crate::state::AppState;
@@ -53,6 +53,48 @@ pub async fn select_model(
         .await
         .map_err(runtime_error_response)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchModelRequest {
+    provider_id: String,
+    model_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "status")]
+pub enum SwitchModelResponse {
+    /// The provider wasn't running; behaves exactly like `select_model` --
+    /// persisted only, applied on the next start.
+    #[serde(rename = "selected")]
+    Selected,
+    /// An already-running instance was swapped in-process; no subprocess
+    /// restart happened.
+    #[serde(rename = "swapped", rename_all = "camelCase")]
+    Swapped { load_seconds: Option<f64> },
+}
+
+/// `POST /v1/models/switch` -- a new, separate, explicit operation from
+/// `select_model` above; that route's persist-only contract and callers
+/// are unchanged. See `RuntimeManager::switch_model`'s doc comment for the
+/// running-vs-not-running behavior split.
+pub async fn switch_model(
+    State(state): State<AppState>,
+    Json(req): Json<SwitchModelRequest>,
+) -> Result<Json<SwitchModelResponse>, ApiError> {
+    let provider_id = ProviderId::new(req.provider_id).map_err(runtime_error_response)?;
+    let outcome = state
+        .runtime_manager
+        .switch_model(&provider_id, &req.model_id)
+        .await
+        .map_err(runtime_error_response)?;
+    Ok(Json(match outcome {
+        SwitchModelOutcome::Selected => SwitchModelResponse::Selected,
+        SwitchModelOutcome::Swapped { load_seconds } => {
+            SwitchModelResponse::Swapped { load_seconds }
+        }
+    }))
 }
 
 #[derive(Deserialize)]

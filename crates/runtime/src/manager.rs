@@ -115,6 +115,16 @@ pub enum ModelPullOutcome {
     Downloading { operation_id: String },
 }
 
+/// Result of [`RuntimeManager::switch_model`]: either the provider wasn't
+/// running and the request was persisted only (same contract as
+/// [`RuntimeManager::select_model`]), or an already-running instance was
+/// swapped in-process with no subprocess restart.
+#[derive(Debug, Clone)]
+pub enum SwitchModelOutcome {
+    Selected,
+    Swapped { load_seconds: Option<f64> },
+}
+
 /// Result of [`RuntimeManager::begin_install`]: either the requested
 /// variant was already available locally (instant, no network — the
 /// common case), or a download was kicked off in the background.
@@ -554,6 +564,108 @@ impl RuntimeManager {
         self.selected_models.lock().await.get(id.as_str()).cloned()
     }
 
+    /// Switch a provider's active model without restarting anything, when
+    /// possible. A new, separate, explicit operation from `select_model`
+    /// above -- that method's persist-only contract and callers are
+    /// unchanged.
+    ///
+    /// If `id` isn't currently running, this is exactly `select_model`
+    /// (persist only, applied on the next `start()`) -- there's no running
+    /// instance to swap in-process. If it *is* running, the swap happens
+    /// live: this POSTs the running instance's own `/v1/admin/model`
+    /// (mirroring the HTTP-call pattern `fetch_streaming_capability` and
+    /// `descriptor_for` already use to talk to a live instance by its own
+    /// `base_url`), which reuses the runtime's own model/device/compute_type
+    /// mismatch check and existing inference lock (see
+    /// `runtimes/faster-whisper/app/main.py::admin_switch_model`) so no
+    /// in-flight inference can race the swap and no subprocess restart is
+    /// needed.
+    ///
+    /// Deliberately takes only a model id, not a device override: an actual
+    /// device/variant change (e.g. CPU to GPU) is a heavier operation --
+    /// stop the provider subprocess, relaunch with the new device -- that
+    /// stays the caller's responsibility. This method never silently
+    /// attempts one; it only ever swaps the model on whatever
+    /// device/compute_type the running instance already has.
+    pub async fn switch_model(
+        &self,
+        id: &ProviderId,
+        model_id: &str,
+    ) -> Result<SwitchModelOutcome, RuntimeError> {
+        let entry = catalog::find_provider(id)?;
+        catalog::find_model(entry, model_id)
+            .ok_or_else(|| RuntimeError::ModelNotFound(model_id.to_string()))?;
+
+        let port = {
+            let mut instances = self.instances.lock().await;
+            match instances.get_mut(id.as_str()) {
+                Some(running) => {
+                    if running.instance.status() == RuntimeStatus::Running {
+                        running.last_activity = Instant::now();
+                        Some(running.instance.port)
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        };
+
+        let Some(port) = port else {
+            // Not running: identical persist-only contract to `select_model`.
+            self.selected_models
+                .lock()
+                .await
+                .insert(id.as_str().to_string(), model_id.to_string());
+            return Ok(SwitchModelOutcome::Selected);
+        };
+
+        #[derive(serde::Serialize)]
+        struct AdminModelBody<'a> {
+            model: &'a str,
+        }
+        #[derive(serde::Deserialize)]
+        struct AdminModelResponse {
+            load_seconds: Option<f64>,
+        }
+
+        let url = format!("http://127.0.0.1:{port}/v1/admin/model");
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&url)
+            .json(&AdminModelBody { model: model_id })
+            .send()
+            .await
+            .map_err(|e| {
+                RuntimeError::ModelSwitchFailed(format!("could not reach {url}: {e}"))
+            })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RuntimeError::ModelSwitchFailed(format!(
+                "runtime rejected model switch ({status}): {body}"
+            )));
+        }
+
+        let parsed: AdminModelResponse = resp.json().await.map_err(|e| {
+            RuntimeError::ModelSwitchFailed(format!("unexpected response shape: {e}"))
+        })?;
+
+        // Keep the persisted selection in sync with what's actually now
+        // serving, so a later restart (for any unrelated reason) relaunches
+        // with the model that's now active, not whatever was selected
+        // before this swap.
+        self.selected_models
+            .lock()
+            .await
+            .insert(id.as_str().to_string(), model_id.to_string());
+
+        Ok(SwitchModelOutcome::Swapped {
+            load_seconds: parsed.load_seconds,
+        })
+    }
+
     /// Start (or return the descriptor of an already-running instance of) a
     /// managed provider. Blocks until the runtime reports healthy.
     pub async fn start(
@@ -909,6 +1021,69 @@ mod tests {
         })
     }
 
+    /// A fake runtime that additionally handles `POST /v1/admin/model` like
+    /// the real `runtimes/faster-whisper/app/main.py::admin_switch_model`
+    /// does: echoes back whatever `model` it was sent plus a fixed
+    /// `load_seconds`, with no subprocess restart involved (it's a single
+    /// long-lived process for the whole test). `http.server`'s
+    /// `SimpleHTTPRequestHandler` can't handle `POST` at all, so this writes
+    /// a tiny standalone `BaseHTTPRequestHandler` script instead of reusing
+    /// `-m http.server` like the other fakes here.
+    fn fake_launch_with_admin_model() -> LaunchBuilder {
+        Box::new(|port, _auth_token, _selected_model, _options| {
+            let dir = std::env::temp_dir().join(format!("stt-runtime-test-admin-{port}"));
+            std::fs::create_dir_all(&dir).expect("create fake runtime temp dir");
+            let script = dir.join("fake_admin_server.py");
+            std::fs::write(
+                &script,
+                r#"
+import http.server
+import json
+import sys
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        if self.path == "/v1/admin/model":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length) or b"{}")
+            response = json.dumps({
+                "status": "ok",
+                "model": body.get("model"),
+                "load_seconds": 0.01,
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(response)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+"#,
+            )
+            .expect("write fake admin server script");
+            Launch {
+                program: python_bin().into(),
+                args: vec![script.to_string_lossy().into_owned(), port.to_string()],
+                env: vec![],
+                cwd: None,
+            }
+        })
+    }
+
     type RecordedCalls = std::sync::Arc<std::sync::Mutex<Vec<(Option<String>, StartOptions)>>>;
 
     /// Captures the `StartOptions`/model each call was invoked with, so a
@@ -1075,6 +1250,87 @@ mod tests {
             manager.selected_model(&id).await,
             Some("Systran/faster-whisper-tiny".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn switch_model_persists_only_when_not_running() {
+        let manager = manager_with_faster_whisper_installed(None).await;
+        let id = ProviderId::new("faster-whisper").unwrap();
+
+        assert_eq!(manager.status(&id).await, RuntimeStatus::Stopped);
+
+        let outcome = manager
+            .switch_model(&id, "Systran/faster-whisper-tiny")
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, SwitchModelOutcome::Selected),
+            "expected a persist-only outcome for a non-running provider, got {outcome:?}"
+        );
+        assert_eq!(
+            manager.selected_model(&id).await,
+            Some("Systran/faster-whisper-tiny".to_string()),
+            "switch_model should persist the selection exactly like select_model does"
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_model_rejects_an_unknown_model() {
+        let manager = manager_with_faster_whisper_installed(None).await;
+        let id = ProviderId::new("faster-whisper").unwrap();
+        assert!(matches!(
+            manager.switch_model(&id, "not-a-real-model").await,
+            Err(RuntimeError::ModelNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn switch_model_swaps_in_process_without_restarting_the_running_instance() {
+        let manager = RuntimeManager::new(None);
+        let id = ProviderId::new("faster-whisper").unwrap();
+        manager
+            .register_install(&id, RuntimeVariant::Cpu, fake_launch_with_admin_model())
+            .await;
+
+        manager.start(&id, &StartOptions::default()).await.unwrap();
+        assert_eq!(manager.status(&id).await, RuntimeStatus::Running);
+
+        let pid_before = {
+            let instances = manager.instances.lock().await;
+            instances.get(id.as_str()).unwrap().instance.pid
+        };
+
+        let outcome = manager
+            .switch_model(&id, "Systran/faster-whisper-tiny")
+            .await
+            .unwrap();
+
+        match outcome {
+            SwitchModelOutcome::Swapped { load_seconds } => {
+                assert_eq!(load_seconds, Some(0.01));
+            }
+            other => panic!("expected an in-process swap for a running instance, got {other:?}"),
+        }
+
+        let pid_after = {
+            let instances = manager.instances.lock().await;
+            instances.get(id.as_str()).unwrap().instance.pid
+        };
+        assert_eq!(
+            pid_before, pid_after,
+            "an in-process model swap must never restart the provider subprocess"
+        );
+        assert_eq!(manager.status(&id).await, RuntimeStatus::Running);
+
+        // The successful swap should also update the persisted selection,
+        // so a later restart (for any unrelated reason) relaunches with
+        // what's actually now serving.
+        assert_eq!(
+            manager.selected_model(&id).await,
+            Some("Systran/faster-whisper-tiny".to_string())
+        );
+
+        manager.stop(&id).await.unwrap();
     }
 
     #[tokio::test]
