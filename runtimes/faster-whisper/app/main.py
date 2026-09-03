@@ -7,7 +7,7 @@ import sys
 import tempfile
 import time
 import wave
-from pathlib import Path
+from pathlib import Path, PurePath
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.concurrency import run_in_threadpool
@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from app import config
-from app.transcribe import get_runtime_status, transcribe
+from app.transcribe import _infer_lock, get_model, get_runtime_status, transcribe
 from app.streaming import (
     StreamingSession,
     create_session,
@@ -93,6 +93,18 @@ class AdminRestartBody(BaseModel):
     device: str | None = None
     compute_type: str | None = None
     auth_token: str | None = None
+
+
+class AdminModelBody(BaseModel):
+    model: str
+    device: str | None = None
+    compute_type: str | None = None
+
+
+class AdminModelResponse(BaseModel):
+    status: str
+    model: str
+    load_seconds: float | None = None
 
 
 @app.get("/health")
@@ -205,6 +217,64 @@ async def audio_transcriptions(
     elapsed = time.perf_counter() - started
     print(f"[voice-typer] {request_id} completed in {elapsed:.2f}s chars={len(text)}", flush=True)
     return TranscriptionResponse(text=text)
+
+
+@app.post("/v1/admin/model")
+async def admin_switch_model(body: AdminModelBody) -> AdminModelResponse:
+    """Swap the loaded model in-process, without restarting the server.
+
+    Reuses get_model()'s existing model/device/compute_type mismatch check
+    (transcribe.py) by mutating config.MODEL (and DEVICE/COMPUTE_TYPE, if
+    given) before calling it — the same call transcribe() itself makes, so
+    no new loading logic is needed here, just making config.MODEL mutable
+    at runtime. Runs under the same _infer_lock every batch/streaming
+    inference call already holds while loading, so a swap can't race
+    in-flight inference in either direction; requests made after the swap
+    resolves see the new model automatically.
+
+    An already-open streaming session (see StreamingSession in streaming.py)
+    keeps using the model it started with — it captured its own reference at
+    creation and nothing re-derives it mid-session. That's deliberate: a
+    swap should not change models out from under a dictation already in
+    progress. Only new requests/sessions after this call see the new model.
+    """
+
+    def _swap() -> float | None:
+        # config.MODEL_DIR is an explicit per-model download_root, computed by
+        # the Rust side as `<data-root>/models/faster-whisper/<model_id>`
+        # (faster_whisper.rs::cached_model_dir) -- a flat, predictable layout,
+        # deliberately not HuggingFace's own hashed cache scheme. It is set
+        # once at process launch for the *old* model only, so a swap that
+        # changes config.MODEL without also recomputing MODEL_DIR would load
+        # (or, worse, re-download) the new model into the old model's
+        # directory instead of its own -- verified to actually happen before
+        # this fix was added. Re-derive the new directory by stripping the
+        # old model id's path components off the tail of the old
+        # MODEL_DIR and re-joining the new model id, mirroring
+        # cached_model_dir's own `root.join("faster-whisper").join(model_id)`
+        # construction exactly.
+        if config.MODEL_DIR is not None:
+            old_dir = PurePath(config.MODEL_DIR)
+            old_model_parts = PurePath(config.MODEL).parts
+            if old_dir.parts[-len(old_model_parts):] == old_model_parts:
+                root = PurePath(*old_dir.parts[: -len(old_model_parts)])
+                config.MODEL_DIR = str(root.joinpath(*PurePath(body.model).parts))
+
+        config.MODEL = body.model
+        if body.device is not None:
+            config.DEVICE = body.device
+        if body.compute_type is not None:
+            config.COMPUTE_TYPE = body.compute_type
+        with _infer_lock:
+            get_model(config.DEVICE, config.COMPUTE_TYPE)
+        return get_runtime_status()["last_model_load_seconds"]
+
+    try:
+        load_seconds = await run_in_threadpool(_swap)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Model switch failed: {exc}")
+
+    return AdminModelResponse(status="ok", model=config.MODEL, load_seconds=load_seconds)
 
 
 @app.post("/v1/admin/restart")

@@ -148,7 +148,15 @@ CUDA_AVAILABLE = _cuda_available()
 CUDA_SUPPORTED_COMPUTE_TYPES = _cuda_supported_compute_types()
 CUDA_RUNTIME_OK, CUDA_ERROR = _cuda_runtime_status()
 _device_env = os.environ.get("VOICE_TYPER_DEVICE")
-REQUESTED_DEVICE = _device_env or ("cuda" if CUDA_AVAILABLE else "cpu")
+# A cpu-variant build can never succeed at CUDA regardless of what hardware
+# is present (the fallback branch below already forces DEVICE="cpu" for this
+# build unconditionally, even against an explicit override) -- so the
+# default should never even attempt it. Without this, a cpu-variant build on
+# CUDA-capable hardware always defaulted to requesting "cuda", wasted a
+# doomed attempt, logged a scary cublas64_12.dll error, and reported
+# device_source="fallback" as if something had failed, when it's really
+# just this variant's only supported default.
+REQUESTED_DEVICE = _device_env or ("cuda" if CUDA_AVAILABLE and BUILD_VARIANT != "cpu" else "cpu")
 REQUESTED_DEVICE_SOURCE = "manual" if _device_env else "auto"
 REQUESTED_COMPUTE_TYPE = os.environ.get("VOICE_TYPER_COMPUTE_TYPE") or (
     "float16" if REQUESTED_DEVICE == "cuda" else "int8"

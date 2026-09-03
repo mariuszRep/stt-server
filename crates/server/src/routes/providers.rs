@@ -26,10 +26,13 @@ pub async fn list_providers(State(state): State<AppState>) -> Json<Vec<ProviderI
     Json(state.runtime_manager.list_providers())
 }
 
-/// `POST /v1/providers/:id/install` with no body (or `{}`) installs the
-/// `cpu` variant — the network-free, instant common case must stay the
-/// default so an existing caller that never mentions "variant" keeps
-/// working unchanged.
+/// `POST /v1/providers/:id/install` with no body (or `{}`, or an explicit
+/// `{"variant": null}`) sends no opinion about which variant to install:
+/// `RuntimeManager::begin_install` resolves that itself — an
+/// already-registered variant wins untouched if one exists, otherwise this
+/// machine's own hardware preference. Never hardcode "cpu" here; that was
+/// exactly the bug (a caller with no real opinion sent a literal "cpu"
+/// default that silently downgraded a correct boot-time GPU registration).
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct InstallProviderRequest {
@@ -71,7 +74,7 @@ pub async fn install_provider(
             )
         })?
     };
-    let variant = parse_variant(request.variant.as_deref().unwrap_or("cpu"))?;
+    let variant = request.variant.as_deref().map(parse_variant).transpose()?;
 
     let outcome = state
         .runtime_manager

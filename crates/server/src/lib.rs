@@ -85,6 +85,7 @@ pub fn build_router(state: state::AppState) -> Router {
         )
         .route("/v1/models", get(routes::list_models))
         .route("/v1/models/select", post(routes::select_model))
+        .route("/v1/models/switch", post(routes::switch_model))
         .route("/v1/models/selected", get(routes::selected_model))
         .route("/v1/models/pull", post(routes::pull_model))
         .route("/v1/models/verify", post(routes::verify_model))

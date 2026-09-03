@@ -115,6 +115,16 @@ pub enum ModelPullOutcome {
     Downloading { operation_id: String },
 }
 
+/// Result of [`RuntimeManager::switch_model`]: either the provider wasn't
+/// running and the request was persisted only (same contract as
+/// [`RuntimeManager::select_model`]), or an already-running instance was
+/// swapped in-process with no subprocess restart.
+#[derive(Debug, Clone)]
+pub enum SwitchModelOutcome {
+    Selected,
+    Swapped { load_seconds: Option<f64> },
+}
+
 /// Result of [`RuntimeManager::begin_install`]: either the requested
 /// variant was already available locally (instant, no network — the
 /// common case), or a download was kicked off in the background.
@@ -172,6 +182,26 @@ impl RuntimeManager {
         }
     }
 
+    /// Test-only: same as `new`, but with a caller-supplied `HardwareReport`
+    /// instead of live `hardware::detect()` — needed so hardware-preference
+    /// resolution tests (`preferred_variant`'s downstream effect on
+    /// `begin_install`) are deterministic regardless of whether the machine
+    /// actually running the test suite has a real NVIDIA GPU.
+    #[cfg(test)]
+    pub(crate) fn new_with_hardware(
+        hardware: HardwareReport,
+        idle_timeout: Option<Duration>,
+    ) -> Self {
+        Self {
+            hardware,
+            instances: Mutex::new(HashMap::new()),
+            installed: Mutex::new(HashMap::new()),
+            selected_models: Mutex::new(HashMap::new()),
+            installs: StdMutex::new(HashMap::new()),
+            idle_timeout,
+        }
+    }
+
     pub fn hardware(&self) -> &HardwareReport {
         &self.hardware
     }
@@ -198,31 +228,95 @@ impl RuntimeManager {
         self.installed.lock().await.contains_key(id.as_str())
     }
 
-    /// Install `variant` of a provider: instant/local if already present
-    /// (a vendored dev copy, or a previously-downloaded copy of exactly
-    /// this variant), otherwise kicks off a background download and
-    /// returns immediately with an operation id to poll. Only one provider
-    /// exists in the catalog today (`faster-whisper`); this dispatches on
-    /// id via a `match` rather than a plugin trait, same rationale as
+    /// Install a provider — or, when `variant` is `None`, resolve "no
+    /// opinion" without ever guessing "cpu": if this provider is already
+    /// registered, that registration wins untouched (no-op, no overwrite —
+    /// this is the fix for the bug where a caller-side "no opinion" default
+    /// of literal "cpu" silently downgraded a correct boot-time GPU
+    /// registration); otherwise this machine's own hardware preference
+    /// (`catalog::preferred_variant`) decides. `Some(v)` is always honored
+    /// verbatim regardless of what's already registered — an explicit ask
+    /// (e.g. a user flipping Settings' GPU toggle) must always be able to
+    /// switch variants.
+    ///
+    /// Instant/local if the resolved variant is already present (a vendored
+    /// dev copy, or a previously-downloaded copy of exactly that variant),
+    /// otherwise kicks off a background download and returns immediately
+    /// with an operation id to poll. Only one provider exists in the
+    /// catalog today (`faster-whisper`); this dispatches on id via a
+    /// `match` rather than a plugin trait, same rationale as
     /// `crates/server/src/routes/providers.rs`'s pre-existing per-provider
     /// dispatch — not worth an abstraction for a single entry.
     pub async fn begin_install(
         self: &Arc<Self>,
         id: &ProviderId,
-        variant: RuntimeVariant,
+        variant: Option<RuntimeVariant>,
     ) -> Result<InstallOutcome, RuntimeError> {
         catalog::find_provider(id)?;
         if id.as_str() != "faster-whisper" {
             return Err(RuntimeError::ProviderNotFound(id.to_string()));
         }
 
-        if let Some(launch) = faster_whisper::install_local(variant) {
-            self.register_install(id, variant, launch).await;
-            return Ok(InstallOutcome::Installed {
-                provider_id: id.to_string(),
-                variant: variant.as_str().to_string(),
-            });
+        // One critical section covers "is something already registered" and,
+        // for the common already-cached-locally case, the registration
+        // itself — so a concurrent `begin_install` call for the same
+        // provider can't slip an explicit registration in between this
+        // decision and a write that's supposed to respect it. Written
+        // directly through the held guard (not via `register_install`,
+        // which would re-acquire this same non-reentrant `tokio::sync::Mutex`
+        // and deadlock). `install_local` is a synchronous, network-free
+        // filesystem check (never a download), so holding the lock across it
+        // costs no more than `start()` already pays holding this same lock
+        // across a launch-builder read.
+        //
+        // Known, accepted gap: a `None` call that falls into the download
+        // path below releases the lock before the background download
+        // finishes (holding it across a multi-gigabyte network fetch would
+        // serialize every other install/start call behind it). A concurrent
+        // explicit `Some(v)` call could register in that window and later be
+        // silently overwritten when this download completes — a
+        // pre-existing race today too (two concurrent explicit installs of
+        // *different* variants already race the same way), not a new
+        // regression.
+        enum Decision {
+            AlreadyRegistered(RuntimeVariant),
+            InstalledNow(RuntimeVariant),
+            NeedsDownload(RuntimeVariant),
         }
+        let decision = {
+            let mut installed = self.installed.lock().await;
+            let existing_variant = installed.get(id.as_str()).map(|entry| entry.variant);
+            match (variant, existing_variant) {
+                (None, Some(existing)) => Decision::AlreadyRegistered(existing),
+                (opinion, _) => {
+                    let effective =
+                        opinion.unwrap_or_else(|| catalog::preferred_variant(&self.hardware));
+                    match faster_whisper::install_local(effective) {
+                        Some(launch) => {
+                            installed.insert(
+                                id.as_str().to_string(),
+                                InstalledProvider {
+                                    variant: effective,
+                                    launch,
+                                },
+                            );
+                            Decision::InstalledNow(effective)
+                        }
+                        None => Decision::NeedsDownload(effective),
+                    }
+                }
+            }
+        };
+
+        let variant = match decision {
+            Decision::AlreadyRegistered(v) | Decision::InstalledNow(v) => {
+                return Ok(InstallOutcome::Installed {
+                    provider_id: id.to_string(),
+                    variant: v.as_str().to_string(),
+                });
+            }
+            Decision::NeedsDownload(v) => v,
+        };
 
         // Reuse an already-in-flight download for the same (provider,
         // variant) instead of starting a duplicate one — mirrors `start()`'s
@@ -468,6 +562,106 @@ impl RuntimeManager {
 
     pub async fn selected_model(&self, id: &ProviderId) -> Option<String> {
         self.selected_models.lock().await.get(id.as_str()).cloned()
+    }
+
+    /// Switch a provider's active model without restarting anything, when
+    /// possible. A new, separate, explicit operation from `select_model`
+    /// above -- that method's persist-only contract and callers are
+    /// unchanged.
+    ///
+    /// If `id` isn't currently running, this is exactly `select_model`
+    /// (persist only, applied on the next `start()`) -- there's no running
+    /// instance to swap in-process. If it *is* running, the swap happens
+    /// live: this POSTs the running instance's own `/v1/admin/model`
+    /// (mirroring the HTTP-call pattern `fetch_streaming_capability` and
+    /// `descriptor_for` already use to talk to a live instance by its own
+    /// `base_url`), which reuses the runtime's own model/device/compute_type
+    /// mismatch check and existing inference lock (see
+    /// `runtimes/faster-whisper/app/main.py::admin_switch_model`) so no
+    /// in-flight inference can race the swap and no subprocess restart is
+    /// needed.
+    ///
+    /// Deliberately takes only a model id, not a device override: an actual
+    /// device/variant change (e.g. CPU to GPU) is a heavier operation --
+    /// stop the provider subprocess, relaunch with the new device -- that
+    /// stays the caller's responsibility. This method never silently
+    /// attempts one; it only ever swaps the model on whatever
+    /// device/compute_type the running instance already has.
+    pub async fn switch_model(
+        &self,
+        id: &ProviderId,
+        model_id: &str,
+    ) -> Result<SwitchModelOutcome, RuntimeError> {
+        let entry = catalog::find_provider(id)?;
+        catalog::find_model(entry, model_id)
+            .ok_or_else(|| RuntimeError::ModelNotFound(model_id.to_string()))?;
+
+        let port = {
+            let mut instances = self.instances.lock().await;
+            match instances.get_mut(id.as_str()) {
+                Some(running) => {
+                    if running.instance.status() == RuntimeStatus::Running {
+                        running.last_activity = Instant::now();
+                        Some(running.instance.port)
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        };
+
+        let Some(port) = port else {
+            // Not running: identical persist-only contract to `select_model`.
+            self.selected_models
+                .lock()
+                .await
+                .insert(id.as_str().to_string(), model_id.to_string());
+            return Ok(SwitchModelOutcome::Selected);
+        };
+
+        #[derive(serde::Serialize)]
+        struct AdminModelBody<'a> {
+            model: &'a str,
+        }
+        #[derive(serde::Deserialize)]
+        struct AdminModelResponse {
+            load_seconds: Option<f64>,
+        }
+
+        let url = format!("http://127.0.0.1:{port}/v1/admin/model");
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&url)
+            .json(&AdminModelBody { model: model_id })
+            .send()
+            .await
+            .map_err(|e| RuntimeError::ModelSwitchFailed(format!("could not reach {url}: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RuntimeError::ModelSwitchFailed(format!(
+                "runtime rejected model switch ({status}): {body}"
+            )));
+        }
+
+        let parsed: AdminModelResponse = resp.json().await.map_err(|e| {
+            RuntimeError::ModelSwitchFailed(format!("unexpected response shape: {e}"))
+        })?;
+
+        // Keep the persisted selection in sync with what's actually now
+        // serving, so a later restart (for any unrelated reason) relaunches
+        // with the model that's now active, not whatever was selected
+        // before this swap.
+        self.selected_models
+            .lock()
+            .await
+            .insert(id.as_str().to_string(), model_id.to_string());
+
+        Ok(SwitchModelOutcome::Swapped {
+            load_seconds: parsed.load_seconds,
+        })
     }
 
     /// Start (or return the descriptor of an already-running instance of) a
@@ -825,6 +1019,69 @@ mod tests {
         })
     }
 
+    /// A fake runtime that additionally handles `POST /v1/admin/model` like
+    /// the real `runtimes/faster-whisper/app/main.py::admin_switch_model`
+    /// does: echoes back whatever `model` it was sent plus a fixed
+    /// `load_seconds`, with no subprocess restart involved (it's a single
+    /// long-lived process for the whole test). `http.server`'s
+    /// `SimpleHTTPRequestHandler` can't handle `POST` at all, so this writes
+    /// a tiny standalone `BaseHTTPRequestHandler` script instead of reusing
+    /// `-m http.server` like the other fakes here.
+    fn fake_launch_with_admin_model() -> LaunchBuilder {
+        Box::new(|port, _auth_token, _selected_model, _options| {
+            let dir = std::env::temp_dir().join(format!("stt-runtime-test-admin-{port}"));
+            std::fs::create_dir_all(&dir).expect("create fake runtime temp dir");
+            let script = dir.join("fake_admin_server.py");
+            std::fs::write(
+                &script,
+                r#"
+import http.server
+import json
+import sys
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        if self.path == "/v1/admin/model":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length) or b"{}")
+            response = json.dumps({
+                "status": "ok",
+                "model": body.get("model"),
+                "load_seconds": 0.01,
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(response)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+"#,
+            )
+            .expect("write fake admin server script");
+            Launch {
+                program: python_bin().into(),
+                args: vec![script.to_string_lossy().into_owned(), port.to_string()],
+                env: vec![],
+                cwd: None,
+            }
+        })
+    }
+
     type RecordedCalls = std::sync::Arc<std::sync::Mutex<Vec<(Option<String>, StartOptions)>>>;
 
     /// Captures the `StartOptions`/model each call was invoked with, so a
@@ -991,6 +1248,87 @@ mod tests {
             manager.selected_model(&id).await,
             Some("Systran/faster-whisper-tiny".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn switch_model_persists_only_when_not_running() {
+        let manager = manager_with_faster_whisper_installed(None).await;
+        let id = ProviderId::new("faster-whisper").unwrap();
+
+        assert_eq!(manager.status(&id).await, RuntimeStatus::Stopped);
+
+        let outcome = manager
+            .switch_model(&id, "Systran/faster-whisper-tiny")
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, SwitchModelOutcome::Selected),
+            "expected a persist-only outcome for a non-running provider, got {outcome:?}"
+        );
+        assert_eq!(
+            manager.selected_model(&id).await,
+            Some("Systran/faster-whisper-tiny".to_string()),
+            "switch_model should persist the selection exactly like select_model does"
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_model_rejects_an_unknown_model() {
+        let manager = manager_with_faster_whisper_installed(None).await;
+        let id = ProviderId::new("faster-whisper").unwrap();
+        assert!(matches!(
+            manager.switch_model(&id, "not-a-real-model").await,
+            Err(RuntimeError::ModelNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn switch_model_swaps_in_process_without_restarting_the_running_instance() {
+        let manager = RuntimeManager::new(None);
+        let id = ProviderId::new("faster-whisper").unwrap();
+        manager
+            .register_install(&id, RuntimeVariant::Cpu, fake_launch_with_admin_model())
+            .await;
+
+        manager.start(&id, &StartOptions::default()).await.unwrap();
+        assert_eq!(manager.status(&id).await, RuntimeStatus::Running);
+
+        let pid_before = {
+            let instances = manager.instances.lock().await;
+            instances.get(id.as_str()).unwrap().instance.pid
+        };
+
+        let outcome = manager
+            .switch_model(&id, "Systran/faster-whisper-tiny")
+            .await
+            .unwrap();
+
+        match outcome {
+            SwitchModelOutcome::Swapped { load_seconds } => {
+                assert_eq!(load_seconds, Some(0.01));
+            }
+            other => panic!("expected an in-process swap for a running instance, got {other:?}"),
+        }
+
+        let pid_after = {
+            let instances = manager.instances.lock().await;
+            instances.get(id.as_str()).unwrap().instance.pid
+        };
+        assert_eq!(
+            pid_before, pid_after,
+            "an in-process model swap must never restart the provider subprocess"
+        );
+        assert_eq!(manager.status(&id).await, RuntimeStatus::Running);
+
+        // The successful swap should also update the persisted selection,
+        // so a later restart (for any unrelated reason) relaunches with
+        // what's actually now serving.
+        assert_eq!(
+            manager.selected_model(&id).await,
+            Some("Systran/faster-whisper-tiny".to_string())
+        );
+
+        manager.stop(&id).await.unwrap();
     }
 
     #[tokio::test]
@@ -1271,7 +1609,7 @@ mod tests {
         let manager = Arc::new(RuntimeManager::new(None));
         let id = ProviderId::new("does-not-exist").unwrap();
         assert!(matches!(
-            manager.begin_install(&id, RuntimeVariant::Cpu).await,
+            manager.begin_install(&id, Some(RuntimeVariant::Cpu)).await,
             Err(RuntimeError::ProviderNotFound(_))
         ));
     }
@@ -1378,7 +1716,7 @@ mod tests {
 
         let manager = Arc::new(RuntimeManager::new(None));
         let id = ProviderId::new("faster-whisper").unwrap();
-        let outcome = manager.begin_install(&id, RuntimeVariant::Cpu).await;
+        let outcome = manager.begin_install(&id, Some(RuntimeVariant::Cpu)).await;
 
         unsafe {
             std::env::remove_var(faster_whisper::RELEASE_BASE_URL_ENV_VAR);
@@ -1418,7 +1756,7 @@ mod tests {
         let manager = Arc::new(RuntimeManager::new(None));
         let id = ProviderId::new("faster-whisper").unwrap();
         let outcome = manager
-            .begin_install(&id, RuntimeVariant::Cpu)
+            .begin_install(&id, Some(RuntimeVariant::Cpu))
             .await
             .unwrap();
         let operation_id = match outcome {
@@ -1453,6 +1791,192 @@ mod tests {
             "expected the download to complete, got {final_state:?}"
         );
         assert!(manager.is_installed(&id).await);
+    }
+
+    #[tokio::test]
+    async fn begin_install_with_no_variant_and_an_existing_gpu_registration_is_a_no_op() {
+        let manager = Arc::new(RuntimeManager::new(None));
+        let id = ProviderId::new("faster-whisper").unwrap();
+        manager
+            .register_install(&id, RuntimeVariant::Gpu, fake_launch())
+            .await;
+
+        // No variant opinion, but faster-whisper is already registered as
+        // gpu: must report the existing registration back unchanged, never
+        // silently fall back to a fresh hardware-preference resolution —
+        // this is the exact "client sends 'cpu' as its 'no opinion' default"
+        // bug this fix closes.
+        let outcome = manager.begin_install(&id, None).await.unwrap();
+
+        assert!(matches!(
+            outcome,
+            InstallOutcome::Installed { ref variant, .. } if variant == "gpu"
+        ));
+        assert_eq!(
+            manager
+                .installed
+                .lock()
+                .await
+                .get(id.as_str())
+                .unwrap()
+                .variant,
+            RuntimeVariant::Gpu,
+            "the existing gpu registration must survive an opinion-free install call untouched"
+        );
+    }
+
+    #[tokio::test]
+    // Held across `.await` deliberately: this guard serializes tests
+    // that mutate process-wide env vars, and each `#[tokio::test]` here runs
+    // on its own single-threaded (current_thread) runtime, so holding it
+    // through the awaits below just serializes those tests, it can't starve
+    // unrelated async work on another task.
+    #[allow(clippy::await_holding_lock)]
+    async fn begin_install_with_no_variant_and_nothing_registered_prefers_gpu_when_hardware_reports_an_nvidia_gpu(
+    ) {
+        let _guard = faster_whisper::lock_env_test();
+        let (mut server, serve_dir, cache_root, base_url) =
+            spawn_fake_release_server(RuntimeVariant::Gpu).await;
+        unsafe {
+            std::env::set_var(faster_whisper::RELEASE_BASE_URL_ENV_VAR, &base_url);
+            std::env::set_var(faster_whisper::RUNTIME_CACHE_DIR_ENV_VAR, &cache_root);
+            std::env::set_var(faster_whisper::RUNTIME_DIR_ENV_VAR, "/nonexistent/for/sure");
+        }
+        let _ = faster_whisper::download_variant(RuntimeVariant::Gpu, |_| {})
+            .await
+            .expect("pre-populating the gpu cache should succeed against the local fake server");
+
+        let hardware = HardwareReport {
+            has_nvidia_gpu: true,
+            gpu_name: Some("Test GPU".to_string()),
+            driver_version: None,
+            vram_bytes: None,
+            cpu_cores: 4,
+            cpu_architecture: "x86_64".to_string(),
+            total_ram_bytes: 0,
+        };
+        let manager = Arc::new(RuntimeManager::new_with_hardware(hardware, None));
+        let id = ProviderId::new("faster-whisper").unwrap();
+
+        let outcome = manager.begin_install(&id, None).await.unwrap();
+
+        unsafe {
+            std::env::remove_var(faster_whisper::RELEASE_BASE_URL_ENV_VAR);
+            std::env::remove_var(faster_whisper::RUNTIME_CACHE_DIR_ENV_VAR);
+            std::env::remove_var(faster_whisper::RUNTIME_DIR_ENV_VAR);
+        }
+        let _ = server.kill().await;
+        std::fs::remove_dir_all(&serve_dir).ok();
+        std::fs::remove_dir_all(&cache_root).ok();
+
+        assert!(matches!(
+            outcome,
+            InstallOutcome::Installed { ref variant, .. } if variant == "gpu"
+        ));
+    }
+
+    #[tokio::test]
+    // Held across `.await` deliberately: this guard serializes tests
+    // that mutate process-wide env vars, and each `#[tokio::test]` here runs
+    // on its own single-threaded (current_thread) runtime, so holding it
+    // through the awaits below just serializes those tests, it can't starve
+    // unrelated async work on another task.
+    #[allow(clippy::await_holding_lock)]
+    async fn begin_install_with_no_variant_and_nothing_registered_prefers_cpu_without_an_nvidia_gpu(
+    ) {
+        let _guard = faster_whisper::lock_env_test();
+        let (mut server, serve_dir, cache_root, base_url) =
+            spawn_fake_release_server(RuntimeVariant::Cpu).await;
+        unsafe {
+            std::env::set_var(faster_whisper::RELEASE_BASE_URL_ENV_VAR, &base_url);
+            std::env::set_var(faster_whisper::RUNTIME_CACHE_DIR_ENV_VAR, &cache_root);
+            std::env::set_var(faster_whisper::RUNTIME_DIR_ENV_VAR, "/nonexistent/for/sure");
+        }
+        let _ = faster_whisper::download_variant(RuntimeVariant::Cpu, |_| {})
+            .await
+            .expect("pre-populating the cpu cache should succeed against the local fake server");
+
+        let hardware = HardwareReport {
+            has_nvidia_gpu: false,
+            gpu_name: None,
+            driver_version: None,
+            vram_bytes: None,
+            cpu_cores: 4,
+            cpu_architecture: "x86_64".to_string(),
+            total_ram_bytes: 0,
+        };
+        let manager = Arc::new(RuntimeManager::new_with_hardware(hardware, None));
+        let id = ProviderId::new("faster-whisper").unwrap();
+
+        let outcome = manager.begin_install(&id, None).await.unwrap();
+
+        unsafe {
+            std::env::remove_var(faster_whisper::RELEASE_BASE_URL_ENV_VAR);
+            std::env::remove_var(faster_whisper::RUNTIME_CACHE_DIR_ENV_VAR);
+            std::env::remove_var(faster_whisper::RUNTIME_DIR_ENV_VAR);
+        }
+        let _ = server.kill().await;
+        std::fs::remove_dir_all(&serve_dir).ok();
+        std::fs::remove_dir_all(&cache_root).ok();
+
+        assert!(matches!(
+            outcome,
+            InstallOutcome::Installed { ref variant, .. } if variant == "cpu"
+        ));
+    }
+
+    #[tokio::test]
+    // Held across `.await` deliberately: this guard serializes tests
+    // that mutate process-wide env vars, and each `#[tokio::test]` here runs
+    // on its own single-threaded (current_thread) runtime, so holding it
+    // through the awaits below just serializes those tests, it can't starve
+    // unrelated async work on another task.
+    #[allow(clippy::await_holding_lock)]
+    async fn begin_install_with_an_explicit_variant_always_overwrites_an_existing_registration() {
+        let _guard = faster_whisper::lock_env_test();
+        let (mut server, serve_dir, cache_root, base_url) =
+            spawn_fake_release_server(RuntimeVariant::Cpu).await;
+        unsafe {
+            std::env::set_var(faster_whisper::RELEASE_BASE_URL_ENV_VAR, &base_url);
+            std::env::set_var(faster_whisper::RUNTIME_CACHE_DIR_ENV_VAR, &cache_root);
+            std::env::set_var(faster_whisper::RUNTIME_DIR_ENV_VAR, "/nonexistent/for/sure");
+        }
+        let _ = faster_whisper::download_variant(RuntimeVariant::Cpu, |_| {})
+            .await
+            .expect("pre-populating the cpu cache should succeed against the local fake server");
+
+        let manager = Arc::new(RuntimeManager::new(None));
+        let id = ProviderId::new("faster-whisper").unwrap();
+        manager
+            .register_install(&id, RuntimeVariant::Gpu, fake_launch())
+            .await;
+
+        // Simulates a user explicitly flipping Settings from gpu to cpu:
+        // even though gpu is already registered, an explicit ask must still
+        // switch it.
+        let outcome = manager
+            .begin_install(&id, Some(RuntimeVariant::Cpu))
+            .await
+            .unwrap();
+        // A follow-up opinion-free call should now report the *new*
+        // registration (cpu), proving the explicit call really overwrote it.
+        let followup = manager.begin_install(&id, None).await.unwrap();
+
+        unsafe {
+            std::env::remove_var(faster_whisper::RELEASE_BASE_URL_ENV_VAR);
+            std::env::remove_var(faster_whisper::RUNTIME_CACHE_DIR_ENV_VAR);
+            std::env::remove_var(faster_whisper::RUNTIME_DIR_ENV_VAR);
+        }
+        let _ = server.kill().await;
+        std::fs::remove_dir_all(&serve_dir).ok();
+        std::fs::remove_dir_all(&cache_root).ok();
+
+        assert!(
+            matches!(outcome, InstallOutcome::Installed { ref variant, .. } if variant == "cpu")
+        );
+        assert!(
+            matches!(followup, InstallOutcome::Installed { ref variant, .. } if variant == "cpu")
+        );
     }
 
     #[tokio::test]

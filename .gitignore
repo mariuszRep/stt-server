@@ -35,9 +35,12 @@ models/
 # Test artifacts
 test-results/
 
-# Vendored managed-runtime Python source (runtimes/*/): bytecode cache and
-# local virtualenvs, not the vendored source itself
+# Vendored managed-runtime Python source (runtimes/*/): bytecode cache,
+# local virtualenvs, and PyInstaller build output, not the vendored source
+# itself
 runtimes/*/__pycache__/
 runtimes/*/**/__pycache__/
 runtimes/*/venv/
 runtimes/*/*.egg-info/
+runtimes/*/build/
+runtimes/*/dist/

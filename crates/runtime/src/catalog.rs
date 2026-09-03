@@ -94,6 +94,20 @@ pub struct VariantInfo {
     pub reason: Option<String>,
 }
 
+/// This machine's hardware-preferred variant absent any other opinion — the
+/// single source of truth for what "no opinion" should resolve to. Factored
+/// out of `crates/cli/src/run.rs`'s inline boot-time check so it can be
+/// reused by `RuntimeManager::begin_install`'s own "no opinion, nothing
+/// registered yet" branch — the two paths must never disagree about what
+/// hardware alone implies. Same rationale as this crate's `recommend.rs`.
+pub fn preferred_variant(hardware: &HardwareReport) -> RuntimeVariant {
+    if hardware.has_nvidia_gpu {
+        RuntimeVariant::Gpu
+    } else {
+        RuntimeVariant::Cpu
+    }
+}
+
 /// GPU is only ever compatible/recommended when an NVIDIA GPU was
 /// detected; CPU is always compatible and recommended only in the absence
 /// of one. Listed either way (never hidden) so a disabled option in a UI
@@ -265,7 +279,9 @@ mod tests {
             has_nvidia_gpu: false,
             gpu_name: None,
             driver_version: None,
+            vram_bytes: None,
             cpu_cores: 4,
+            cpu_architecture: "x86_64".to_string(),
             total_ram_bytes: 0,
         };
         let info = evaluate_variant(RuntimeVariant::Gpu, &hardware);
@@ -287,7 +303,9 @@ mod tests {
             has_nvidia_gpu: true,
             gpu_name: Some("Test GPU".to_string()),
             driver_version: None,
+            vram_bytes: Some(8 * 1024 * 1024 * 1024),
             cpu_cores: 4,
+            cpu_architecture: "x86_64".to_string(),
             total_ram_bytes: 0,
         };
         let info = evaluate_variant(RuntimeVariant::Gpu, &hardware);
@@ -318,7 +336,9 @@ mod tests {
             has_nvidia_gpu: false,
             gpu_name: None,
             driver_version: None,
+            vram_bytes: None,
             cpu_cores: 4,
+            cpu_architecture: "x86_64".to_string(),
             total_ram_bytes: 0,
         };
         let providers = list_providers(&hardware);
