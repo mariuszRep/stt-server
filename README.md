@@ -26,9 +26,10 @@ stt-server/
 
 The managed faster-whisper runtime is a separate OS process this control plane spawns,
 health-checks, and supervises — it is never linked into `stt-server` itself. Its own wire
-contract (`GET /health`, `GET /v1/config`, `POST /v1/audio/transcriptions`,
-`WS /v1/audio/stream`) is untouched by this repo; `stt-server` only starts it and reports
-back where it's listening.
+contract (`GET /health`, `GET /v1/config`, `POST /v1/audio/transcriptions`) is untouched
+by this repo; `stt-server` only starts it and reports back where it's listening. (The
+runtime previously also exposed a local `WS /v1/audio/stream` streaming protocol; that was
+removed from the runtime itself — batch transcription is unaffected.)
 
 ## Quick Start
 
@@ -129,10 +130,14 @@ consumes:
   "protocol": "voice-typer-v1",
   "transport": "http",
   "baseUrl": "http://127.0.0.1:51234",
-  "streaming": { "enabled": true, "endpoint": "/v1/audio/stream", "protocolVersion": 1, "..." : "..." },
   "auth": { "type": "token", "value": "..." }
 }
 ```
+
+`streaming` (`{ enabled, endpoint, protocolVersion, ... }`) is an optional field, present
+only when the managed runtime itself advertises a streaming capability via its own
+`GET /v1/config` — faster-whisper doesn't today (its WS streaming protocol was removed),
+so this control plane reports a batch-only descriptor (`streaming` omitted) for it.
 
 ### Idle auto-shutdown
 

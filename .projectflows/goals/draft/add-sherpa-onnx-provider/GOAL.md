@@ -9,16 +9,17 @@ attempt: 0
 max_attempts: 5
 last_result: none
 next_action: |
-  Blocked on generalize-provider-engine-installation landing first (the ProviderEngine trait and
-  shared cache machinery this adapter implements against don't exist yet). Once that goal is
-  done: verify sherpa-onnx's actual current per-model-family file manifests and real release/
-  model URLs against the real k2-fsa/sherpa-onnx repo and releases page — not assumed from this
-  goal's own notes, which were written during a design pass without checking real current
-  releases or model repos.
+  Sequence after both generalize-provider-engine-installation and add-whisper-cpp-provider. Once
+  whisper.cpp has validated the first-provider path against the landed abstraction, verify
+  sherpa-onnx's current per-family multi-file manifests and real release/model URLs against the
+  k2-fsa/sherpa-onnx repo, then flesh out this draft before moving it to ready. Use this second
+  provider to validate that the shared machinery handles multiple files and multiple model
+  families rather than merely repeating whisper.cpp's single-family/plain-file shape.
 success_criteria:
   - sherpa-onnx installs, caches under default_data_root(), and uninstalls cleanly through the same API/CLI surface every other engine uses.
   - Release assets are fetched from k2-fsa/sherpa-onnx's own releases, never rebuilt or re-hosted by stt-server.
   - At least one non-Whisper model family (e.g. an NVIDIA Parakeet/Canary ONNX export) is a real, installable catalog entry, proving the "one engine, many model families" shape works end-to-end.
+  - A real family-dependent multi-file model manifest downloads and verifies through the shared cache helper, validating multi-file support after whisper.cpp has established the first-provider path.
 source: user
 ---
 
@@ -40,12 +41,13 @@ model families **neither faster-whisper nor whisper.cpp can run at all** — NVI
 Moonshine, SenseVoice, Zipformer/Paraformer — through one engine binary, matching the user's
 explicit "min effort, minimal maintenance" requirement better than a bespoke adapter per family.
 
-## Blocker
+## Blockers and Sequence
 
-Hard-blocked on `generalize-provider-engine-installation` (currently `ready`, not yet attempted)
-— this goal implements a `ProviderEngine` trait impl that doesn't exist as a trait yet. Also
-depends on that goal's `cache::verify_files_present` shared helper, needed here specifically for
-model families with multiple weight files (encoder/decoder/joiner/tokens).
+Hard-blocked first on `generalize-provider-engine-installation` (currently `ready`, not yet
+attempted), which must land the trait and `cache::verify_files_present`. It is then sequenced after
+`add-whisper-cpp-provider`: whisper.cpp is the first new provider, while sherpa-onnx is deliberately
+the second so it tests the harder multi-file and multi-family shape (encoder/decoder/joiner/tokens
+and family-dependent manifests) against an abstraction already validated by one real adapter.
 
 ## Scope, Acceptance Criteria, Verification
 
@@ -62,4 +64,4 @@ No attempts yet.
 ## Ready For Execution
 
 - Status: no
-- Reason: Blocked on `generalize-provider-engine-installation`.
+- Reason: Blocked on `generalize-provider-engine-installation` and intentionally sequenced after `add-whisper-cpp-provider` so this second provider validates multi-file/multi-family support.

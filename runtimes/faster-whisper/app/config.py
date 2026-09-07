@@ -158,8 +158,17 @@ _device_env = os.environ.get("VOICE_TYPER_DEVICE")
 # just this variant's only supported default.
 REQUESTED_DEVICE = _device_env or ("cuda" if CUDA_AVAILABLE and BUILD_VARIANT != "cpu" else "cpu")
 REQUESTED_DEVICE_SOURCE = "manual" if _device_env else "auto"
+# int8_float16 benchmarked ~2.4x faster than float16 on this project's default
+# "small" model with no measured accuracy difference (see the chunk-transcription
+# latency investigation this default came from). Only default to it when the
+# detected CUDA runtime actually lists it as supported -- an unsupported compute
+# type fails model construction outright and would otherwise force a full CPU
+# fallback (losing GPU accel entirely) instead of gracefully staying on GPU.
+_CUDA_DEFAULT_COMPUTE_TYPE = (
+    "int8_float16" if "int8_float16" in CUDA_SUPPORTED_COMPUTE_TYPES else "float16"
+)
 REQUESTED_COMPUTE_TYPE = os.environ.get("VOICE_TYPER_COMPUTE_TYPE") or (
-    "float16" if REQUESTED_DEVICE == "cuda" else "int8"
+    _CUDA_DEFAULT_COMPUTE_TYPE if REQUESTED_DEVICE == "cuda" else "int8"
 )
 if REQUESTED_DEVICE == "cuda" and (BUILD_VARIANT == "cpu" or not CUDA_RUNTIME_OK):
     if BUILD_VARIANT == "cpu" and CUDA_RUNTIME_OK:
