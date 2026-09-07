@@ -9,12 +9,11 @@ attempt: 0
 max_attempts: 5
 last_result: none
 next_action: |
-  Blocked on generalize-provider-engine-installation landing first (the ProviderEngine trait and
-  shared cache machinery this adapter implements against don't exist yet). Once that goal is
-  done: verify whisper.cpp's actual current GH release asset layout (zip contents, whether
-  CPU/CUDA/Vulkan/Metal are separate downloads or one universal build) against the real
-  ggml-org/whisper.cpp releases page — not assumed from this goal's own notes, which were
-  written during a design pass without checking real current releases.
+  This is the first provider goal after generalize-provider-engine-installation. Once that goal
+  lands, verify whisper.cpp's current GitHub release asset layout (zip contents and CPU/CUDA/
+  Vulkan/Metal packaging) against the real ggml-org/whisper.cpp releases, then flesh out this
+  draft against the landed ProviderEngine/cache API before moving it to ready. Do not begin
+  sherpa-onnx first; whisper.cpp is the initial real-provider validation of the abstraction.
 success_criteria:
   - whisper.cpp installs, caches under default_data_root(), and uninstalls cleanly through the same API/CLI surface every other engine uses.
   - Release assets are fetched from ggml-org/whisper.cpp's own releases, never rebuilt or re-hosted by stt-server.
@@ -41,10 +40,12 @@ Its standout strength is a purpose-built Apple Silicon path (dedicated Metal ker
 encoder offload) — not currently load-bearing since the project ships Windows+Linux only today,
 but real value once macOS becomes a live target.
 
-## Blocker
+## Blocker and Sequence
 
 Hard-blocked on `generalize-provider-engine-installation` (currently `ready`, not yet attempted)
-— this goal implements a `ProviderEngine` trait impl that doesn't exist as a trait yet.
+— this goal implements a `ProviderEngine` trait impl that doesn't exist as a trait yet. When that
+refactor is done, whisper.cpp is explicitly the first real provider to implement against it;
+`add-sherpa-onnx-provider` follows afterward.
 
 ## Scope, Acceptance Criteria, Verification
 
@@ -59,4 +60,4 @@ No attempts yet.
 ## Ready For Execution
 
 - Status: no
-- Reason: Blocked on `generalize-provider-engine-installation`.
+- Reason: Blocked on `generalize-provider-engine-installation`; this remains the first provider goal to execute immediately after that refactor.

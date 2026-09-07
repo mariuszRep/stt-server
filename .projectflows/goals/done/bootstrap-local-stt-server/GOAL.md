@@ -358,5 +358,11 @@ published on `mariuszRep/stt-server` with all expected platform artifacts — `w
 
 ## Ready For Execution
 
-- Status: yes
-- Reason: Server ownership, current data-path violations, managed-runtime compatibility boundary, release independence, and verification expectations are fully defined. Runtime packaging and registry configuration are explicit delivery dependencies rather than unresolved product scope.
+- Status: done
+- Reason: Executed and verified; the post-completion metadata audit below does not reopen the core bootstrap.
+
+## Post-Completion Audit Note
+
+A later metadata audit does not change this goal's `done` status. The control-plane implementation and its public release path were verified with source tests, real Windows lifecycle checks, and successful `v0.1.1` and `v0.2.0` GitHub releases. Those are the evidence for the completed bootstrap.
+
+The audit also found follow-up metadata and compatibility cleanup that should not be mistaken for missing core implementation: the header/comments in `release.yml` are stale, SDK compatibility language/checks do not yet reflect a published and pinned SDK `0.3` package, Cargo repository metadata is stale, and some historical goal text/verification references still mention the removed faster-whisper WebSocket endpoint. These are release-metadata, SDK/bootstrap/consumer compatibility, and historical-documentation issues for later work. They do not justify reopening the control-plane bootstrap goal.

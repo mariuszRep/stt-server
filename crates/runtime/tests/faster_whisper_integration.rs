@@ -128,17 +128,16 @@ async fn real_faster_whisper_runtime_starts_and_serves_health() {
     assert_eq!(descriptor.protocol, "voice-typer-v1");
     assert_eq!(manager.status(&id).await, RuntimeStatus::Running);
 
-    // Proves the streaming-descriptor fix end-to-end against the real
-    // runtime (not just the fake test double in manager.rs's unit tests):
-    // the vendored Python backend's own GET /v1/config already returns this
-    // block, so a non-null value here confirms stt-server actually fetches
-    // and forwards it now.
-    let streaming = descriptor
-        .streaming
-        .as_ref()
-        .expect("real runtime should advertise streaming capability");
-    assert_eq!(streaming.endpoint, "/v1/audio/stream");
-    assert!(streaming.enabled);
+    // Proves the batch-only fallback end-to-end against the real runtime (not
+    // just the fake test double in manager.rs's unit tests): the local WS
+    // streaming engine was removed from the vendored Python backend (its
+    // GET /v1/config no longer returns a `streaming` block at all), so
+    // `fetch_streaming_capability`'s graceful-degradation path is what
+    // actually runs here now, not a populated descriptor.
+    assert!(
+        descriptor.streaming.is_none(),
+        "faster-whisper no longer advertises streaming; descriptor.streaming should be None"
+    );
 
     // start() already blocked on GET /health via the supervisor; re-confirm
     // directly against the descriptor's own base_url as an end-to-end check
