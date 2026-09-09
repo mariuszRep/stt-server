@@ -1,4 +1,5 @@
 pub mod catalog;
+pub mod conformance;
 pub mod error;
 pub mod hardware;
 pub mod manager;

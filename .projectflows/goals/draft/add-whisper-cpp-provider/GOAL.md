@@ -9,11 +9,11 @@ attempt: 0
 max_attempts: 5
 last_result: none
 next_action: |
-  This is the first provider goal after generalize-provider-engine-installation. Once that goal
-  lands, verify whisper.cpp's current GitHub release asset layout (zip contents and CPU/CUDA/
+  Parked 2026-09-09 behind add-sherpa-onnx-provider (see Blocker and Sequence). Do not start this
+  until sherpa-onnx has landed and the latency problem it targets is resolved or understood. When
+  picked up, verify whisper.cpp's current GitHub release asset layout (zip contents and CPU/CUDA/
   Vulkan/Metal packaging) against the real ggml-org/whisper.cpp releases, then flesh out this
-  draft against the landed ProviderEngine/cache API before moving it to ready. Do not begin
-  sherpa-onnx first; whisper.cpp is the initial real-provider validation of the abstraction.
+  draft against the landed ProviderEngine/cache API before moving it to ready.
 success_criteria:
   - whisper.cpp installs, caches under default_data_root(), and uninstalls cleanly through the same API/CLI surface every other engine uses.
   - Release assets are fetched from ggml-org/whisper.cpp's own releases, never rebuilt or re-hosted by stt-server.
@@ -43,9 +43,24 @@ but real value once macOS becomes a live target.
 ## Blocker and Sequence
 
 Hard-blocked on `generalize-provider-engine-installation` (currently `ready`, not yet attempted)
-— this goal implements a `ProviderEngine` trait impl that doesn't exist as a trait yet. When that
-refactor is done, whisper.cpp is explicitly the first real provider to implement against it;
-`add-sherpa-onnx-provider` follows afterward.
+— this goal implements a `ProviderEngine` trait impl that doesn't exist as a trait yet.
+
+**Parked behind `add-sherpa-onnx-provider` (2026-09-09, user decision).** This goal was originally
+the first adapter after the refactor; it is now the second. Rationale:
+
+- The live product problem is Whisper-family latency. whisper.cpp is another Whisper engine, so it
+  does not address it; sherpa-onnx does, by way of NVIDIA Parakeet.
+- whisper.cpp is largely redundant with faster-whisper for the Whisper family, which faster-whisper
+  already serves as the accuracy baseline.
+- Its distinctive strength — the Apple Silicon Metal/CoreML path — is not load-bearing while the
+  product ships Windows and Linux only. It becomes valuable when macOS becomes a live target, and
+  that is the natural trigger to unpark this goal.
+- Doing sherpa-onnx first also puts the harder multi-file/multi-family model shape against the new
+  abstraction immediately, rather than letting an easier single-file adapter shape it first.
+
+This goal remains genuinely wanted, not cancelled: it stays in the roster named by
+`stt-server/VISION.md`'s 2026-08-30 key decision, and `stt-sdk` still exports an unimplemented
+`WhisperCppProvider` seam awaiting it.
 
 ## Scope, Acceptance Criteria, Verification
 
@@ -60,4 +75,6 @@ No attempts yet.
 ## Ready For Execution
 
 - Status: no
-- Reason: Blocked on `generalize-provider-engine-installation`; this remains the first provider goal to execute immediately after that refactor.
+- Reason: Blocked on `generalize-provider-engine-installation`, and deliberately parked behind
+  `add-sherpa-onnx-provider`. Natural trigger to revisit: macOS becoming a live target, or
+  sherpa-onnx failing to resolve the latency problem.

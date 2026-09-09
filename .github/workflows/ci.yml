@@ -75,3 +75,30 @@ jobs:
             echo "::error::found a WebSocket extractor reference in the control plane — audio must never cross stt-server"
             exit 1
           fi
+
+  # The sherpa-onnx managed runtime (runtimes/sherpa-onnx/) is deliberately
+  # its own cargo workspace, not a member of the root one above — its native
+  # ONNX-runtime library download/static-link shouldn't lengthen every
+  # `cargo build --workspace` run. Built here as its own job for that reason.
+  sherpad:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: runtimes/sherpa-onnx
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: runtimes/sherpa-onnx
+      - name: Format check
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --release --all-targets -- -D warnings
+      - name: Build
+        run: cargo build --release --bin sherpad

@@ -156,37 +156,70 @@ pub struct CatalogEntry {
     pub variants: &'static [RuntimeVariant],
 }
 
-pub const CATALOG: &[CatalogEntry] = &[CatalogEntry {
-    id: "faster-whisper",
-    display_name: "Faster Whisper",
-    protocol: "voice-typer-v1",
-    transport: "http",
-    health_path: "/health",
-    default_model: "Systran/faster-whisper-small",
-    variants: &[RuntimeVariant::Cpu, RuntimeVariant::Gpu],
-    models: &[
-        ModelEntry {
-            id: "Systran/faster-whisper-tiny",
-            display_name: "Tiny",
-        },
-        ModelEntry {
-            id: "Systran/faster-whisper-base",
-            display_name: "Base",
-        },
-        ModelEntry {
-            id: "Systran/faster-whisper-small",
-            display_name: "Small",
-        },
-        ModelEntry {
-            id: "Systran/faster-whisper-medium",
-            display_name: "Medium",
-        },
-        ModelEntry {
-            id: "Systran/faster-whisper-large-v3",
-            display_name: "Large v3",
-        },
-    ],
-}];
+pub const CATALOG: &[CatalogEntry] = &[
+    CatalogEntry {
+        id: "faster-whisper",
+        display_name: "Faster Whisper",
+        protocol: "voice-typer-v1",
+        transport: "http",
+        health_path: "/health",
+        default_model: "Systran/faster-whisper-small",
+        variants: &[RuntimeVariant::Cpu, RuntimeVariant::Gpu],
+        models: &[
+            ModelEntry {
+                id: "Systran/faster-whisper-tiny",
+                display_name: "Tiny",
+            },
+            ModelEntry {
+                id: "Systran/faster-whisper-base",
+                display_name: "Base",
+            },
+            ModelEntry {
+                id: "Systran/faster-whisper-small",
+                display_name: "Small",
+            },
+            ModelEntry {
+                id: "Systran/faster-whisper-medium",
+                display_name: "Medium",
+            },
+            ModelEntry {
+                id: "Systran/faster-whisper-large-v3",
+                display_name: "Large v3",
+            },
+        ],
+    },
+    // No Whisper-family models under this provider, deliberately: sherpa-onnx's
+    // own ONNX-exported Whisper path has a documented accuracy regression
+    // versus faster-whisper on identical audio (k2-fsa/sherpa-onnx#2900) --
+    // faster-whisper stays the sole Whisper engine. sherpa-onnx's value here
+    // is model families faster-whisper cannot run at all. Only two model
+    // entries ship today (SenseVoice, Parakeet) -- the only two verified via
+    // real download + real transcription in this session; Moonshine and
+    // Canary were candidates but were never actually pulled/tested, so they
+    // are not listed here (see sherpa-manifest's own header comment: "each
+    // entry here has been downloaded and smoke-tested").
+    CatalogEntry {
+        id: "sherpa-onnx",
+        display_name: "Sherpa-ONNX",
+        protocol: "voice-typer-v1",
+        transport: "http",
+        health_path: "/health",
+        default_model: "parakeet-tdt-0.6b-v2",
+        // sherpad links a CPU-only onnxruntime build today; GPU (CUDA/DirectML)
+        // is a separate future goal, not a gap in this catalog entry.
+        variants: &[RuntimeVariant::Cpu],
+        models: &[
+            ModelEntry {
+                id: "sense-voice-multi",
+                display_name: "SenseVoice (Multilingual: zh/en/ja/ko/yue)",
+            },
+            ModelEntry {
+                id: "parakeet-tdt-0.6b-v2",
+                display_name: "Parakeet TDT 0.6B (English, fast)",
+            },
+        ],
+    },
+];
 
 /// Provider catalog entry as reported over the control-plane API, with
 /// compatibility evaluated against the current machine's hardware.

@@ -2,22 +2,13 @@
 name: generalize-provider-engine-installation
 title: Generalize Provider/Engine Installation Into a Pluggable Architecture
 description: Replace faster-whisper-hardcoded lifecycle dispatch and cache mechanics with a ProviderEngine trait, provider registry, and shared engine-agnostic cache machinery, then migrate faster-whisper without behavior changes.
-status: ready
+status: done
 type: refactor
 scope: stt-server/crates/runtime/src/manager.rs, stt-server/crates/runtime/src/providers/, stt-server/crates/cli/src/run.rs
-attempt: 0
+attempt: 1
 max_attempts: 5
-last_result: none
-next_action: |
-  Design/reading is complete (see Design Validation). Start the first implementation attempt by:
-  1. Add `crates/runtime/src/providers/cache.rs` with provider-parameterized variant/model paths,
-     download-with-progress and atomic completion, cache removal, and multi-file verification.
-  2. Define `ProviderEngine` and `providers::registry()` in `providers/mod.rs`.
-  3. Replace RuntimeManager and `run.rs` faster-whisper-specific dispatch with registry dispatch,
-     including catalog-driven local registration and provider-specific uninstall variant cleanup.
-  4. Migrate `faster_whisper.rs` onto the trait with no binary, URL, cache-layout, lifecycle, or
-     model behavior changes, then rerun the bootstrap goal's automated and real-hardware
-     regression checks.
+last_result: passed
+next_action: null
 success_criteria:
   - RuntimeManager's install/uninstall/model-pull/verify/remove methods and daemon startup registration dispatch through a provider registry, with no faster-whisper-specific dispatch in manager.rs or run.rs.
   - Download-with-progress, atomic rename-on-completion, per-variant cache directories, per-model directories, verification, and uninstall cleanup use shared provider-parameterized cache machinery rather than faster-whisper-specific copies.
@@ -45,9 +36,15 @@ explicitly asked for a solution that is "easy flexibility but also min effort so
 maintenance from our side." Later in the same session, after research into candidate engines and
 a Plan-agent design-validation pass, the user explicitly confirmed the target roster: *"lets
 design with mind that all 3 will be implemented and eny other but we keep faster-whisper as
-priotrity"*. This goal supplies only the shared seam and faster-whisper migration. The separate
-`add-whisper-cpp-provider` draft owns the first new adapter after this refactor; the separate
-`add-sherpa-onnx-provider` draft follows it and owns multi-file/multi-family validation.
+priotrity"*. This goal supplies only the shared seam and faster-whisper migration.
+
+**Adapter order revised 2026-09-09 (user decision):** `add-sherpa-onnx-provider` is now the first
+adapter after this refactor, and `add-whisper-cpp-provider` is parked behind it. Rationale: the
+product's live problem is Whisper-family latency, and sherpa-onnx is the only route to NVIDIA
+Parakeet, which addresses it. whisper.cpp is redundant with faster-whisper for the Whisper family,
+and its distinctive strength (Metal/CoreML on Apple Silicon) is not load-bearing on a Windows+Linux
+product today. Doing sherpa-onnx first also means the harder multi-file/multi-family shape validates
+the abstraction immediately rather than after an easier adapter has already shaped it.
 
 ## Problem / Motivation
 
@@ -121,15 +118,19 @@ Considered and researched this session (full detail in conversation; summarized 
   documented accuracy regression versus faster-whisper on identical audio
   ([k2-fsa/sherpa-onnx#2900](https://github.com/k2-fsa/sherpa-onnx/issues/2900)) — it is additive
   for model families neither faster-whisper nor whisper.cpp can run, not a Whisper replacement.
+  **Corrected 2026-09-09 — see "Correction: sherpa-onnx is a self-hosted-binary engine" below.**
+  Those prebuilt releases exist but none of them speaks this project's local provider protocol, so
+  this bullet's implied conclusion (that the adapter fetches a ready-made server binary from
+  upstream) is wrong.
 - **Considered and explicitly not pursued**: Coqui STT and Mozilla DeepSpeech (both effectively
   unmaintained ecosystems); NVIDIA NeMo directly (pulls in a full PyTorch stack — the same
   heavy-dependency problem embeddable-Python packaging would create; sherpa-onnx's ONNX export of
   the same Parakeet/Canary models achieves the same model access without that dependency weight).
 
-whisper.cpp remains the first planned adapter after this abstraction lands, followed by
-sherpa-onnx. Their separate draft goals own real adapter implementation; the engine research here
-is retained only as design evidence that the shared trait/cache boundary must not assume one
-binary or one model-file shape.
+sherpa-onnx is the first planned adapter after this abstraction lands (revised 2026-09-09, see
+Source Requirements), with whisper.cpp parked behind it. Their separate draft goals own real adapter
+implementation; the engine research here is retained only as design evidence that the shared
+trait/cache boundary must not assume one binary or one model-file shape.
 
 ## Convention Constraints
 
@@ -165,7 +166,8 @@ binary or one model-file shape.
 
 - Real whisper.cpp or sherpa-onnx adapters, catalog entries, upstream asset integration, model
   manifests, and provider-specific runtime verification. Those are owned by the separate
-  `add-whisper-cpp-provider` and `add-sherpa-onnx-provider` drafts, in that order.
+  `add-sherpa-onnx-provider` and `add-whisper-cpp-provider` drafts, in that order (revised
+  2026-09-09).
 - Any pip/embeddable-Python/package-manager-based distribution mechanism for faster-whisper —
   considered and explicitly deferred. Substantial, separate engineering lift with no existing
   pressure behind it; its own goal with its own design pass if ever pursued.
@@ -237,7 +239,7 @@ generalizes):
 | Cache removal | **Shared** | Pure `rm -rf` of the shared-layout path. |
 | Download streaming primitive (`.part` file, progress, atomic rename, unix chmod) | **Shared** (`cache::download_to_cache(url, dest_dir, filename, make_executable, on_progress)`) | Bytes-agnostic mechanics generalize cleanly. |
 | Multi-file verification | **Shared, new** (`cache::verify_files_present(dir, &[relative_paths]) -> Result<Option<u64>, RuntimeError>`) | Handles both "one file" engines (faster-whisper/whisper.cpp) and "several files per model family" engines (sherpa-onnx: encoder/decoder/joiner/tokens, family-dependent) with the same helper — no catalog/trait schema change needed for that difference. |
-| Download **orchestration** (URL/repo/tag construction, archive extraction, launch-spec assembly) | **Trait method** (`download_variant`) | Does not generalize — whisper.cpp/sherpa-onnx ship zip archives from their own upstream repo+tag scheme (`ggml-org/whisper.cpp`, `k2-fsa/sherpa-onnx`), never `env!("CARGO_PKG_VERSION")` against `mariuszRep/stt-server`'s own releases the way faster-whisper does. |
+| Download **orchestration** (URL/repo/tag construction, archive extraction, launch-spec assembly) | **Trait method** (`download_variant`) | Does not generalize — whisper.cpp ships archives from its own upstream repo+tag scheme (`ggml-org/whisper.cpp`), whereas faster-whisper *and* sherpa-onnx both resolve against `mariuszRep/stt-server`'s own releases via `env!("CARGO_PKG_VERSION")` because neither upstream ships a protocol-conformant server binary. The trait must accommodate both schemes; that it does is the point. |
 | `install_local` (dev-copy detection) | **Trait method** | whisper.cpp/sherpa-onnx have no "raw Python source + interpreter" concept; a dev override is a locally-built binary, structurally different detection. |
 | `download_model` | **Trait method** | faster-whisper spawns its own installed runtime as a subprocess; whisper.cpp/sherpa-onnx do plain HTTP GET(s) with no runtime-installed precondition — proves the trait doesn't presuppose faster-whisper's shape. |
 | `verify_cached_model` | **Trait method**, built on `cache::verify_files_present` | "What proves completion" varies by shape; each engine's impl becomes a 2-line call into the shared helper. |
@@ -257,6 +259,37 @@ the task body, not capture a borrowed `&dyn ProviderEngine` from the outer scope
 `tokio::spawn`'s `'static` bound). Since `engines: HashMap<String, Box<dyn ProviderEngine>>` is
 populated once in `RuntimeManager::new()` and never mutated afterward, it needs no `Mutex` —
 a plain field, read via `&manager.engines` inside the spawned block.
+
+### Correction: sherpa-onnx is a self-hosted-binary engine (2026-09-09)
+
+This goal's original research notes assumed sherpa-onnx's adapter would fetch a ready-made server
+binary from `k2-fsa/sherpa-onnx`'s own releases, putting it in whisper.cpp's category and leaving
+faster-whisper as the "sole exception" to `CONVENTIONS.md`'s minimize-self-hosted-binaries rule.
+**That assumption is wrong.** Verified directly against release `v1.13.7` (289 assets):
+
+- `sherpa-onnx-non-streaming-asr-x64-v1.13.7.exe` and siblings are desktop demo applications.
+- `sherpa-onnx-offline-websocket-server` / `-online-websocket-server` (inside the shared/static
+  tarballs) are real servers, but speak sherpa-onnx's own bespoke WebSocket protocol, not this
+  project's local provider protocol.
+- `python-api-examples/http_server.py` is an example script, not a distributed binary.
+
+Upstream ships the *engine*, not a runtime conforming to our protocol — exactly faster-whisper's
+situation, which ships a pip package and no executable. So sherpa-onnx is a **hybrid**:
+
+- **Binary: self-hosted.** `stt-server` builds and releases the `sherpad` runtime itself, resolving
+  its download URL against `mariuszRep/stt-server` releases the same way faster-whisper does.
+  `CONVENTIONS.md`'s "minimize self-hosted binaries" rule is satisfied on its own terms — its stated
+  test is whether an official upstream release exists *at all* for the thing we would otherwise
+  build, and here it does not.
+- **Models: upstream.** Fetched from `k2-fsa/sherpa-onnx`'s `asr-models` release tag.
+
+This strengthens rather than weakens the trait boundary below: it demonstrates that
+`download_variant` (self-hosted) and `download_model` (upstream) genuinely must be independent trait
+methods, since one engine mixes both schemes. No change to the trait signature is required.
+
+Note also that the self-hosted binary is thin: `sherpad` does not rebuild sherpa-onnx. The
+`sherpa-onnx` Rust crate downloads upstream's prebuilt native library at build time and links it
+statically, so what we host is a small HTTP conformance layer over an upstream artifact.
 
 ### Follow-up adapter design evidence (not implementation scope)
 
@@ -285,8 +318,8 @@ landed abstraction.
    only that the string can flow through the install/cache layer. Name the full opening-up as its
    own future goal, don't let it silently balloon into this one.
 3. **Scope discipline**: do not use the abstraction attempt to begin either real provider.
-   Finish and regression-verify the faster-whisper migration first; then execute the whisper.cpp
-   draft, followed by the sherpa-onnx draft.
+   Finish and regression-verify the faster-whisper migration first; then execute the sherpa-onnx
+   draft, followed by the whisper.cpp draft.
 
 ## Verification Expectations
 
@@ -304,7 +337,9 @@ landed abstraction.
 
 ## Attempts
 
-No attempts yet.
+- 2026-09-09 — Attempt 1 started. Audited the current nested `stt-server` worktree and confirmed
+  the prepared trait/cache boundary still matches `manager.rs`, `faster_whisper.rs`, `catalog.rs`,
+  and daemon startup. Implementation is in progress.
 
 ## Do Not Repeat
 
@@ -312,16 +347,57 @@ None yet.
 
 ## Verification Log
 
-No verification yet — design validation (not execution) is recorded in Architecture Notes above.
+- 2026-09-09 — `cargo fmt --check`: passed.
+- 2026-09-09 — `cargo test --workspace`: passed (89 tests total: 10 common, 73 runtime unit,
+  1 real faster-whisper integration, 5 server auth/routing; all other targets/doc-tests clean).
+- 2026-09-09 — `cargo clippy --workspace --all-targets -- -D warnings`: passed.
+- 2026-09-09 — `cargo build --release --bin stt`: passed.
+- 2026-09-09 — concrete-dispatch audit found no production `faster_whisper` import/call in
+  `manager.rs` or `run.rs`; remaining references are test fixtures only.
+- 2026-09-09 — the real faster-whisper integration initially exposed a pre-existing Windows-only
+  PATH construction bug (`:` was used instead of the platform separator). Replaced it with
+  `std::env::join_paths`; the test then launched the vendored venv runtime and passed health.
+- 2026-09-09 — attempted the longer isolated model pull/verify/remove/reset flow under
+  `.tmp/provider-refactor-verification`. The model pull did not complete within several minutes,
+  so the attempt was terminated; the spawned daemon was stopped and `stt reset --yes` removed the
+  isolated root. Confirmed no stray `stt` process and no test directory remained. This leaves only
+  the long real lifecycle checks outstanding; it does not invalidate the passing automated suite.
+- 2026-09-09 (review, second session) — root-caused the "hang": the isolated daemon was launched
+  without the faster-whisper venv's `Scripts`/`bin` dir on `PATH`, so the spawned `python` resolved
+  to the system interpreter (no `faster_whisper` package), which fails fast with
+  `ModuleNotFoundError` — not a hang. Confirmed via a direct subprocess call
+  (`venv/Scripts/python.exe run_sidecar.py download-model ...`), which completed in ~12s. Also found
+  and corrected a second test-methodology error: `STT_DATA_ROOT` only isolates `stt reset` (via
+  `resolved_data_root()`); `install`/`pull` isolation is via the per-provider
+  `STT_FASTER_WHISPER_MODEL_DIR`/`STT_FASTER_WHISPER_CACHE_DIR` overrides — this is pre-existing
+  behavior, unchanged by this refactor, not a bug. Re-ran the full isolated lifecycle correctly (venv
+  on `PATH`, per-provider dir overrides) end to end against the release binary: install (dev source,
+  gpu-preferred) -> pull `Systran/faster-whisper-tiny` (real network download, completed) -> verify
+  (`verified:true, sizeBytes:75538270`, matches the real weights file) -> remove model (204, verify
+  after confirms gone, directory removed from disk) -> cascade-uninstall
+  `DELETE /v1/providers/faster-whisper` (204, status afterward `stopped`) -> `stt reset` without
+  `--yes` (dry-run message, no deletion) -> `stt reset --yes` with no daemon running (removed the
+  data root, confirmed gone on disk). All steps matched expected pre-refactor behavior exactly. An
+  earlier verification pass (before the PATH fix was identified) had accidentally written a
+  `faster-whisper-tiny` model into the real user cache dir instead of an isolated one; removed it
+  during cleanup so the real environment is unaffected.
 
 ## Final Outcome
 
-Pending.
+Complete. The `ProviderEngine` trait, `providers::registry()`, and the shared `cache.rs` module
+(`variant_dir`/`model_dir`, `download_to_cache`, `remove_variant`/`remove_model`,
+`verify_files_present`) replace every hardcoded faster-whisper dispatch site in `manager.rs` and
+`run.rs`. `faster-whisper` implements `ProviderEngine` with unchanged install, cache, model, launch,
+lifecycle, variant, and release behavior — confirmed both automatically (89 tests, clippy, fmt) and
+manually, end to end, on real hardware (install/pull/verify/remove/cascade-uninstall/reset all
+match pre-refactor behavior exactly). A registry/catalog consistency test
+(`every_catalog_provider_has_an_engine`) guards the "every catalog entry has a registered engine"
+invariant the design notes recommended. All success criteria, acceptance criteria, and the Judgment
+Rubric are satisfied; no faster-whisper regression found. This unblocks
+`add-sherpa-onnx-provider` and `provider-conformance-test-suite`.
 
 ## Ready For Execution
 
-- Status: yes
-- Reason: The trait, registry, shared-cache boundary, hardcoded dispatch sites, faster-whisper
-  migration, and regression gates are defined against the current code. Follow-up adapter sketches
-  only pressure-tested the boundary; real whisper.cpp and sherpa-onnx implementation is explicitly
-  owned by separate drafts and is not required to execute or complete this ready refactor.
+- Status: done
+- Reason: All acceptance criteria met and verified on real hardware; see Verification Log and
+  Attempts.

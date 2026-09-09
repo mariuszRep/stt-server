@@ -140,6 +140,197 @@ pub fn reset(yes: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Runs `stt-runtime`'s shared Local Provider Protocol conformance checks
+/// (see `provider-conformance-test-suite`) against every installed engine
+/// on real hardware, printing a per-check pass/fail table. Same check logic
+/// `cargo test`'s `protocol_conformance.rs` asserts -- this is the
+/// real-hardware-only, human-readable view of the identical suite. Runs
+/// entirely in-process; no daemon needed (same convention as
+/// `hardware`/`recommend`/`reset`).
+pub async fn verify() -> anyhow::Result<()> {
+    let mut any_ran = false;
+    let mut any_failed = false;
+
+    for (provider_id, outcome) in stt_runtime::conformance::check_all().await {
+        match outcome {
+            stt_runtime::conformance::ConformanceOutcome::Skipped { reason } => {
+                println!("SKIP  {provider_id:<16} {reason}");
+            }
+            stt_runtime::conformance::ConformanceOutcome::Ran { checks } => {
+                any_ran = true;
+                for check in &checks {
+                    let marker = if check.passed { "PASS" } else { "FAIL" };
+                    if !check.passed {
+                        any_failed = true;
+                    }
+                    println!(
+                        "{marker}  {provider_id:<16} {:<28} {}",
+                        check.name, check.detail
+                    );
+                }
+            }
+        }
+    }
+
+    if !any_ran {
+        println!("\nNo engine was both locally installed and had its default model cached -- nothing to verify. \
+                   Run `stt provider install <id>` and `stt model pull --provider <id> --model <id>` first.");
+    }
+
+    if any_failed {
+        anyhow::bail!("one or more conformance checks failed");
+    }
+    Ok(())
+}
+
+/// Transcribes every clip in `audio_dir` through every model of every
+/// installed, model-cached engine (or a specific `provider`/`model` pair),
+/// reporting per-clip wall-clock latency and real-time factor. Models are
+/// loaded once and reused across clips so load time never pollutes the
+/// per-clip figures (see `validate-parakeet-performance`'s own success
+/// criteria, which this makes repeatable instead of a one-off manual spike).
+pub async fn bench(
+    audio_dir: std::path::PathBuf,
+    provider_filter: Option<String>,
+    model_filter: Option<String>,
+) -> anyhow::Result<()> {
+    use std::sync::Arc;
+    use std::time::Instant;
+    use stt_runtime::{manager::StartOptions, ProviderId, RuntimeManager};
+
+    let clips: Vec<std::path::PathBuf> = std::fs::read_dir(&audio_dir)
+        .with_context(|| format!("reading {}", audio_dir.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"))
+        })
+        .collect();
+    if clips.is_empty() {
+        anyhow::bail!("no .wav files found in {}", audio_dir.display());
+    }
+
+    let manager = Arc::new(RuntimeManager::new(None));
+    manager.register_local_installs().await;
+
+    println!(
+        "{:<30} {:<16} {:<24} {:>8} {:>8} {:>6}  text",
+        "clip", "provider", "model", "dur(s)", "wall(s)", "rtf"
+    );
+
+    for entry in stt_runtime::catalog::CATALOG {
+        if let Some(p) = &provider_filter {
+            if p != entry.id {
+                continue;
+            }
+        }
+        let id = ProviderId::new(entry.id)?;
+        if !manager.is_installed(&id).await {
+            eprintln!("SKIP {}: not locally installed", entry.id);
+            continue;
+        }
+
+        for model in entry.models {
+            if let Some(m) = &model_filter {
+                if m != model.id {
+                    continue;
+                }
+            }
+            if !matches!(manager.verify_model(&id, model.id), Ok(Some(_))) {
+                eprintln!("SKIP {} / {}: model not cached", entry.id, model.id);
+                continue;
+            }
+
+            manager.select_model(&id, model.id).await?;
+            let descriptor = manager.start(&id, &StartOptions::default()).await?;
+            let client = reqwest::Client::new();
+            let bearer = descriptor
+                .auth
+                .as_ref()
+                .map(|a| a.value.clone())
+                .unwrap_or_default();
+
+            for clip in &clips {
+                let bytes = std::fs::read(clip)?;
+                let dur = wav_duration_secs(&bytes).unwrap_or(0.0);
+                let form = reqwest::multipart::Form::new().part(
+                    "file",
+                    reqwest::multipart::Part::bytes(bytes).file_name(
+                        clip.file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string(),
+                    ),
+                );
+                let start = Instant::now();
+                let resp = client
+                    .post(format!("{}/v1/audio/transcriptions", descriptor.base_url))
+                    .bearer_auth(&bearer)
+                    .multipart(form)
+                    .send()
+                    .await?;
+                let wall = start.elapsed().as_secs_f64();
+                let body: serde_json::Value = resp.json().await?;
+                let text = body
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<error>");
+                let rtf = if dur > 0.0 { wall / dur } else { f64::NAN };
+                println!(
+                    "{:<30} {:<16} {:<24} {:>8.2} {:>8.3} {:>6.3}  {}",
+                    clip.file_name().unwrap_or_default().to_string_lossy(),
+                    entry.id,
+                    model.id,
+                    dur,
+                    wall,
+                    rtf,
+                    text
+                );
+            }
+
+            manager.stop(&id).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Minimal WAV header parse (sample rate + data size) to compute duration
+/// without pulling in a full audio-decode dependency just for a CLI report.
+fn wav_duration_secs(bytes: &[u8]) -> Option<f64> {
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut pos = 12;
+    let mut sample_rate = None;
+    let mut byte_rate = None;
+    let mut data_len = None;
+    while pos + 8 <= bytes.len() {
+        let chunk_id = &bytes[pos..pos + 4];
+        let chunk_size = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().ok()?) as usize;
+        let body_start = pos + 8;
+        if chunk_id == b"fmt " && body_start + 16 <= bytes.len() {
+            sample_rate = Some(u32::from_le_bytes(
+                bytes[body_start + 4..body_start + 8].try_into().ok()?,
+            ));
+            byte_rate = Some(u32::from_le_bytes(
+                bytes[body_start + 8..body_start + 12].try_into().ok()?,
+            ));
+        }
+        if chunk_id == b"data" {
+            data_len = Some(chunk_size);
+        }
+        pos = body_start + chunk_size + (chunk_size % 2);
+    }
+    let (byte_rate, data_len) = (byte_rate?, data_len?);
+    let _ = sample_rate;
+    if byte_rate == 0 {
+        return None;
+    }
+    Some(data_len as f64 / byte_rate as f64)
+}
+
 pub fn model_list() -> anyhow::Result<()> {
     #[derive(serde::Serialize)]
     #[serde(rename_all = "camelCase")]
