@@ -190,7 +190,7 @@ pub async fn check_provider(
                 } else {
                     checks.push(ok(
                         "transcribe (no model field)",
-                        format!("{}...", &text.chars().take(40).collect::<String>()),
+                        format!("{}...", text.chars().take(40).collect::<String>()),
                     ));
                 }
             }
