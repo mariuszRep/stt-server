@@ -21,9 +21,14 @@
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 
+use async_trait::async_trait;
+
 use crate::catalog::RuntimeVariant;
 use crate::error::RuntimeError;
 use crate::manager::{Launch, LaunchBuilder};
+use crate::providers::{cache, ProgressCallback, ProviderEngine};
+
+pub struct FasterWhisper;
 
 /// Environment variable overriding where the runtime (packaged or raw
 /// source) lives. Primarily for local development and for a Tauri sidecar
@@ -205,10 +210,7 @@ pub const RUNTIME_CACHE_DIR_ENV_VAR: &str = "STT_FASTER_WHISPER_CACHE_DIR";
 /// own subdirectory so installing one never evicts another — switching
 /// device preference back and forth doesn't force a re-download.
 fn cached_variant_dir(variant: RuntimeVariant) -> PathBuf {
-    let root = std::env::var(RUNTIME_CACHE_DIR_ENV_VAR)
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| stt_common::default_runtime_cache_dir());
-    root.join("faster-whisper").join(variant.as_str())
+    cache::variant_dir("faster-whisper", variant.as_str())
 }
 
 fn cached_variant_exe_path(variant: RuntimeVariant) -> PathBuf {
@@ -263,11 +265,7 @@ pub fn install_local(variant: RuntimeVariant) -> Option<LaunchBuilder> {
 /// vendored dev copy (that's `locate_runtime_dir()`'s domain, not the
 /// cache dir this function operates on).
 pub fn remove_cached_variant(variant: RuntimeVariant) -> Result<(), RuntimeError> {
-    let dir = cached_variant_dir(variant);
-    if dir.is_dir() {
-        std::fs::remove_dir_all(&dir).map_err(RuntimeError::Io)?;
-    }
-    Ok(())
+    cache::remove_variant("faster-whisper", variant.as_str())
 }
 
 /// Overrides where downloaded model weights are cached
@@ -286,10 +284,7 @@ pub const MODEL_CACHE_DIR_ENV_VAR: &str = "STT_FASTER_WHISPER_MODEL_DIR";
 /// harmless here since ids only ever come from the curated catalog, never
 /// caller-supplied paths.
 pub fn cached_model_dir(model_id: &str) -> PathBuf {
-    let root = std::env::var(MODEL_CACHE_DIR_ENV_VAR)
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| stt_common::default_model_dir());
-    root.join("faster-whisper").join(model_id)
+    cache::model_dir("faster-whisper", model_id)
 }
 
 /// The one file whose presence/size actually proves a model finished
@@ -301,24 +296,14 @@ const MODEL_WEIGHTS_FILENAME: &str = "model.bin";
 /// A pure filesystem check — no subprocess, no network — mirroring how
 /// `remove_cached_variant` needs neither to clean up.
 pub fn verify_cached_model(model_id: &str) -> Result<Option<u64>, RuntimeError> {
-    let weights = cached_model_dir(model_id).join(MODEL_WEIGHTS_FILENAME);
-    match std::fs::metadata(&weights) {
-        Ok(meta) if meta.len() > 0 => Ok(Some(meta.len())),
-        Ok(_) => Ok(None),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(RuntimeError::Io(e)),
-    }
+    cache::verify_files_present(&cached_model_dir(model_id), &[MODEL_WEIGHTS_FILENAME])
 }
 
 /// Delete a previously-downloaded model's cached directory. Idempotent —
 /// `Ok` if it was never downloaded, matching `remove_cached_variant`'s
 /// spirit.
 pub fn remove_cached_model(model_id: &str) -> Result<(), RuntimeError> {
-    let dir = cached_model_dir(model_id);
-    if dir.is_dir() {
-        std::fs::remove_dir_all(&dir).map_err(RuntimeError::Io)?;
-    }
-    Ok(())
+    cache::remove_model("faster-whisper", model_id)
 }
 
 /// Locate any usable local copy of the runtime, packaged or raw source,
@@ -398,12 +383,7 @@ pub async fn download_model(model_id: &str, output_dir: &Path) -> Result<(), Run
     Ok(())
 }
 
-/// Progress of an in-flight release-asset download.
-#[derive(Debug, Clone, Copy)]
-pub struct DownloadProgress {
-    pub downloaded_bytes: u64,
-    pub total_bytes: Option<u64>,
-}
+pub use crate::providers::DownloadProgress;
 
 /// Download `variant`'s packaged runtime from this crate's GitHub release,
 /// persist it under the runtime cache dir, and return a launch spec for
@@ -414,65 +394,49 @@ pub struct DownloadProgress {
 /// plain `std::sync::Mutex`-guarded state update with no `.await` needed.
 pub async fn download_variant(
     variant: RuntimeVariant,
-    on_progress: impl Fn(DownloadProgress),
+    on_progress: impl Fn(DownloadProgress) + Send + Sync + 'static,
 ) -> Result<LaunchBuilder, RuntimeError> {
     let name = asset_name(variant);
     let url = format!("{}/{name}", release_base_url());
     let dest_dir = cached_variant_dir(variant);
-    std::fs::create_dir_all(&dest_dir).map_err(RuntimeError::Io)?;
-    let dest = dest_dir.join(&name);
-    let tmp = dest_dir.join(format!("{name}.part"));
-
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| RuntimeError::DownloadFailed(format!("request to {url} failed: {e}")))?;
-    if !resp.status().is_success() {
-        return Err(RuntimeError::DownloadFailed(format!(
-            "{url} returned {}",
-            resp.status()
-        )));
-    }
-    let total_bytes = resp.content_length();
-
-    use futures_util::StreamExt;
-    use tokio::io::AsyncWriteExt;
-
-    let mut downloaded: u64 = 0;
-    let mut file = tokio::fs::File::create(&tmp)
-        .await
-        .map_err(RuntimeError::Io)?;
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk
-            .map_err(|e| RuntimeError::DownloadFailed(format!("download interrupted: {e}")))?;
-        downloaded += chunk.len() as u64;
-        file.write_all(&chunk).await.map_err(RuntimeError::Io)?;
-        on_progress(DownloadProgress {
-            downloaded_bytes: downloaded,
-            total_bytes,
-        });
-    }
-    file.flush().await.map_err(RuntimeError::Io)?;
-    drop(file);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&tmp)
-            .map_err(RuntimeError::Io)?
-            .permissions();
-        perms.set_mode(perms.mode() | 0o111);
-        std::fs::set_permissions(&tmp, perms).map_err(RuntimeError::Io)?;
-    }
-
-    tokio::fs::rename(&tmp, &dest)
-        .await
-        .map_err(RuntimeError::Io)?;
+    let dest =
+        cache::download_to_cache(&url, &dest_dir, &name, true, Box::new(on_progress)).await?;
 
     Ok(packaged_launch_builder(dest, dest_dir))
+}
+
+fn parse_variant(variant: &str) -> Option<RuntimeVariant> {
+    RuntimeVariant::parse(variant)
+}
+
+#[async_trait]
+impl ProviderEngine for FasterWhisper {
+    fn provider_id(&self) -> &'static str {
+        "faster-whisper"
+    }
+
+    fn install_local(&self, variant: &str) -> Option<LaunchBuilder> {
+        parse_variant(variant).and_then(install_local)
+    }
+
+    async fn download_variant(
+        &self,
+        variant: &str,
+        on_progress: ProgressCallback,
+    ) -> Result<LaunchBuilder, RuntimeError> {
+        let variant = parse_variant(variant).ok_or_else(|| {
+            RuntimeError::DownloadFailed(format!("unsupported faster-whisper variant: {variant}"))
+        })?;
+        download_variant(variant, on_progress).await
+    }
+
+    async fn download_model(&self, model_id: &str, output_dir: &Path) -> Result<(), RuntimeError> {
+        download_model(model_id, output_dir).await
+    }
+
+    fn verify_cached_model(&self, model_id: &str) -> Result<Option<u64>, RuntimeError> {
+        verify_cached_model(model_id)
+    }
 }
 
 /// Env vars every launch form shares: host/port/auth/model/model

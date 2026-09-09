@@ -1,12 +1,5 @@
 name: Release
 
-# BLOCKED on external prerequisites this workflow cannot set up itself:
-#   1. This repository has no public GitHub remote configured yet (local-only
-#      git history as of this workflow's authoring).
-#   2. `gh release create` needs release-write permissions on that remote.
-# The job definitions below are complete and correct against the current
-# codebase, but cannot run end-to-end until both exist. See stt-server's
-# .projectflows goal notes for the full context.
 on:
   push:
     tags: ["v*"]
@@ -107,8 +100,54 @@ jobs:
           name: faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}
           path: runtimes/faster-whisper/dist/faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}${{ matrix.ext }}
 
+  # Builds the sherpa-onnx managed runtime (sherpad) as a standalone binary.
+  # Upstream k2-fsa/sherpa-onnx ships no server conforming to this project's
+  # local provider protocol (only demo binaries and its own bespoke
+  # WebSocket-server protocol — verified directly against its releases, see
+  # generalize-provider-engine-installation's goal notes), so — like
+  # faster-whisper — stt-server builds and hosts this binary itself rather
+  # than fetching a ready-made one from sherpa-onnx's own releases. CPU-only
+  # today (sherpad links a CPU-only onnxruntime build; GPU is a separate
+  # future goal), so there is only one variant per OS, unlike
+  # faster-whisper's cpu/gpu split. The asset name
+  # (`sherpad-{os}-cpu{ext}`) is the exact contract
+  # add-sherpa-onnx-provider's `download_variant` resolves against.
+  build-sherpad:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            os_slug: linux
+            ext: ""
+          - os: windows-latest
+            os_slug: windows
+            ext: ".exe"
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: runtimes/sherpa-onnx
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: runtimes/sherpa-onnx
+      - run: cargo build --release --bin sherpad
+      - name: Rename to the sherpad-{os}-cpu release-asset convention
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/release/sherpad${{ matrix.ext }}" "dist/sherpad-${{ matrix.os_slug }}-cpu${{ matrix.ext }}"
+      - name: Audit release artifact
+        shell: bash
+        run: bash ../../scripts/verify-release-artifact.sh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sherpad-${{ matrix.os_slug }}-cpu
+          path: runtimes/sherpa-onnx/dist/sherpad-${{ matrix.os_slug }}-cpu${{ matrix.ext }}
+
   release:
-    needs: [build-binaries, build-faster-whisper-sidecar]
+    needs: [build-binaries, build-faster-whisper-sidecar, build-sherpad]
     runs-on: ubuntu-latest
     permissions:
       contents: write

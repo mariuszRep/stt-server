@@ -51,8 +51,10 @@ fn venv_bin_dir(runtime_dir: &std::path::Path) -> PathBuf {
 /// those tests even if they run concurrently with this one.
 fn activate_venv(runtime_dir: &std::path::Path) {
     let venv_bin = venv_bin_dir(runtime_dir);
-    let existing = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{}:{existing}", venv_bin.display());
+    let existing = std::env::var_os("PATH").unwrap_or_default();
+    let new_path =
+        std::env::join_paths(std::iter::once(venv_bin).chain(std::env::split_paths(&existing)))
+            .expect("venv and existing PATH entries should form a valid PATH");
     // SAFETY: see module-level doc comment above.
     unsafe {
         std::env::set_var("PATH", new_path);

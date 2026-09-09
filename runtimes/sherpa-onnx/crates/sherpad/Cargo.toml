@@ -1,0 +1,39 @@
+[package]
+name = "sherpad"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sherpad"
+path = "src/main.rs"
+
+[dependencies]
+sherpa-onnx = { version = "1.13.7", default-features = false, features = ["static"] }
+sherpa-manifest = { path = "../sherpa-manifest" }
+
+axum = { version = "0.8", features = ["multipart"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
+tower-http = { version = "0.7", features = ["trace", "cors"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+ureq = "3"
+bzip2 = "0.6"
+tar = "0.4"
+
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+dirs = "6"
+uuid = { version = "1", features = ["v4"] }
+
+# Fallback decoder for non-WAV audio sherpa_onnx::Wave::read can't handle.
+# Covers WebM/Matroska + Ogg containers carrying PCM/Vorbis (the "mkv"/"ogg"
+# format features plus "wav"/"pcm"/"vorbis" codecs). Does NOT cover Opus --
+# symphonia 0.5 has no Opus decoder or even a registered codec-type constant
+# for it (verified against upstream source, not assumed), so WebM/Opus (the
+# app's actual MediaRecorder fallback codec) is a known, documented gap; see
+# make-sherpad-protocol-conformant's goal file for the follow-up options.
+symphonia = { version = "0.5", default-features = false, features = ["mkv", "wav", "pcm", "vorbis", "ogg"] }

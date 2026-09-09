@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use clap::Args;
 
-use stt_runtime::{preferred_variant, providers::faster_whisper, ProviderId, RuntimeManager};
+use stt_runtime::RuntimeManager;
 
 #[derive(Args)]
 pub struct RunArgs {
@@ -81,22 +81,7 @@ pub async fn execute(args: RunArgs) -> anyhow::Result<()> {
     // just isn't start-able until `POST /v1/providers/:id/install` (or the
     // equivalent CLI command) succeeds. `install_local` is network-free, so
     // this never delays startup waiting on a download.
-    let faster_whisper_id = ProviderId::new("faster-whisper")?;
-    let preferred_variant = preferred_variant(runtime_manager.hardware());
-    match faster_whisper::install_local(preferred_variant) {
-        Some(launch) => {
-            runtime_manager
-                .register_install(&faster_whisper_id, preferred_variant, launch)
-                .await;
-            tracing::info!(variant = %preferred_variant, "faster-whisper runtime found and registered");
-        }
-        None => {
-            tracing::warn!(
-                "faster-whisper runtime not available locally yet (tried {preferred_variant} variant); \
-                 install it via `stt provider install faster-whisper` or `POST /v1/providers/faster-whisper/install`"
-            );
-        }
-    }
+    runtime_manager.register_local_installs().await;
 
     stt_server::run_server(config, runtime_manager).await
 }

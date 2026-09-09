@@ -50,6 +50,21 @@ enum Commands {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Run the Local Provider Protocol conformance checks against every
+    /// installed engine on real hardware (see provider-conformance-test-suite)
+    Verify,
+    /// Transcribe every .wav clip in a folder through every installed,
+    /// model-cached engine and report per-clip latency / real-time factor
+    Bench {
+        #[arg(long)]
+        audio: std::path::PathBuf,
+        /// Restrict to one provider id
+        #[arg(long)]
+        provider: Option<String>,
+        /// Restrict to one model id
+        #[arg(long)]
+        model: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -65,5 +80,11 @@ async fn main() -> anyhow::Result<()> {
         Commands::Recommend => commands::recommend(),
         Commands::Descriptor { provider_id } => commands::descriptor(&client, &provider_id).await,
         Commands::Reset { yes } => commands::reset(yes),
+        Commands::Verify => commands::verify().await,
+        Commands::Bench {
+            audio,
+            provider,
+            model,
+        } => commands::bench(audio, provider, model).await,
     }
 }

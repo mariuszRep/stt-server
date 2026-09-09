@@ -342,7 +342,7 @@ pub async fn spawn_with_timeout(
     }
 
     let health_url = format!("http://127.0.0.1:{port}{}", spec.health_path);
-    if let Err(e) = wait_for_health(&health_url, health_timeout).await {
+    if let Err(e) = wait_for_health(&health_url, &spec.auth_token, health_timeout).await {
         let tail = log_tail
             .lock()
             .expect("log_tail mutex poisoned")
@@ -385,11 +385,30 @@ where
     });
 }
 
-async fn wait_for_health(url: &str, timeout: Duration) -> Result<(), RuntimeError> {
+/// Every instance is spawned with a non-empty `auth_token` (`RuntimeManager::start`
+/// always generates or accepts one — see `manager.rs` — regardless of loopback
+/// vs remote binding), so the health poll must send it too. This was
+/// previously unauthenticated and happened to work anyway only because
+/// faster-whisper's own Python sidecar never enforces the token it's given
+/// (see `runtimes/faster-whisper/app/main.py` — parsed but never compared).
+/// A runtime that actually enforces auth on every route, `sherpad` per
+/// `make-sherpad-protocol-conformant`, would otherwise 401 on every health
+/// poll and never be observed as healthy within the timeout.
+async fn wait_for_health(
+    url: &str,
+    auth_token: &str,
+    timeout: Duration,
+) -> Result<(), RuntimeError> {
     let client = reqwest::Client::new();
     let deadline = Instant::now() + timeout;
     loop {
-        if let Ok(resp) = client.get(url).timeout(Duration::from_secs(2)).send().await {
+        if let Ok(resp) = client
+            .get(url)
+            .bearer_auth(auth_token)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+        {
             if resp.status().is_success() {
                 return Ok(());
             }

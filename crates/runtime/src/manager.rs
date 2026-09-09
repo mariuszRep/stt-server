@@ -24,7 +24,7 @@ use stt_common::{
 use crate::catalog::{self, CatalogEntry, ProviderId, ProviderInfo, RuntimeVariant};
 use crate::error::RuntimeError;
 use crate::hardware::{self, HardwareReport};
-use crate::providers::faster_whisper;
+use crate::providers::{self, ProviderEngine};
 use crate::supervisor::{self, ManagedInstance, RuntimeStatus, SpawnSpec};
 
 /// What to run for a provider: program, args, env, and an optional working
@@ -157,12 +157,13 @@ struct InstalledProvider {
 
 pub struct RuntimeManager {
     hardware: HardwareReport,
+    engines: HashMap<String, Box<dyn ProviderEngine>>,
     instances: Mutex<HashMap<String, RunningEntry>>,
     installed: Mutex<HashMap<String, InstalledProvider>>,
     selected_models: Mutex<HashMap<String, String>>,
     /// Synchronous (not `tokio::sync::Mutex`) because it's also updated
-    /// from a plain, non-async progress callback passed into
-    /// `faster_whisper::download_variant` — see `begin_install`. Critical
+    /// from a plain, non-async progress callback passed into an engine's
+    /// `download_variant` — see `begin_install`. Critical
     /// sections here are always tiny (a struct field write), never held
     /// across an `.await`.
     installs: StdMutex<HashMap<String, InstallOperationState>>,
@@ -174,6 +175,7 @@ impl RuntimeManager {
     pub fn new(idle_timeout: Option<Duration>) -> Self {
         Self {
             hardware: hardware::detect(),
+            engines: providers::registry(),
             instances: Mutex::new(HashMap::new()),
             installed: Mutex::new(HashMap::new()),
             selected_models: Mutex::new(HashMap::new()),
@@ -194,6 +196,7 @@ impl RuntimeManager {
     ) -> Self {
         Self {
             hardware,
+            engines: providers::registry(),
             instances: Mutex::new(HashMap::new()),
             installed: Mutex::new(HashMap::new()),
             selected_models: Mutex::new(HashMap::new()),
@@ -208,6 +211,51 @@ impl RuntimeManager {
 
     pub fn list_providers(&self) -> Vec<ProviderInfo> {
         catalog::list_providers(&self.hardware)
+    }
+
+    fn engine(&self, id: &ProviderId) -> Result<&dyn ProviderEngine, RuntimeError> {
+        self.engines
+            .get(id.as_str())
+            .map(Box::as_ref)
+            .ok_or_else(|| RuntimeError::ProviderNotFound(id.to_string()))
+    }
+
+    pub async fn register_local_installs(&self) {
+        for entry in catalog::CATALOG {
+            let Ok(id) = ProviderId::new(entry.id) else {
+                continue;
+            };
+            // `preferred_variant` is a global, hardware-only preference
+            // (GPU whenever an NVIDIA GPU is present) -- it doesn't know
+            // which variants a given catalog entry actually offers. Found
+            // via real-hardware testing: on a GPU machine this previously
+            // registered sherpa-onnx (variants: &[Cpu] only) under the
+            // label "gpu", which install_local silently tolerated (it
+            // ignores the variant string) but was still wrong bookkeeping.
+            // Fall back to whatever the entry actually lists when the
+            // global preference isn't one of them.
+            let hardware_preferred = catalog::preferred_variant(&self.hardware);
+            let variant = entry
+                .variants
+                .iter()
+                .find(|v| **v == hardware_preferred)
+                .copied()
+                .or_else(|| entry.variants.first().copied())
+                .unwrap_or(RuntimeVariant::Cpu);
+            match self
+                .engine(&id)
+                .ok()
+                .and_then(|engine| engine.install_local(variant.as_str()))
+            {
+                Some(launch) => {
+                    self.register_install(&id, variant, launch).await;
+                    info!(provider = entry.id, variant = %variant, "local provider runtime found and registered");
+                }
+                None => {
+                    warn!(provider = entry.id, variant = %variant, "provider runtime not available locally yet")
+                }
+            }
+        }
     }
 
     /// Register how to launch a provider once its artifact is available
@@ -242,20 +290,15 @@ impl RuntimeManager {
     /// Instant/local if the resolved variant is already present (a vendored
     /// dev copy, or a previously-downloaded copy of exactly that variant),
     /// otherwise kicks off a background download and returns immediately
-    /// with an operation id to poll. Only one provider exists in the
-    /// catalog today (`faster-whisper`); this dispatches on id via a
-    /// `match` rather than a plugin trait, same rationale as
-    /// `crates/server/src/routes/providers.rs`'s pre-existing per-provider
-    /// dispatch — not worth an abstraction for a single entry.
+    /// with an operation id to poll. Provider-specific work is dispatched
+    /// through the engine registry.
     pub async fn begin_install(
         self: &Arc<Self>,
         id: &ProviderId,
         variant: Option<RuntimeVariant>,
     ) -> Result<InstallOutcome, RuntimeError> {
         catalog::find_provider(id)?;
-        if id.as_str() != "faster-whisper" {
-            return Err(RuntimeError::ProviderNotFound(id.to_string()));
-        }
+        let engine = self.engine(id)?;
 
         // One critical section covers "is something already registered" and,
         // for the common already-cached-locally case, the registration
@@ -291,7 +334,7 @@ impl RuntimeManager {
                 (opinion, _) => {
                     let effective =
                         opinion.unwrap_or_else(|| catalog::preferred_variant(&self.hardware));
-                    match faster_whisper::install_local(effective) {
+                    match engine.install_local(effective.as_str()) {
                         Some(launch) => {
                             installed.insert(
                                 id.as_str().to_string(),
@@ -360,17 +403,24 @@ impl RuntimeManager {
         tokio::spawn(async move {
             let manager_for_progress = Arc::clone(&manager);
             let progress_op_id = op_id.clone();
-            let result = faster_whisper::download_variant(variant, move |progress| {
-                let mut installs = manager_for_progress
-                    .installs
-                    .lock()
-                    .expect("installs mutex poisoned");
-                if let Some(state) = installs.get_mut(&progress_op_id) {
-                    state.downloaded_bytes = progress.downloaded_bytes;
-                    state.total_bytes = progress.total_bytes;
-                }
-            })
-            .await;
+            let result = manager
+                .engines
+                .get(id_owned.as_str())
+                .expect("catalog provider must have a registered engine")
+                .download_variant(
+                    variant.as_str(),
+                    Box::new(move |progress| {
+                        let mut installs = manager_for_progress
+                            .installs
+                            .lock()
+                            .expect("installs mutex poisoned");
+                        if let Some(state) = installs.get_mut(&progress_op_id) {
+                            state.downloaded_bytes = progress.downloaded_bytes;
+                            state.total_bytes = progress.total_bytes;
+                        }
+                    }),
+                )
+                .await;
 
             match result {
                 Ok(launch) => {
@@ -415,8 +465,9 @@ impl RuntimeManager {
         variant: RuntimeVariant,
     ) -> Result<(), RuntimeError> {
         catalog::find_provider(id)?;
+        self.engine(id)?;
         let _ = self.stop(id).await; // fine if it wasn't running
-        faster_whisper::remove_cached_variant(variant)
+        providers::cache::remove_variant(id.as_str(), variant.as_str())
     }
 
     /// Remove a provider's install registration, stopping it first if
@@ -430,14 +481,16 @@ impl RuntimeManager {
     /// single variant already — this brings whole-provider uninstall up to
     /// the same standard rather than leaving it memory-only).
     pub async fn uninstall(&self, id: &ProviderId) -> Result<(), RuntimeError> {
+        let entry = catalog::find_provider(id)?;
+        self.engine(id)?;
         let _ = self.stop(id).await; // fine if it wasn't running
         let mut installed = self.installed.lock().await;
         if installed.remove(id.as_str()).is_none() {
             return Err(RuntimeError::ProviderNotInstalled(id.to_string()));
         }
         drop(installed);
-        for variant in [RuntimeVariant::Cpu, RuntimeVariant::Gpu] {
-            faster_whisper::remove_cached_variant(variant)?;
+        for variant in entry.variants {
+            providers::cache::remove_variant(id.as_str(), variant.as_str())?;
         }
         Ok(())
     }
@@ -445,8 +498,7 @@ impl RuntimeManager {
     /// Download `model_id`'s weights for `id`, reusing the same
     /// `InstallOperationState` progress-polling table `begin_install` uses
     /// (`GET /v1/install-operations/:id` works for either kind unchanged).
-    /// Only `faster-whisper` is a real provider today, same dispatch
-    /// rationale as `begin_install`.
+    /// Provider-specific work is dispatched through the engine registry.
     pub async fn begin_model_pull(
         self: &Arc<Self>,
         id: &ProviderId,
@@ -455,11 +507,9 @@ impl RuntimeManager {
         let entry = catalog::find_provider(id)?;
         catalog::find_model(entry, model_id)
             .ok_or_else(|| RuntimeError::ModelNotFound(model_id.to_string()))?;
-        if id.as_str() != "faster-whisper" {
-            return Err(RuntimeError::ProviderNotFound(id.to_string()));
-        }
+        let engine = self.engine(id)?;
 
-        if faster_whisper::verify_cached_model(model_id)?.is_some() {
+        if engine.verify_cached_model(model_id)?.is_some() {
             return Ok(ModelPullOutcome::Cached);
         }
 
@@ -496,11 +546,17 @@ impl RuntimeManager {
         }
 
         let manager = Arc::clone(self);
+        let id_owned = id.clone();
         let model_id_owned = model_id.to_string();
         let op_id = operation_id.clone();
         tokio::spawn(async move {
-            let output_dir = faster_whisper::cached_model_dir(&model_id_owned);
-            let result = faster_whisper::download_model(&model_id_owned, &output_dir).await;
+            let output_dir = providers::cache::model_dir(id_owned.as_str(), &model_id_owned);
+            let result = manager
+                .engines
+                .get(id_owned.as_str())
+                .expect("catalog provider must have a registered engine")
+                .download_model(&model_id_owned, &output_dir)
+                .await;
             match result {
                 Ok(()) => {
                     let mut installs = manager.installs.lock().expect("installs mutex poisoned");
@@ -532,7 +588,7 @@ impl RuntimeManager {
         let entry = catalog::find_provider(id)?;
         catalog::find_model(entry, model_id)
             .ok_or_else(|| RuntimeError::ModelNotFound(model_id.to_string()))?;
-        faster_whisper::verify_cached_model(model_id)
+        self.engine(id)?.verify_cached_model(model_id)
     }
 
     /// Delete a previously-downloaded model's cached weights. Idempotent —
@@ -541,7 +597,8 @@ impl RuntimeManager {
         let entry = catalog::find_provider(id)?;
         catalog::find_model(entry, model_id)
             .ok_or_else(|| RuntimeError::ModelNotFound(model_id.to_string()))?;
-        faster_whisper::remove_cached_model(model_id)
+        self.engine(id)?;
+        providers::cache::remove_model(id.as_str(), model_id)
     }
 
     /// Select which curated model a provider should load on its next
@@ -750,7 +807,7 @@ impl RuntimeManager {
         )
         .await?;
 
-        let streaming = fetch_streaming_capability(instance.port).await;
+        let streaming = fetch_streaming_capability(instance.port, &instance.auth_token).await;
         let descriptor = descriptor_for(entry, &instance, streaming.clone());
 
         let mut instances = self.instances.lock().await;
@@ -911,14 +968,24 @@ fn descriptor_for(
 /// streaming at all — since a batch-only descriptor (`streaming: None`) is
 /// still a valid, usable result; `start()` must not fail just because this
 /// best-effort enrichment didn't pan out.
-async fn fetch_streaming_capability(port: u16) -> Option<StreamingCapability> {
+async fn fetch_streaming_capability(port: u16, auth_token: &str) -> Option<StreamingCapability> {
     #[derive(serde::Deserialize)]
     struct ConfigResponse {
         streaming: Option<StreamingCapability>,
     }
 
+    // Every instance carries a non-empty auth_token regardless of loopback
+    // vs remote binding (see `wait_for_health`'s doc comment in
+    // supervisor.rs for the same fix, found via the same real-hardware
+    // sherpa-onnx test) -- an auth-enforcing runtime would otherwise 401
+    // here and always report no streaming capability, silently.
     let url = format!("http://127.0.0.1:{port}/v1/config");
-    match reqwest::get(&url).await {
+    match reqwest::Client::new()
+        .get(&url)
+        .bearer_auth(auth_token)
+        .send()
+        .await
+    {
         Ok(resp) => match resp.json::<ConfigResponse>().await {
             Ok(config) => config.streaming,
             Err(e) => {
@@ -936,6 +1003,7 @@ async fn fetch_streaming_capability(port: u16) -> Option<StreamingCapability> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::faster_whisper;
 
     /// `python -m venv` only creates `Scripts\python.exe` on Windows — no
     /// `python3.exe` — matching `providers::faster_whisper::python_candidates`'s

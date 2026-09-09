@@ -1,0 +1,15 @@
+/target/
+
+# Downloaded model archives and local scratch/test artifacts (hundreds of MB,
+# and re-downloadable via the manifest / POST /v1/models/{id}/pull anyway).
+/.cache/
+
+# Claude Code's local project state - not part of the project itself.
+/.claude/
+
+# Editor / OS cruft
+.vscode/
+.idea/
+*.pdb
+Thumbs.db
+.DS_Store
