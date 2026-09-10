@@ -59,6 +59,14 @@ pub struct StartOptions {
     pub compute_type: Option<String>,
     pub bind_host: Option<String>,
     pub auth_token: Option<String>,
+    /// Explicit language override for a multilingual model (e.g. `"en"`, `"de"`).
+    /// `None` means "no explicit override" — the provider derives its own default
+    /// from the selected model's catalog `languages` (auto-pinned to the model's
+    /// sole language when it isn't `"auto"`; real auto-detection otherwise). This
+    /// field exists only for a caller overriding that derived default on a
+    /// multilingual model — never used to force a language onto an English-only
+    /// model, which wouldn't make sense.
+    pub language: Option<String>,
 }
 
 /// Builds a [`Launch`] for a provider given the port it must bind, the auth

@@ -475,6 +475,29 @@ fn build_env(
     if let Some(compute_type) = &options.compute_type {
         env.push(("VOICE_TYPER_COMPUTE_TYPE".to_string(), compute_type.clone()));
     }
+    // Language: an explicit caller override always wins. Otherwise, derive from the
+    // selected model's own catalog entry -- a model whose only language tag isn't
+    // "auto" is safely pinnable (skips Whisper's language auto-detection pass,
+    // measured ~26% of inference time on a 15s clip), and a multilingual model is
+    // left unset (real auto-detect) rather than guessed at. Never invents a
+    // language for a model catalog lookup can't resolve (e.g. a raw HF id not in
+    // the curated catalog) -- falls through to Whisper's own auto-detect, same as
+    // today.
+    if let Some(language) = &options.language {
+        env.push(("VOICE_TYPER_LANGUAGE".to_string(), language.clone()));
+    } else if let Some(model) = selected_model {
+        let provider_id = crate::catalog::ProviderId::new("faster-whisper")
+            .expect("\"faster-whisper\" is a valid provider id");
+        if let Ok(entry) = crate::catalog::find_provider(&provider_id) {
+            if let Some(model_entry) = crate::catalog::find_model(entry, model) {
+                if let [single] = model_entry.languages {
+                    if *single != "auto" {
+                        env.push(("VOICE_TYPER_LANGUAGE".to_string(), (*single).to_string()));
+                    }
+                }
+            }
+        }
+    }
     env
 }
 

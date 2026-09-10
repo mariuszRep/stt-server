@@ -174,6 +174,7 @@ pub async fn install_operation_status(
 pub struct StartProviderRequest {
     device: Option<String>,
     compute_type: Option<String>,
+    language: Option<String>,
     bind_host: Option<String>,
     auth_token: Option<String>,
 }
@@ -223,6 +224,7 @@ pub async fn start_provider(
         compute_type: request.compute_type,
         bind_host: request.bind_host,
         auth_token: request.auth_token,
+        language: request.language,
     };
     let descriptor = state
         .runtime_manager
