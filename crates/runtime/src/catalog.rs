@@ -138,6 +138,15 @@ fn evaluate_variant(variant: RuntimeVariant, hardware: &HardwareReport) -> Varia
 pub struct ModelEntry {
     pub id: &'static str,
     pub display_name: &'static str,
+    /// BCP-47-ish language tags this model covers, or `["auto"]` for
+    /// language-agnostic/auto-detecting models. Mirrors
+    /// `sherpa_manifest::ModelEntry::languages` (same name, same meaning) so both
+    /// catalogs agree on what "English-only" means. Drives automatic language
+    /// pinning: a model whose only tag is `"en"` gets `VOICE_TYPER_LANGUAGE=en`
+    /// pushed for it (see `providers::faster_whisper::build_env`), skipping
+    /// Whisper's language auto-detection pass safely — never on a model that
+    /// might legitimately be asked to transcribe something else.
+    pub languages: &'static [&'static str],
 }
 
 /// A single curated provider's static metadata.
@@ -163,28 +172,80 @@ pub const CATALOG: &[CatalogEntry] = &[
         protocol: "voice-typer-v1",
         transport: "http",
         health_path: "/health",
-        default_model: "Systran/faster-whisper-small",
+        // distil-small.en over the multilingual small: same encoder (so the same
+        // fixed cost on Whisper's padded 30s window) but a 2-layer decoder instead
+        // of 12, measured at roughly half the latency on a short utterance
+        // (0.48s vs 0.98s for 2s of audio on a GTX 1650) with a byte-identical
+        // transcript on the test fixture. Being English-only it also auto-pins
+        // `language`, skipping the ~0.4s language-detection pass that a
+        // multilingual model pays on every single request.
+        default_model: "Systran/faster-distil-whisper-small.en",
         variants: &[RuntimeVariant::Cpu, RuntimeVariant::Gpu],
         models: &[
             ModelEntry {
                 id: "Systran/faster-whisper-tiny",
-                display_name: "Tiny",
+                display_name: "Tiny (Multilingual)",
+                languages: &["auto"],
+            },
+            ModelEntry {
+                id: "Systran/faster-whisper-tiny.en",
+                display_name: "Tiny (English)",
+                languages: &["en"],
             },
             ModelEntry {
                 id: "Systran/faster-whisper-base",
-                display_name: "Base",
+                display_name: "Base (Multilingual)",
+                languages: &["auto"],
+            },
+            ModelEntry {
+                id: "Systran/faster-whisper-base.en",
+                display_name: "Base (English)",
+                languages: &["en"],
             },
             ModelEntry {
                 id: "Systran/faster-whisper-small",
-                display_name: "Small",
+                display_name: "Small (Multilingual)",
+                languages: &["auto"],
+            },
+            ModelEntry {
+                id: "Systran/faster-whisper-small.en",
+                display_name: "Small (English)",
+                languages: &["en"],
+            },
+            ModelEntry {
+                id: "Systran/faster-distil-whisper-small.en",
+                display_name: "Distil Small (English, fast)",
+                languages: &["en"],
             },
             ModelEntry {
                 id: "Systran/faster-whisper-medium",
-                display_name: "Medium",
+                display_name: "Medium (Multilingual)",
+                languages: &["auto"],
+            },
+            ModelEntry {
+                id: "Systran/faster-whisper-medium.en",
+                display_name: "Medium (English)",
+                languages: &["en"],
+            },
+            ModelEntry {
+                id: "Systran/faster-distil-whisper-medium.en",
+                display_name: "Distil Medium (English, fast)",
+                languages: &["en"],
             },
             ModelEntry {
                 id: "Systran/faster-whisper-large-v3",
-                display_name: "Large v3",
+                display_name: "Large v3 (Multilingual)",
+                languages: &["auto"],
+            },
+            ModelEntry {
+                id: "Systran/faster-distil-whisper-large-v3",
+                display_name: "Distil Large v3 (Multilingual, fast)",
+                languages: &["auto"],
+            },
+            ModelEntry {
+                id: "deepdml/faster-whisper-large-v3-turbo-ct2",
+                display_name: "Large v3 Turbo (Multilingual, fast)",
+                languages: &["auto"],
             },
         ],
     },
@@ -212,10 +273,12 @@ pub const CATALOG: &[CatalogEntry] = &[
             ModelEntry {
                 id: "sense-voice-multi",
                 display_name: "SenseVoice (Multilingual: zh/en/ja/ko/yue)",
+                languages: &["auto", "zh", "en", "ja", "ko", "yue"],
             },
             ModelEntry {
                 id: "parakeet-tdt-0.6b-v2",
                 display_name: "Parakeet TDT 0.6B (English, fast)",
+                languages: &["en"],
             },
         ],
     },

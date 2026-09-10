@@ -189,7 +189,10 @@ else:
     DEVICE_SOURCE = REQUESTED_DEVICE_SOURCE
     COMPUTE_TYPE = REQUESTED_COMPUTE_TYPE
 DEFAULT_LANGUAGE = os.environ.get("VOICE_TYPER_LANGUAGE", None)
-BEAM_SIZE = int(os.environ.get("VOICE_TYPER_BEAM_SIZE", "5"))
+# Greedy decoding (beam=1): measured beam=5->beam=1 saves ~15% on this project's
+# default "small" model with no observed accuracy difference on short dictation-length
+# audio (see the chunk-transcription latency investigation this default came from).
+BEAM_SIZE = int(os.environ.get("VOICE_TYPER_BEAM_SIZE", "1"))
 VAD_FILTER = os.environ.get("VOICE_TYPER_VAD_FILTER", "1") not in ("0", "false", "False", "")
 AUTH_TOKEN = os.environ.get("VOICE_TYPER_AUTH_TOKEN") or None
 

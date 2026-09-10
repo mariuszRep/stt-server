@@ -19,13 +19,13 @@ pub struct ModelRecommendation {
 pub fn recommend(hardware: &HardwareReport) -> Vec<ModelRecommendation> {
     let (model_id, device, reason) = if hardware.has_nvidia_gpu {
         (
-            "Systran/faster-whisper-small",
+            "Systran/faster-distil-whisper-small.en",
             "cuda",
-            "NVIDIA GPU detected; small model balances speed and accuracy on GPU.",
+            "NVIDIA GPU detected; distilled small model matches small's accuracy at about half the latency.",
         )
     } else {
         (
-            "Systran/faster-whisper-tiny",
+            "Systran/faster-whisper-tiny.en",
             "cpu",
             "No NVIDIA GPU detected; tiny model keeps CPU-only transcription responsive.",
         )

@@ -163,18 +163,31 @@ def _resample_to_whisper_rate(pcm: np.ndarray, src_rate: int) -> np.ndarray:
 def _run(
     model: WhisperModel, audio: str | np.ndarray, initial_prompt: str | None
 ) -> TranscriptionOutput:
-    # word_timestamps=True costs a small amount of extra compute (the model's own
-    # cross-attention pattern) but is what makes per-word start/end/probability
-    # available at all; avg_logprob/no_speech_prob/compression_ratio are already
-    # computed by the library internally either way, just surfaced here instead of
-    # discarded.
+    # word_timestamps=False: per-word start/end/probability costs a real extra
+    # cross-attention alignment pass and nothing in the protocol or its only consumer
+    # (whisper-vibes) ever reads it -- avg_logprob/no_speech_prob/compression_ratio are
+    # unaffected, they're computed by the library internally regardless.
+    #
+    # condition_on_previous_text=False: with it True (the library default), a
+    # multi-window decode that starts repeating carries that repetition forward as
+    # context for the next window, which trips the compression_ratio_threshold check
+    # and forces the full temperature-fallback ladder to re-decode -- this is what
+    # made 30s+ audio cost ~4x the latency the audio length alone predicts. Our chunks
+    # are always well under one 30s window, so this only removes a failure mode, not
+    # legitimate cross-window conditioning.
+    #
+    # temperature bounded to [0.0, 0.2] (library default is a 6-step ladder up to
+    # 1.0): caps the worst case if compression_ratio/no_speech fallback still
+    # triggers, instead of paying for up to 6 re-decodes.
     segments_iter, info = model.transcribe(
         audio,
         language=config.DEFAULT_LANGUAGE,
         beam_size=config.BEAM_SIZE,
         vad_filter=config.VAD_FILTER,
         initial_prompt=initial_prompt,
-        word_timestamps=True,
+        word_timestamps=False,
+        condition_on_previous_text=False,
+        temperature=[0.0, 0.2],
     )
     segments: list[TranscriptSegment] = []
     for segment in segments_iter:
