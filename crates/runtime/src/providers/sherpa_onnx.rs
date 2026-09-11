@@ -78,7 +78,10 @@ fn cached_variant_dir() -> PathBuf {
 }
 
 fn cached_binary_path() -> PathBuf {
-    cached_variant_dir().join(binary_name())
+    // Downloads are stored under the published asset name (for example
+    // `sherpad-windows-cpu.exe`). Startup must look for that same filename;
+    // `binary_name()` is only the name of locally-built dev binaries.
+    cached_variant_dir().join(asset_name())
 }
 
 /// Overrides where downloaded model weights are cached (mirrors
@@ -297,5 +300,20 @@ impl ProviderEngine for SherpaOnnx {
 
     fn verify_cached_model(&self, model_id: &str) -> Result<Option<u64>, RuntimeError> {
         verify_cached_model(model_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cached_runtime_path_uses_the_downloaded_asset_name() {
+        assert_eq!(
+            cached_binary_path()
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some(asset_name().as_str())
+        );
     }
 }

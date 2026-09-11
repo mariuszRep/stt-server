@@ -12,15 +12,28 @@ use serde_json::json;
 use crate::recognizer::{self, Job, TranscribeRequest, TranscribeResponse};
 use crate::state::{AppState, ModelState};
 
-/// Enforces `Authorization: Bearer <token>` on every route when
-/// `state.auth_token` is configured -- no route is exempt, mirroring
-/// `stt-server`'s own control-plane `require_auth` middleware. A pure
+fn is_cors_preflight(request: &Request) -> bool {
+    request.method() == axum::http::Method::OPTIONS
+        && request.headers().contains_key(header::ORIGIN)
+        && request
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_REQUEST_METHOD)
+}
+
+/// Enforces `Authorization: Bearer <token>` on every real API request when
+/// `state.auth_token` is configured. Browser CORS preflights are exempt: an
+/// OPTIONS preflight carries no credentials by design and only negotiates
+/// whether the subsequent authenticated request may be sent. A pure
 /// passthrough when no token is configured (the loopback-default case).
 pub async fn require_auth(
     State(state): State<Arc<AppState>>,
     request: Request,
     next: Next,
 ) -> Response {
+    if is_cors_preflight(&request) {
+        return next.run(request).await;
+    }
+
     let Some(expected) = &state.auth_token else {
         return next.run(request).await;
     };
@@ -39,6 +52,48 @@ pub async fn require_auth(
             Json(json!({ "error": "unauthorized" })),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use axum::body::Body;
+    use axum::http::{header, Method, Request};
+
+    use super::is_cors_preflight;
+
+    #[test]
+    fn browser_cors_preflight_is_recognized_without_authorization() {
+        let request = Request::builder()
+            .method(Method::OPTIONS)
+            .header(header::ORIGIN, "http://tauri.localhost")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+            .body(Body::empty())
+            .unwrap();
+
+        assert!(is_cors_preflight(&request));
+    }
+
+    #[test]
+    fn ordinary_options_request_is_not_treated_as_cors_preflight() {
+        let request = Request::builder()
+            .method(Method::OPTIONS)
+            .body(Body::empty())
+            .unwrap();
+
+        assert!(!is_cors_preflight(&request));
+    }
+
+    #[test]
+    fn authenticated_get_is_still_a_real_api_request() {
+        let request = Request::builder()
+            .method(Method::GET)
+            .header(header::ORIGIN, "http://tauri.localhost")
+            .header(header::AUTHORIZATION, "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+
+        assert!(!is_cors_preflight(&request));
     }
 }
 

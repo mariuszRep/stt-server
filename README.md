@@ -72,6 +72,7 @@ runtime. Provider ids are validated strings (no path traversal).
 | POST | `/v1/providers/:id/heartbeat` | Reset the idle-shutdown clock for a long session |
 | GET | `/v1/models` | Curated model catalog across all providers |
 | POST | `/v1/models/select` | `{providerId, modelId}` — picked up on next `start` |
+| POST | `/v1/models/switch` | `{providerId, modelId}` — live provider-local model swap when supported, otherwise selection only if stopped |
 | GET | `/v1/models/selected?provider=:id` | Currently selected model |
 | POST | `/v1/models/pull?provider=:id&model=:id` | Download a model's weights into stt-server's own model directory — instant `200` if already cached, else `202` + `operationId` to poll |
 | POST | `/v1/models/verify?provider=:id&model=:id` | Pure filesystem check: are this model's weights actually present on disk |
@@ -84,6 +85,16 @@ location passed to the managed runtime as `download_root`, not the OS-default Hu
 cache. `pull`/`verify`/`remove` are real filesystem operations, not stubs; `provider`/`model`
 are query params (not `:id` path segments) because model ids like
 `"Systran/faster-whisper-small"` contain their own `/`.
+
+### Model hot-swap
+
+`POST /v1/models/switch` only addresses the named provider; it never stops or starts a
+different provider. If the named provider is stopped, the route persists the selection for
+its next start. If it is running, live in-process switching is currently supported only by
+faster-whisper; callers must stop/start for sherpa-onnx or for a cross-provider change. The
+response reports only the selection/swap result and never returns a runtime connection
+descriptor, so a caller that restarts or changes providers must obtain the new descriptor
+from the lifecycle operation.
 
 ### GPU vs CPU variant installs
 
