@@ -1,25 +1,14 @@
 ---
 name: add-sherpa-onnx-provider
 title: Add sherpa-onnx as a Real Managed Provider Engine
-description: Implement the ProviderEngine adapter and catalog entry for sherpa-onnx, served by the stt-server-hosted sherpad runtime, covering model families faster-whisper cannot run at all — NVIDIA Parakeet, Moonshine, SenseVoice, Canary.
-status: in_progress
+description: Implement the ProviderEngine adapter and catalog entry for sherpa-onnx, served by the stt-server-hosted sherpad runtime, shipping the verified Parakeet and SenseVoice model families.
+status: done
 type: feature
 scope: stt-server/crates/runtime/src/providers/sherpa_onnx.rs (new), crates/runtime/src/catalog.rs, crates/runtime/src/providers/cache.rs, crates/runtime/src/supervisor.rs, crates/runtime/src/manager.rs (run.rs unchanged -- registry dispatch already generic)
 attempt: 1
 max_attempts: 5
-last_result: partial
-next_action: |
-  Core adapter complete and verified end to end on real hardware, including full lifecycle
-  (install/pull/verify/start/transcribe/stop/uninstall). Two real integration bugs found and fixed
-  along the way (see Attempts): the health-poll auth gap and the global-hardware-variant mislabeling.
-  Remaining before this can move to done: (1) run.rs was NOT touched, contrary to this goal's
-  original scope list -- register_local_installs() already iterates catalog::CATALOG generically, so
-  no change was needed there; update the goal's own scope field to reflect that. (2) Only 2 of the
-  originally named 4 models (Parakeet, SenseVoice) are catalogued -- Moonshine and Canary were never
-  downloaded/tested and are deliberately not shipped; add them as separate, later, individually
-  verified additions. (3) validate-parakeet-performance's dictation-based final verdict is still
-  pending the user's sample set -- this goal proceeded on the strong read-speech signal already
-  gathered, per explicit user direction this session.
+last_result: passed — Parakeet and SenseVoice lifecycle verified end to end; release scope confirmed
+next_action: none
 success_criteria:
   - sherpa-onnx installs, caches under default_data_root(), starts, stops, and uninstalls cleanly through the same HTTP API and CLI surface faster-whisper uses, with no engine-specific branching in manager.rs or run.rs.
   - The sherpad binary is fetched from stt-server's own releases and model archives are fetched from k2-fsa/sherpa-onnx's asr-models tag, exercising both download schemes through one adapter.
@@ -286,11 +275,13 @@ zero engine-specific code added to `manager.rs` or `run.rs` -- confirming the
 `generalize-provider-engine-installation` abstraction does what it was built for. Two real,
 previously-latent bugs in the shared supervision code were found and fixed as a direct result of
 actually running this end to end, not from code review. Two of the four originally-planned models
-(Moonshine, Canary) are deliberately not shipped, since they were never verified.
+(Moonshine, Canary) are deliberately not shipped, since they were never verified. On 2026-09-14 the
+release scope was explicitly confirmed as Parakeet and SenseVoice only; Zipformer, Silero VAD,
+Omnilingual ASR, Moonshine, and Canary remain separate future decisions. The performance benchmark
+remains independently tracked by `validate-parakeet-performance`.
 
 ## Ready For Execution
 
-- Status: in_progress (core done; see next_action for the three remaining housekeeping items)
-- Reason: All four blocking goals have landed enough to support this (generalize-provider-engine-installation
-  is `done`; fold/make-sherpad-conformant/validate-parakeet are each substantially complete with named,
-  tracked follow-ups that don't block this adapter specifically).
+- Status: done
+- Reason: The verified Sherpa provider release scope is complete. Follow-up model families and the
+  independent Parakeet benchmark remain separate goals.
