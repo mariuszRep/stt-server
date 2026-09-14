@@ -85,29 +85,9 @@ async fn every_registered_provider_conforms_to_the_local_provider_protocol() {
                         check.name, check.detail
                     );
                 }
-                // KNOWN GAP (found by this suite, 2026-09-09): faster-whisper's
-                // Python sidecar parses VOICE_TYPER_AUTH_TOKEN but never
-                // enforces it -- a real, pre-existing violation, tracked as
-                // its own goal (fix-faster-whisper-auth-enforcement), not
-                // fixed or hidden here. Soft-fail *only* that one named check
-                // for that one provider so the suite stays a real regression
-                // gate for everything else, including sherpa-onnx's (correct)
-                // auth enforcement and every other check for both engines.
-                let hard_failures: Vec<_> = checks
-                    .iter()
-                    .filter(|c| {
-                        !(c.passed
-                            || (provider_id == "faster-whisper" && c.name == "auth enforcement"))
-                    })
-                    .collect();
+                let hard_failures: Vec<_> = checks.iter().filter(|c| !c.passed).collect();
                 if !hard_failures.is_empty() {
                     panic!("{provider_id}: conformance failures: {hard_failures:?}");
-                }
-                if let Some(known) = checks
-                    .iter()
-                    .find(|c| !c.passed && c.name == "auth enforcement")
-                {
-                    eprintln!("CONFORMANCE GAP {provider_id}: {}", known.detail);
                 }
             }
         }
