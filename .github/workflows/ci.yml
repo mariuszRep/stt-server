@@ -108,6 +108,14 @@ jobs:
     defaults:
       run:
         working-directory: runtimes/sherpa-onnx
+    env:
+      # audiopus_sys vendors and cmake-builds libopus from source (its
+      # "static" feature -- see Cargo.toml). Its bundled libopus CMakeLists
+      # still declares `cmake_minimum_required(VERSION 2.8)`; a current
+      # CMake (verified: 4.x, which GitHub-hosted runners ship) refuses to
+      # configure projects requiring < 3.5 at all, not just with a warning.
+      # This is CMake's own documented escape hatch for exactly that case.
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
