@@ -2,23 +2,18 @@
 name: fold-sherpad-runtime-into-stt-server
 title: Fold the sherpad Runtime Into stt-server as a Managed Runtime
 description: Move the sherpad daemon out of the standalone stt-server-v2 repository into stt-server/runtimes/sherpa-onnx/, matching the runtimes/faster-whisper/ precedent, and retire stt-server-v2 as a workspace component.
-status: blocked
+status: done
 type: refactor
 scope: stt-server/runtimes/sherpa-onnx/ (new), voice-typer/VISION.md, voice-typer/scripts/check-worktrees.sh, stt-server-v2 (retired)
 attempt: 1
 max_attempts: 3
-last_result: partial
-next_action: |
-  All local work complete and verified. One external action remains, deliberately not done
-  automatically: archive the mariuszRep/stt-server-v2 GitHub repository (gh repo archive
-  mariuszRep/stt-server-v2). Not performed in this attempt since it affects an external, shared
-  resource beyond the local working tree -- do it manually, or explicitly authorize it, then mark
-  this goal fully done.
+last_result: passed — Sherpa runtime folded into stt-server; old repository archiving deferred by owner
+next_action: none
 success_criteria:
   - sherpad and sherpa-manifest build from stt-server/runtimes/sherpa-onnx/ with cargo build succeeding.
   - The stt-server-v2 gitlink and worktree are removed from the voice-typer superproject and check-worktrees.sh covers three repos again.
   - Root VISION.md states explicitly where managed runtime source lives, so the faster-whisper and sherpa-onnx placements are both covered by a written rule.
-  - No code or history is deleted irrecoverably — the stt-server-v2 GitHub repository is archived, not deleted.
+  - No code or history is deleted irrecoverably. Archiving the old stt-server-v2 GitHub repository is optional owner housekeeping and is not required to complete this fold.
 source: user
 ---
 
@@ -193,16 +188,14 @@ None yet.
 
 ## Final Outcome
 
-**Local work complete and verified; one external step deliberately deferred.** All four "local"
+**Local work complete and verified; GitHub archiving deliberately deferred.** All four "local"
 acceptance criteria are met: standalone build succeeds, `stt-server`'s own workspace is unaffected,
-`check-worktrees.sh` covers three repos, and `VISION.md` states the placement rule explicitly. The
-fifth criterion (archiving the GitHub repo) is not done — see next_action. Not moving this to `done/`
-until that's resolved, per the goal's own Judgment Rubric ("not done if the stt-server-v2 repository
-is deleted rather than archived" implies archiving is part of done, not optional).
+`check-worktrees.sh` covers three repos, and `VISION.md` states the placement rule explicitly. On
+2026-09-14, the owner explicitly decided that manually archiving the old GitHub repository is
+optional housekeeping rather than a completion requirement. The fold is complete.
 
 ## Ready For Execution
 
-- Status: blocked (external action only)
-- Reason: All local file/build/git work is complete and verified. Only the GitHub repo archive step
-  remains, which needs either the user to do it directly or explicit authorization to run `gh repo
-  archive mariuszRep/stt-server-v2` on their behalf.
+- Status: done
+- Reason: All local file/build/git work is complete and verified; the remaining GitHub archive is
+  intentionally deferred to the owner and does not affect the completed fold.

@@ -1,0 +1,125 @@
+name: Server Candidate
+
+# Manually dispatchable validation build only. Builds the same three
+# artifacts as release.yml (stt control plane, faster-whisper sidecar,
+# sherpad) and uploads them as Actions artifacts for manual download/install
+# per RELEASE_PROCESS.md gate 3. Does NOT create a GitHub Release and has no
+# `contents: write` permission — structurally incapable of publishing.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-binaries:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: stt-linux-x86_64
+          - os: windows-latest
+            asset: stt-windows-x86_64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --bin stt
+      - shell: bash
+        run: |
+          mkdir -p dist
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp target/release/stt.exe "dist/${{ matrix.asset }}"
+          else
+            cp target/release/stt "dist/${{ matrix.asset }}"
+          fi
+      - name: Audit release artifact
+        shell: bash
+        run: bash scripts/verify-release-artifact.sh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+
+  build-faster-whisper-sidecar:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            os_slug: linux
+            variant: cpu
+            ext: ""
+          - os: windows-latest
+            os_slug: windows
+            variant: cpu
+            ext: ".exe"
+          - os: windows-latest
+            os_slug: windows
+            variant: gpu
+            ext: ".exe"
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: runtimes/faster-whisper
+    env:
+      VOICE_TYPER_BUILD_VARIANT: ${{ matrix.variant }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - shell: bash
+        run: |
+          python -m venv venv
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            venv/Scripts/pip install -r requirements.txt pyinstaller
+            venv/Scripts/pyinstaller --clean --noconfirm voice-typer-backend.spec
+          else
+            venv/bin/pip install -r requirements.txt pyinstaller
+            venv/bin/pyinstaller --clean --noconfirm voice-typer-backend.spec
+          fi
+      - name: Rename to the faster-whisper-runtime-{os}-{variant} release-asset convention
+        shell: bash
+        run: |
+          mv "dist/voice-typer-backend${{ matrix.ext }}" \
+             "dist/faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}${{ matrix.ext }}"
+      - name: Audit release artifact
+        shell: bash
+        run: bash ../../scripts/verify-release-artifact.sh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}
+          path: runtimes/faster-whisper/dist/faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}${{ matrix.ext }}
+
+  build-sherpad:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            os_slug: linux
+            ext: ""
+          - os: windows-latest
+            os_slug: windows
+            ext: ".exe"
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: runtimes/sherpa-onnx
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: runtimes/sherpa-onnx
+      - run: cargo build --release --bin sherpad
+      - name: Rename to the sherpad-{os}-cpu release-asset convention
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/release/sherpad${{ matrix.ext }}" "dist/sherpad-${{ matrix.os_slug }}-cpu${{ matrix.ext }}"
+      - name: Audit release artifact
+        shell: bash
+        run: bash ../../scripts/verify-release-artifact.sh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sherpad-${{ matrix.os_slug }}-cpu
+          path: runtimes/sherpa-onnx/dist/sherpad-${{ matrix.os_slug }}-cpu${{ matrix.ext }}

@@ -11,6 +11,7 @@ on:
 # criteria ("Clean Server CI builds/tests without App or SDK checkouts").
 jobs:
   rust:
+    needs: sherpad
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
@@ -32,6 +33,25 @@ jobs:
 
       - name: Build
         run: cargo build --workspace
+
+      # Fetch the sherpad binary built by the `sherpad` job below, at exactly
+      # the path crates/runtime/tests/support/mod.rs's
+      # point_at_locally_built_runtimes() points STT_SHERPA_ONNX_RUNTIME_DIR
+      # at -- so sherpa-onnx's general/engine-specific conformance tests run
+      # for real here instead of loudly skipping for lack of a runtime
+      # binary. Downloaded, not built a second time here, since the whole
+      # point of splitting `sherpad` into its own job (see that job's own
+      # comment) is to keep sherpa-onnx's native ONNX-runtime link out of
+      # every `cargo build --workspace` run.
+      - name: Fetch built sherpad binary
+        uses: actions/download-artifact@v4
+        with:
+          name: sherpad-${{ matrix.os }}
+          path: runtimes/sherpa-onnx/target/release
+
+      - name: Make sherpad executable
+        if: matrix.os != 'windows-latest'
+        run: chmod +x runtimes/sherpa-onnx/target/release/sherpad
 
       # Unit/integration tests that spawn the real vendored faster-whisper
       # runtime (crates/runtime/tests/faster_whisper_integration.rs) need its
@@ -88,6 +108,14 @@ jobs:
     defaults:
       run:
         working-directory: runtimes/sherpa-onnx
+    env:
+      # audiopus_sys vendors and cmake-builds libopus from source (its
+      # "static" feature -- see Cargo.toml). Its bundled libopus CMakeLists
+      # still declares `cmake_minimum_required(VERSION 2.8)`; a current
+      # CMake (verified: 4.x, which GitHub-hosted runners ship) refuses to
+      # configure projects requiring < 3.5 at all, not just with a warning.
+      # This is CMake's own documented escape hatch for exactly that case.
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -102,3 +130,14 @@ jobs:
         run: cargo clippy --release --all-targets -- -D warnings
       - name: Build
         run: cargo build --release --bin sherpad
+      # Handed to the `rust` job above so it can run sherpa-onnx's
+      # conformance tests for real, without building sherpad a second time.
+      - name: Upload sherpad binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: sherpad-${{ matrix.os }}
+          path: |
+            runtimes/sherpa-onnx/target/release/sherpad
+            runtimes/sherpa-onnx/target/release/sherpad.exe
+          if-no-files-found: error
+          retention-days: 1

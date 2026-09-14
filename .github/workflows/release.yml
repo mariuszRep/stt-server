@@ -3,7 +3,6 @@ name: Release
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:
 
 jobs:
   build-binaries:
@@ -126,6 +125,12 @@ jobs:
     defaults:
       run:
         working-directory: runtimes/sherpa-onnx
+    env:
+      # See the matching comment in ci.yml's `sherpad` job: audiopus_sys's
+      # vendored libopus CMakeLists predates CMake 3.5's minimum-version
+      # floor, so a current CMake (the runner images' default) refuses to
+      # configure it without this.
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -165,13 +170,17 @@ jobs:
             --notes "protocolVersion: 1, schemaVersion: 1 (RuntimeConnectionDescriptor). See CONVENTIONS.md/VISION.md for compatibility guarantees." \
             artifacts/*/*
 
-  # Gated: @open-vibe-ai/stt-sdk has no npm org or publish pipeline yet (see
-  # stt-sdk's own goal notes), so there is no released version to install
-  # here. This job is real — not a placeholder — but is intentionally left
-  # unreachable (workflow_dispatch only, and disabled below) rather than
-  # silently skipped, so it's obvious the requirement isn't satisfied yet
-  # rather than looking like it passed. Flip `if: false` once a published
-  # SDK version exists, and pin @open-vibe-ai/stt-sdk@<version> below.
+  # Gated: @open-vibe-ai/stt-sdk does have a real npm publish pipeline
+  # (stt-sdk/.github/workflows/release.yml, OIDC trusted publishing), but
+  # there is no confirmed-consumable published version yet — stt-sdk's
+  # source version and its actual npm-published version have drifted (see
+  # RELEASE_PROCESS.md's SDK version-drift checklist item; check with
+  # `node scripts/release-status.mjs` from the voice-typer workspace root).
+  # This job is real — not a placeholder — but is intentionally left
+  # unreachable (`if: false` below) rather than silently skipped, so it's
+  # obvious the requirement isn't satisfied yet rather than looking like it
+  # passed. Flip `if: false` once the SDK version drift is resolved and pin
+  # @open-vibe-ai/stt-sdk@<version> below.
   sdk-compatibility:
     if: false
     needs: [build-faster-whisper-sidecar]

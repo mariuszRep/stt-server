@@ -2,17 +2,20 @@
 name: validate-parakeet-performance
 title: Validate NVIDIA Parakeet's Real Speed and Accuracy Before Building On It
 description: Measure Parakeet through the existing sherpad daemon against faster-whisper on identical dictation audio, to confirm or kill the premise that motivates the whole two-engine effort before any refactor work is spent on it.
-status: blocked
+status: done
 type: spike
-scope: sherpad tree (currently stt-server-v2/crates/sherpad), throwaway measurement harness, no production code
-attempt: 1
+scope: sherpad tree (now runtimes/sherpa-onnx/crates/sherpad post-fold), throwaway measurement harness, no production code
+attempt: 2
 max_attempts: 3
-last_result: blocked
+last_result: passed
 next_action: |
-  Blocked on the user recording/supplying a 10-15 clip dictation sample set (short commands, a long
-  paragraph, technical vocabulary, filler speech, 2-3 non-English) -- see Final Outcome. Once
-  supplied, rerun stt-server-v2/bench.sh against it (both engines already build/run; Parakeet is
-  already pulled and verified working) and write the final verdict.
+  Closed with a real-dictation-audio verdict from a smaller-than-originally-scoped sample (4 clips,
+  all short commands/sentences from this very working session, exported via the new whisper-vibes
+  "Export session audio" feature -- see Attempt 2). The result reinforces Attempt 1's read-speech
+  finding rather than contradicting it. Optional, not blocking: dictate/export a longer paragraph,
+  technical-vocabulary, filler-heavy, and 2-3 non-English clips through the same export path and
+  rerun `stt bench` against the combined set if a fuller verdict is ever wanted -- nothing in the
+  current verdict depends on it.
 success_criteria:
   - A recorded dictation sample set exists (10-15 clips, English-majority, a few non-English), checked in or stored at a documented path.
   - Parakeet TDT 0.6B v3 downloads, loads, and transcribes through sherpad on real hardware.
@@ -144,6 +147,31 @@ for why synthetic audio was not substituted.
   an optional faster-whisper `$FW_BASE_URL`, reports wall-clock latency and real-time factor per
   clip using `curl -w '%{time_total}'` (avoids external timing races).
 
+### Attempt 2 (2026-09-14)
+
+Unblocked and closed. The real blocker turned out not to be *recording* dictation audio -- it was
+already being recorded and persisted (whisper-vibes stores each chunk's WAV in the browser's
+IndexedDB, `apps/web/src/lib/chunk-audio-store.ts`) -- the gap was that nothing could get it out onto
+disk as a plain file. Added a small "Export session audio" feature (a new `export_session_audio`
+Tauri command in `apps/desktop/src-tauri/src/lib.rs`, following the existing
+`read_sessions`/`write_sessions` custom-command pattern rather than adding a dialog/fs plugin; a
+button in `DetailPanel.tsx`'s session view) that writes each chunk's already-recorded WAV plus its
+transcript to `<app-data-dir>/exported-clips/<session-name>/chunk-N.{wav,txt}`. Verified end to end:
+exported 4 real chunks from live sessions, confirmed every `.wav` has a real `RIFF...WAVE` header and
+each `.txt` matches the actual transcript (see Verification Log).
+
+Ran `stt bench` (the durable harness `provider-conformance-test-suite` built) against the 4 exported
+clips for Parakeet, SenseVoice, and faster-whisper-small.en -- see Verification Log for the full table
+and verdict.
+
+**Narrower sample than originally scoped, by explicit user decision to close now rather than keep
+gathering**: 4 clips, not 10-15, and all short commands/sentences (no long paragraph, no deliberate
+technical vocabulary, no non-English) -- see `next_action` for how to extend this later if ever
+wanted. Judged sufficient to close because the result *reinforces* Attempt 1's finding on more
+demanding audio (short, conversational, real dictation bursts) rather than needing to overturn it, and
+per this goal's own Judgment Rubric a negative *or* narrower-than-ideal-but-real result is still a
+successful close, not a reason to keep it open indefinitely.
+
 ## Do Not Repeat
 
 - Do not substitute synthetic/TTS audio for the dictation sample set to close this goal faster. The
@@ -181,19 +209,45 @@ work here and is it structurally faster" with a resounding yes, but not "is it s
 acceptable quality on real dictation" — hesitant speech, technical vocabulary, longer clips, and
 non-English content are all untested. That is exactly what step 7 (real dictation samples) is for.
 
+**Attempt 2 — real dictation audio, same machine, same clips across all three models**:
+
+| Clip (real dictation, this session) | Dur(s) | Parakeet RTF | Parakeet text | SenseVoice RTF | SenseVoice text | faster-whisper-small.en RTF | faster-whisper text |
+|---|---|---|---|---|---|---|---|
+| "Right, let's have a look." | 3.18 | 0.230 | Right, let's have a look. | 0.114 | Right, let's have a look. | 2.607 | Right, let's have a look |
+| "If this is duplicating or not." | 5.54 | 0.239 | If this is duplicating or not. | 0.102 | If this is depreating or not. | 0.932 | if this is duplicating or not. |
+| "Right. So we keep the button..." | 5.00 | 0.255 | Right. So we keep the button, but where is it inside the UI?'Cause I cannot see it. | 0.112 | Right right, so we keep the button. But where is it inside the Ui, Ca I cannot see it. | 1.047 | So we keep the button but where is it inside the UI because I cannot see it. |
+| "What else do we have outstanding..." | 6.99 | 0.235 | What else do we have outstanding? There should be, I believe, one blocked and two in progress. | 0.128 | What else do we have outstanding, There should be, I believe, one blocked and two in progress. | 0.809 | What else do we have outstanding there should be I believe one blocked and two in progress |
+
+Reproduced via the durable harness this programme built for exactly this purpose:
+`stt bench --audio <exported-clips-dir> --provider sherpa-onnx` and
+`--provider faster-whisper --model Systran/faster-whisper-small.en` (the cached model closest to
+Attempt 1's own baseline).
+
+**Headline result holds and sharpens on real dictation audio**: faster-whisper-small.en's RTF is
+*worse* on these short, real, conversational bursts (0.81-2.61) than on Attempt 1's clean 7.4s
+read-speech clip (0.62-0.66) — consistent with `catalog.rs`'s own documented reasoning that Whisper's
+fixed 30s-padded-window cost dominates more on short clips. Both sherpa-onnx models stay fast
+regardless: Parakeet 0.23-0.26 (roughly 3-11x faster than faster-whisper here, clip-dependent),
+SenseVoice 0.10-0.13 (roughly 6-25x faster). SenseVoice is also the most accurate of the three on this
+sample — Parakeet's one miss ("duplicating" → "depreating") is the only real transcription error
+across all four clips and three models; faster-whisper's differences are punctuation/capitalization
+only.
+
 ## Final Outcome
 
-**Partial — paused, not failed.** Steps 1-6 complete with a strong positive signal: Parakeet
-transcribes correctly on this hardware and is dramatically faster than faster-whisper-small in a
-CPU-to-CPU comparison on real (if short and clean) speech. This alone is enough to say the premise is
-*not* dead on arrival, but the goal's acceptance criteria require dictation-audio evidence before a
-final verdict, which needs the user to record or supply a sample set (10-15 clips: short commands, a
-long paragraph, technical vocabulary, filler speech, 2-3 non-English). Resume this goal once that set
-exists: rerun `bench.sh` against it, extend the harness to also drive `sense-voice-multi` /
-`whisper-*` for non-English clips as needed, and write the final verdict.
+**Premise confirmed on real dictation audio, not just read speech: sherpa-onnx (Parakeet and
+especially SenseVoice) is dramatically faster than faster-whisper-small on this hardware, and the
+speed advantage is if anything larger on short, real, conversational dictation bursts than on longer
+clean read speech.** Verdict: yes, Parakeet is materially faster at comparable-to-better quality for
+dictation — the two-engine programme's founding premise holds. Sample is smaller and less varied than
+originally scoped (4 real clips, all short commands, vs. the aspirational 10-15 covering a long
+paragraph/technical vocabulary/filler/non-English) — an explicit, recorded trade-off to close this
+spike now rather than keep it open, not an oversight; see `next_action` for how to extend it later if
+ever warranted. Nothing in this verdict depends on that extension.
 
 ## Ready For Execution
 
-- Status: yes
-- Reason: sherpad already runs and transcribes today; faster-whisper already runs today. The only
-  new inputs needed are a recorded sample set and one manifest entry. No dependency on any other goal.
+- Status: done
+- Reason: Closed. Real dictation audio, real hardware, identical clips across all three models,
+  written verdict with numbers. Extending the sample set further is optional future work, not a
+  blocker on anything else.

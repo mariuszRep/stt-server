@@ -676,13 +676,13 @@ impl RuntimeManager {
         catalog::find_model(entry, model_id)
             .ok_or_else(|| RuntimeError::ModelNotFound(model_id.to_string()))?;
 
-        let port = {
+        let running_state = {
             let mut instances = self.instances.lock().await;
             match instances.get_mut(id.as_str()) {
                 Some(running) => {
                     if running.instance.status() == RuntimeStatus::Running {
                         running.last_activity = Instant::now();
-                        Some(running.instance.port)
+                        Some((running.instance.port, running.instance.auth_token.clone()))
                     } else {
                         None
                     }
@@ -691,7 +691,7 @@ impl RuntimeManager {
             }
         };
 
-        let Some(port) = port else {
+        let Some((port, auth_token)) = running_state else {
             // Not running: identical persist-only contract to `select_model`.
             self.selected_models
                 .lock()
@@ -713,6 +713,7 @@ impl RuntimeManager {
         let client = reqwest::Client::new();
         let resp = client
             .post(&url)
+            .bearer_auth(&auth_token)
             .json(&AdminModelBody { model: model_id })
             .send()
             .await

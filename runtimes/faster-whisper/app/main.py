@@ -1,13 +1,14 @@
 import asyncio
 import os
 import platform as _platform
+import secrets
 import sys
 import tempfile
 import time
 import wave
 from pathlib import Path, PurePath
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -15,7 +16,28 @@ from pydantic import BaseModel
 from app import config
 from app.transcribe import _infer_lock, get_model, get_runtime_status, transcribe
 
-app = FastAPI(title="Voice Typer Backend", version="0.1.0")
+
+async def require_auth(authorization: str | None = Header(default=None)) -> None:
+    """Enforces config.AUTH_TOKEN (VOICE_TYPER_AUTH_TOKEN) as a bearer token on every route.
+
+    Applied as a global dependency (see FastAPI(dependencies=[...]) below) rather than per-route,
+    matching sherpad's require_auth middleware (runtimes/sherpa-onnx/crates/sherpad/src/api.rs) --
+    no route is exempt, so a new route can't accidentally ship unauthenticated. Pure passthrough
+    when no token is configured (the loopback-default case).
+    """
+    expected = config.AUTH_TOKEN
+    if expected is None:
+        return
+
+    provided = None
+    if authorization is not None and authorization.startswith("Bearer "):
+        provided = authorization[len("Bearer "):]
+
+    if provided is None or not secrets.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
+app = FastAPI(title="Voice Typer Backend", version="0.1.0", dependencies=[Depends(require_auth)])
 
 _ALLOWED_ORIGINS = [
     "http://localhost:5173",
@@ -187,7 +209,6 @@ async def get_config() -> ConfigResponse:
 async def audio_transcriptions(
     file: UploadFile = File(...),
     prompt: str | None = Form(default=None),
-    authorization: str | None = Header(default=None),
 ) -> TranscriptionResponse:
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file provided")
@@ -374,4 +395,8 @@ def _find_static() -> Path | None:
 _static_dir = _find_static()
 if _static_dir is not None:
     from fastapi.staticfiles import StaticFiles
+    # StaticFiles is mounted as its own ASGI sub-app, so it does not go through
+    # FastAPI(dependencies=[...]) -- require_auth does not apply here. Acceptable: this only
+    # serves the bundled frontend's static assets, not the authenticated API surface, mirroring
+    # sherpad's own documented carve-out (CORS preflight) as the one exemption to its blanket auth.
     app.mount("/", StaticFiles(directory=str(_static_dir), html=True), name="static")

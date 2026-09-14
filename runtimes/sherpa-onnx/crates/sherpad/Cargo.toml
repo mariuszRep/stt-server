@@ -31,9 +31,22 @@ uuid = { version = "1", features = ["v4"] }
 
 # Fallback decoder for non-WAV audio sherpa_onnx::Wave::read can't handle.
 # Covers WebM/Matroska + Ogg containers carrying PCM/Vorbis (the "mkv"/"ogg"
-# format features plus "wav"/"pcm"/"vorbis" codecs). Does NOT cover Opus --
-# symphonia 0.5 has no Opus decoder or even a registered codec-type constant
-# for it (verified against upstream source, not assumed), so WebM/Opus (the
-# app's actual MediaRecorder fallback codec) is a known, documented gap; see
-# make-sherpad-protocol-conformant's goal file for the follow-up options.
+# format features plus "wav"/"pcm"/"vorbis" codecs) directly, and demuxes
+# WebM/Opus (the app's actual MediaRecorder fallback codec) for the audiopus
+# pair below to decode -- symphonia's own registry has a CODEC_TYPE_OPUS
+# constant and can identify/demux an Opus track, it just never shipped a
+# decoder crate for the payload (verified against the pinned 0.5.5 source).
 symphonia = { version = "0.5", default-features = false, features = ["mkv", "wav", "pcm", "vorbis", "ogg"] }
+
+# libopus binding to decode the raw Opus packets symphonia demuxes out of
+# WebM/Opus. Both crates haven't published a release since 2021, but remain
+# the de facto standard Rust Opus binding (millions of recent downloads,
+# e.g. via Discord bot libraries) and the codec itself is stable/frozen --
+# "static" vendors and cmake-builds libopus from source so no system libopus
+# is required on dev machines or CI runners (needs cmake + a C toolchain).
+audiopus = "0.3.0-rc.0"
+audiopus_sys = { version = "0.2", features = ["static"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

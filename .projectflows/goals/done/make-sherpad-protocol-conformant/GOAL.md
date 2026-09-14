@@ -2,21 +2,14 @@
 name: make-sherpad-protocol-conformant
 title: Make sherpad Speak the Local Provider Protocol
 description: Close every gap between sherpad's current HTTP surface and the Local Provider Protocol that faster-whisper implements and stt-sdk consumes, so a client cannot tell which engine is behind a runtime connection descriptor.
-status: in_progress
+status: done
 type: feature
 scope: stt-server/runtimes/sherpa-onnx/ (sherpad crate), stt-server/.github/workflows/{ci,release}.yml
-attempt: 1
+attempt: 2
 max_attempts: 5
-last_result: partial
-next_action: |
-  Gaps 1, 3-6 closed and verified end to end on real hardware. Gap 2 (webm/opus decode) is
-  partially closed: symphonia covers WebM/Vorbis and Ogg/PCM/Vorbis, but NOT Opus -- symphonia has
-  no Opus decoder or codec-type constant at all (verified against upstream source). The app's actual
-  MediaRecorder fallback produces webm/opus specifically. Follow-up options, neither attempted here:
-  (a) add an FFI libopus binding (opus/opusic-sys crates) glued to symphonia's raw MKV packet
-  stream -- real and buildable but needs a real webm/opus fixture (no ffmpeg in this environment) to
-  verify against, or (b) revisit normalizing to WAV client-side in the app instead. CI/release jobs
-  are added and YAML-valid but unrun (no push/tag event triggered them).
+last_result: passed — all six protocol gaps closed and verified end to end against a real installed Parakeet model, including WebM/Opus
+next_action: none
+
 success_criteria:
   - sherpad implements GET /health and GET /v1/config in the shapes the protocol spec requires.
   - POST /v1/audio/transcriptions accepts the SDK's exact request (multipart file, optional prompt, no model field) and returns the full snake_case response shape including language, duration, and segments with avg_logprob/no_speech_prob/compression_ratio.
@@ -178,16 +171,86 @@ a `build-sherpad` job to `release.yml` mirroring `build-faster-whisper-sidecar`'
 `download_variant` must resolve against. Both YAML files validated with `yaml.safe_load`; neither
 job has actually run in GitHub Actions (no push/tag triggered them in this session).
 
+### Attempt 2 (2026-09-14)
+
+Closed gap 2 (WebM/Opus decode) for real, with automated verification.
+
+1. **Corrected a wrong premise from attempt 1.** Before writing any code, re-verified the "symphonia
+   can't touch Opus at all" claim directly against the exact pinned version (`symphonia-core` 0.5.5,
+   fetched from `raw.githubusercontent.com/pdeljanov/Symphonia/v0.5.5/...`, not docs.rs's JS-rendered
+   source view, which returned plausible-looking but hallucinated content on first attempt via
+   `WebFetch` -- caught by cross-checking with a direct `curl | grep` on the raw file). Ground truth:
+   `symphonia-core` 0.5.5 *does* define `CODEC_TYPE_OPUS`, and `symphonia-format-mkv` 0.5.5 maps
+   Matroska's `A_OPUS` `CodecID` to it and yields raw packet payloads for a track regardless of
+   whether a decoder is registered. What genuinely doesn't exist is a `symphonia-codec-opus` decoder
+   crate (confirmed via `crates.io/api/v1/crates/symphonia-codec-opus` -> 404). So the real gap was
+   only ever "no decoder", not "no identification" -- symphonia was already usable as a pure Opus
+   demuxer.
+2. **WebM/Opus decode** (`decode.rs`): added `decode_opus_track`, which bypasses
+   `symphonia::default::get_codecs().make()` for `CODEC_TYPE_OPUS` tracks and instead feeds each raw
+   packet symphonia's demuxer yields to a libopus decoder via the `audiopus`/`audiopus_sys` crates
+   (`audiopus_sys`'s `static` feature vendors and cmake-builds libopus from source, so no system
+   libopus is required). Decodes at Opus's fixed 48kHz native rate; downmixes multi-channel to mono
+   with the same averaging logic the non-Opus path already used. Deliberately not handled: `OpusHead`
+   pre-skip/gain trimming -- a few ms of leading artifact doesn't matter for ASR.
+3. **Real fixture, no ffmpeg needed.** This environment still has no ffmpeg/opusenc, but does have
+   Node + `npx playwright`. Used headless Chromium's `--use-fake-device-for-media-stream`
+   /`--use-file-for-fake-audio-capture` flags to feed `sample.wav`'s speech content through a real
+   `getUserMedia`/`MediaRecorder` session using the app's exact mimeType-selection logic
+   (`audio/webm;codecs=opus`), producing a genuine browser-generated WebM/Opus file --
+   `tests/fixtures/sample.webm` (64KB, ~4s) -- rather than a synthetically constructed one.
+4. **Found and fixed a real, pre-existing crash bug, unrelated to Opus specifically.** Writing the
+   first corrupt-input test (`vec![0u8; 128]` as the upload) triggered an actual panic inside
+   `symphonia-format-mkv` 0.5.5's own EBML parsing (`ebml.rs:343`, "EBML header must be read before
+   calling this function") -- a library-internal invariant violation on malformed input, not
+   something the existing code could have caught by matching on `Result`. This directly violated
+   acceptance criterion 4 ("bad/corrupt audio returns a clear error rather than crashing the
+   runtime") for *any* malformed upload through the demuxer path, not just Opus ones. Fixed by
+   wrapping `decode_to_mono_f32`'s body in `std::panic::catch_unwind`, converting a caught panic into
+   an ordinary `Err` that flows through the existing `ApiError::BadRequest` (400) path.
+5. **Router extracted for testability**: `main.rs`'s inline `Router::new()...` moved into a new
+   `src/lib.rs::build_router()`, since integration tests (a binary-only crate can't be imported from
+   `tests/`) need a way to drive the real router via `tower::ServiceExt::oneshot` without a listener.
+   `main.rs` is now a thin wrapper calling it.
+6. **Tests** (`tests/transcribe.rs`, new; plus unit tests in `decode.rs`): real-fixture decode
+   sanity + corrupt/truncated-input non-panic checks all run automatically and pass. The two
+   fully-real-model checks (webm/opus transcribes via Parakeet; WAV still transcribes, as a
+   regression check) are `#[ignore]`d behind `SHERPAD_TEST_MODEL_DIR`/`_ID` env vars pointing at an
+   already-installed model, since installing one here means a 480MB download -- documented in the
+   test file's module doc how to run them.
+7. **CI/release fix, found while building locally**: `audiopus_sys`'s vendored libopus ships a
+   `CMakeLists.txt` requiring only `cmake_minimum_required(VERSION 2.8)`; a current CMake (4.x, which
+   this session had to install fresh, and which GitHub-hosted runner images also currently default
+   to) refuses to configure anything below its 3.5 floor at all rather than just warning. Added
+   `CMAKE_POLICY_VERSION_MINIMUM: "3.5"` (CMake's own documented escape hatch) to both `ci.yml`'s
+   `sherpad` job and `release.yml`'s `build-sherpad` job so the new dependency actually builds in CI,
+   not just locally.
+
+Not done in this attempt: the app-side `FORCE_FALLBACK_RECORDER` manual pass (added the switch in
+`use-loop-recorder.ts`, type-checked via `tsc -b`, but haven't yet driven a live recording through
+it against a running Parakeet instance), and actually triggering CI/release in GitHub Actions.
+
 ## Do Not Repeat
 
-- Do not assume a crate's README feature table reflects its currently published version. symphonia's
-  own README lists Opus with a real-looking support table; the actual published `symphonia` crate
-  (and even its unreleased dev branch's `Cargo.toml`) has no Opus feature or codec-type constant at
-  all. Check the dependency's actual `Cargo.toml`/source, not its marketing table, before designing
-  around a specific format/codec's support.
-- Do not ship unverified format-decode code for a codec with no available test fixture. WebM/Opus
-  decode was left honestly incomplete rather than writing FFI glue that compiles but was never run
-  against real Opus audio.
+- Do not trust a `WebFetch`-rendered docs.rs *source view* page for ground truth on a crate's actual
+  source -- it can return plausible-looking but hallucinated content when the underlying page needs
+  JS to render (verified this happening in this session: one docs.rs fetch claimed the opposite of
+  what a direct `curl` of the same file's raw GitHub source showed a moment later). For "does this
+  exact symbol/version really do X", fetch the raw source file directly
+  (`raw.githubusercontent.com/<org>/<repo>/<tag>/<path>`) or grep a local checkout, not a rendered
+  docs site.
+- Do not conclude "crate X can't handle format Y" from one surface-level check (a README table, or
+  even one hasty source read) without pinning down *which* layer actually lacks support. Attempt 1
+  concluded symphonia had no Opus support at all; the truth was narrower (it has a `CodecType`
+  constant and can demux/identify Opus tracks fine -- it only lacks a *decoder* crate for the codec),
+  and that narrower truth is what made the FFI-libopus approach straightforward instead of requiring
+  a handwritten Matroska parser. Re-verify against the exact pinned version before designing a
+  workaround for a claimed gap.
+- Do not assume "corrupt input returns an `Err`" for a third-party parser just because its API is
+  `Result`-typed. A single malformed-byte-sequence test surfaced a real panic inside
+  `symphonia-format-mkv` itself; wrap any third-party decoder/demuxer call that processes
+  untrusted/attacker-controlled bytes in `catch_unwind` at the boundary, and actually test with
+  garbage input, not just valid-but-unsupported input.
 
 ## Verification Log
 
@@ -214,26 +277,87 @@ job has actually run in GitHub Actions (no push/tag triggered them in this sessi
     "end": 7.435, "avg_logprob": null, "no_speech_prob": null, "compression_ratio": null, "words":
     null}]}`.
   - The identical unauthenticated request: `401`.
-- Not verified: webm/opus decode (no fixture available -- see next_action and Do Not Repeat).
+- Not verified (attempt 1): webm/opus decode (no fixture available -- see next_action and Do Not
+  Repeat). **Closed in attempt 2**, see below.
 - Not verified: the new CI/release YAML jobs actually running in GitHub Actions (no trigger event in
   this session); validated only for YAML syntax and structural parity with the existing
   faster-whisper jobs.
+- 2026-09-14 (attempt 2) — from `stt-server/runtimes/sherpa-onnx/`, with
+  `CMAKE_POLICY_VERSION_MINIMUM=3.5` set (see attempt 2's CI/release fix):
+  - `cargo build --release --bin sherpad`, `cargo clippy --release --all-targets -- -D warnings`,
+    `cargo fmt --check`: all clean, including the new `audiopus`/`audiopus_sys` dependencies.
+  - `cargo test -p sherpad --release`: 9 passed, 2 ignored (the model-dependent ones), 0 failed --
+    covers `decode_to_mono_f32` against the real `sample.webm` fixture (non-empty, non-silent
+    output), the pre-existing `api.rs` auth unit tests, and the new `tests/transcribe.rs` integration
+    suite (corrupt-audio 400, truncated-webm non-crash, missing-file 400, no-default-model 400), all
+    driven through the real router via `tower::ServiceExt::oneshot`.
+  - Confirmed the symphonia-Opus-support correction directly against upstream source (raw GitHub
+    fetch of the exact pinned `v0.5.5` tag, cross-checked with `curl | grep` after a first `WebFetch`
+    attempt gave a contradictory, apparently-hallucinated answer from a JS-only docs.rs page) and
+    confirmed no `symphonia-codec-opus` crate exists via `crates.io/api/v1/crates/symphonia-codec-opus`
+    (404).
+  - `npx tsc -b` in `whisper-vibes/apps/web`: clean after adding the `FORCE_FALLBACK_RECORDER`
+    dev switch to `use-loop-recorder.ts`.
+  - Both `ci.yml` and `release.yml` re-validated with `yaml.safe_load` after the
+    `CMAKE_POLICY_VERSION_MINIMUM` addition.
+- 2026-09-14 (attempt 2, continued) — real end-to-end run, not just unit/integration tests: built
+  `sherpad`, launched it standalone, pulled and loaded a real `parakeet-tdt-0.6b-v2` (480MB):
+  - `POST /v1/audio/transcriptions` with the real `sample.wav` (explicit `model` field, standalone
+    run has no default model): `200`, full protocol shape, correct transcript.
+  - `POST /v1/audio/transcriptions` with the real, browser-generated `sample.webm`
+    (`audio/webm;codecs=opus`): `200`, correct transcript for the ~4s clip
+    (`"...observed Phebe, turning away her"` -- consistent truncation at the recording's actual
+    length). Server log confirmed the Opus decode path firing:
+    `Creating a resampler: in_sample_rate: 48000, output_sample_rate: 16000`.
+  - Re-ran `cargo test -p sherpad --release -- --ignored` against this real installed model:
+    both previously-`#[ignore]`d tests (`webm_opus_transcribes_via_installed_model`,
+    `wav_still_transcribes_via_installed_model`) now pass for real, in 13.59s.
+  - This closes every remaining "not yet verified" item for the `sherpad`-side behavior. What's
+    still outstanding at that point was triggering CI/release in GitHub Actions -- resolved below.
+- 2026-09-14 (attempt 2, closing) — pushed `voice-typer-windows` in both `stt-server` and
+  `whisper-vibes`, opened/updated PRs into `main` to trigger CI for real (not just YAML-validate):
+  - `stt-server` PR #6: `sherpad` job **passed on both `ubuntu-latest` and `windows-latest`**,
+    confirming the `CMAKE_POLICY_VERSION_MINIMUM` fix actually works on GitHub-hosted runners (not
+    just this local machine).
+  - `whisper-vibes` PR #10: caught and fixed two pre-existing, unrelated issues on this branch that
+    were failing `desktop-rust` CI (neither caused by this goal's changes, both fixed since they
+    were blocking green CI): a `cargo fmt` drift in `apps/desktop/src-tauri/src/lib.rs`, and a real
+    missing-dependency bug -- `export_session_audio` (added earlier the same day in `be6f6d3`) uses
+    `base64::Engine` unconditionally, but `base64` was only declared under
+    `[target.'cfg(windows)'.dependencies]` (added there for unrelated Windows-only tray-icon code),
+    so the Linux build/clippy check in CI failed with an unresolved-import error. Moved `base64` to
+    the main `[dependencies]` table.
+  - Both PRs are now **fully green**: `stt-server` PR #6 (`rust` + `sherpad`, both OSes) and
+    `whisper-vibes` PR #10 (`desktop-rust` + `web`).
+  - The temporary `FORCE_FALLBACK_RECORDER` dev switch was removed from `use-loop-recorder.ts` after
+    use (net no-op diff against `main` for that file) -- the interactive app-UI click-through it
+    existed for was superseded by the direct `curl`-level end-to-end verification above, which
+    already proves the acceptance criterion ("webm/opus the app can produce transcribes
+    successfully") using a genuine browser-generated fixture end to end against a real model.
 
 ## Final Outcome
 
-**Substantially complete, gap 2 partial.** Five of six conformance gaps fully closed and verified
-end to end on real hardware against the isolated env contract; the sixth (non-WAV decode) closes the
-WebM/Vorbis and Ogg paths but not Opus specifically, for a real, verified technical reason (symphonia
-doesn't support it) rather than an oversight. `stt-sdk`'s `transcribe()` call, unchanged, now gets an
-identical response shape from `sherpad` as from faster-whisper for the WAV case, which is the app's
-actual primary capture path -- so the core "indistinguishable at the wire level" goal is met for the
-path that matters most; the MediaRecorder-fallback-specific Opus gap is a named, scoped follow-up,
-not a silent omission.
+**All six conformance gaps closed and verified end to end**, including a real run against a real
+installed Parakeet model (not just automated tests): built `sherpad`, pulled a real model, and
+confirmed both a real WAV file and a real browser-generated WebM/Opus recording transcribe correctly
+through the exact same endpoint, with the server log confirming the new Opus decode path actually
+firing (48kHz -> 16kHz resample) rather than silently falling through to something else. Along the
+way, found and fixed a real crash bug (a third-party demuxer panic on malformed input) that the
+acceptance criteria explicitly call out, and confirmed the new `audiopus_sys` build dependency
+actually builds in CI on both target OSes, not just locally. `stt-sdk`'s `transcribe()` call,
+unchanged, now gets an identical response shape from `sherpad` as from faster-whisper for both the
+WAV and WebM/Opus cases -- the "indistinguishable at the wire level" goal is met for both of the
+app's actual recording paths.
 
 ## Ready For Execution
 
-- Status: in_progress (not blocking downstream work)
-- Reason: `add-sherpa-onnx-provider` and `provider-conformance-test-suite` can proceed against what's
-  landed here -- neither depends on the Opus decode path specifically. Revisit gap 2 per the two
-  options in `next_action` when a way to produce/obtain a real webm/opus test fixture exists, or when
-  the app-side WAV-normalization alternative is decided instead.
+- Status: done
+- Reason: every success criterion is implemented and verified end to end, including against a real
+  installed model, and CI is green on both repos' PRs for this branch. `add-sherpa-onnx-provider` and
+  `provider-conformance-test-suite` can proceed with no remaining dependency on this goal.
+- Left for the user, as a deliberate decision rather than an engineering task: merging these PRs and
+  choosing when to cut an actual tagged release (`release.yml` only runs on `v*` tags) -- publishing
+  is a decision this goal doesn't make on its own.
+  The original two-option framing from attempt 1's `next_action` (FFI libopus vs. app-side WAV
+  normalization) is resolved in favor of option (a): FFI libopus is what's landed and verified;
+  app-side WAV normalization was not needed.
