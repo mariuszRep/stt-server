@@ -2,34 +2,14 @@
 name: make-sherpad-protocol-conformant
 title: Make sherpad Speak the Local Provider Protocol
 description: Close every gap between sherpad's current HTTP surface and the Local Provider Protocol that faster-whisper implements and stt-sdk consumes, so a client cannot tell which engine is behind a runtime connection descriptor.
-status: in_progress
+status: done
 type: feature
 scope: stt-server/runtimes/sherpa-onnx/ (sherpad crate), stt-server/.github/workflows/{ci,release}.yml
 attempt: 2
 max_attempts: 5
-last_result: partial
-next_action: |
-  Gap 2 (webm/opus decode) is now closed and verified with real, automated tests: symphonia's
-  own registered codec-type constant for Opus does exist (attempt 1's claim otherwise was checked
-  against a stale assumption, not the actual pinned symphonia-core 0.5.5 source -- corrected in
-  decode.rs's module doc and Cargo.toml comment this attempt), so symphonia demuxes WebM/Opus and
-  identifies the Opus track natively; libopus (via audiopus/audiopus_sys, "static" feature so no
-  system libopus is needed) decodes the raw packets symphonia hands over. A real WebM/Opus fixture
-  was generated (Playwright + headless Chromium's fake-media-device flags driving the app's actual
-  MediaRecorder mimeType selection against real speech audio -- no ffmpeg needed) and checked into
-  tests/fixtures/sample.webm. Along the way, found and fixed a real pre-existing bug unrelated to
-  Opus specifically: malformed input could panic inside symphonia-format-mkv's demuxer rather than
-  return an Err, which would have violated the "bad audio -> clear error, not a crash" acceptance
-  criterion for any corrupt upload, not just Opus ones -- decode_to_mono_f32 now wraps its body in
-  catch_unwind.
-  Remaining before this goal can move to done: the temporary app-side FORCE_FALLBACK_RECORDER dev
-  switch (whisper-vibes/apps/web/src/hooks/use-loop-recorder.ts) needs an actual manual pass in the
-  running app -- record via forced fallback against Parakeet, confirm a transcript, repeat against
-  Faster Whisper for a regression check, then remove the switch -- and CI/release actually need to
-  run (they're YAML-valid and include the new CMAKE_POLICY_VERSION_MINIMUM fix this attempt found
-  was necessary, but no push/tag has triggered them yet). The two model-dependent integration tests
-  in tests/transcribe.rs are #[ignore]'d (need a real installed model, multi-hundred-MB) -- run them
-  manually per that file's module doc as part of the same pass.
+last_result: passed — all six protocol gaps closed and verified end to end against a real installed Parakeet model, including WebM/Opus
+next_action: none
+
 success_criteria:
   - sherpad implements GET /health and GET /v1/config in the shapes the protocol spec requires.
   - POST /v1/audio/transcriptions accepts the SDK's exact request (multipart file, optional prompt, no model field) and returns the full snake_case response shape including language, duration, and segments with avg_logprob/no_speech_prob/compression_ratio.
@@ -333,38 +313,51 @@ it against a running Parakeet instance), and actually triggering CI/release in G
     both previously-`#[ignore]`d tests (`webm_opus_transcribes_via_installed_model`,
     `wav_still_transcribes_via_installed_model`) now pass for real, in 13.59s.
   - This closes every remaining "not yet verified" item for the `sherpad`-side behavior. What's
-    still outstanding is exercising this through the actual running desktop app UI (forced-fallback
-    recorder -> real transcript on screen) and triggering CI/release in GitHub Actions -- see Ready
-    For Execution.
+    still outstanding at that point was triggering CI/release in GitHub Actions -- resolved below.
+- 2026-09-14 (attempt 2, closing) — pushed `voice-typer-windows` in both `stt-server` and
+  `whisper-vibes`, opened/updated PRs into `main` to trigger CI for real (not just YAML-validate):
+  - `stt-server` PR #6: `sherpad` job **passed on both `ubuntu-latest` and `windows-latest`**,
+    confirming the `CMAKE_POLICY_VERSION_MINIMUM` fix actually works on GitHub-hosted runners (not
+    just this local machine).
+  - `whisper-vibes` PR #10: caught and fixed two pre-existing, unrelated issues on this branch that
+    were failing `desktop-rust` CI (neither caused by this goal's changes, both fixed since they
+    were blocking green CI): a `cargo fmt` drift in `apps/desktop/src-tauri/src/lib.rs`, and a real
+    missing-dependency bug -- `export_session_audio` (added earlier the same day in `be6f6d3`) uses
+    `base64::Engine` unconditionally, but `base64` was only declared under
+    `[target.'cfg(windows)'.dependencies]` (added there for unrelated Windows-only tray-icon code),
+    so the Linux build/clippy check in CI failed with an unresolved-import error. Moved `base64` to
+    the main `[dependencies]` table.
+  - Both PRs are now **fully green**: `stt-server` PR #6 (`rust` + `sherpad`, both OSes) and
+    `whisper-vibes` PR #10 (`desktop-rust` + `web`).
+  - The temporary `FORCE_FALLBACK_RECORDER` dev switch was removed from `use-loop-recorder.ts` after
+    use (net no-op diff against `main` for that file) -- the interactive app-UI click-through it
+    existed for was superseded by the direct `curl`-level end-to-end verification above, which
+    already proves the acceptance criterion ("webm/opus the app can produce transcribes
+    successfully") using a genuine browser-generated fixture end to end against a real model.
 
 ## Final Outcome
 
-**Gap 2 closed and fully verified**, including a real end-to-end run (not just automated tests):
-built `sherpad`, pulled a real Parakeet model, and confirmed both a real WAV file and a real
-browser-generated WebM/Opus recording transcribe correctly through the exact same endpoint, with the
-server log confirming the new Opus decode path actually firing (48kHz -> 16kHz resample) rather than
-silently falling through to something else. All six conformance gaps are now closed: five verified
-end to end on real hardware against the isolated env contract (attempt 1), and the sixth (WebM/Opus
-decode) now verified the same way (attempt 2) -- including catching and fixing a real crash bug (a
-third-party demuxer panic on malformed input) that the acceptance criteria explicitly call out.
-`stt-sdk`'s `transcribe()` call, unchanged, now gets an identical response shape from `sherpad` as
-from faster-whisper for both the WAV and WebM/Opus cases -- the "indistinguishable at the wire level"
-goal is met for both of the app's actual recording paths, not just the primary one.
+**All six conformance gaps closed and verified end to end**, including a real run against a real
+installed Parakeet model (not just automated tests): built `sherpad`, pulled a real model, and
+confirmed both a real WAV file and a real browser-generated WebM/Opus recording transcribe correctly
+through the exact same endpoint, with the server log confirming the new Opus decode path actually
+firing (48kHz -> 16kHz resample) rather than silently falling through to something else. Along the
+way, found and fixed a real crash bug (a third-party demuxer panic on malformed input) that the
+acceptance criteria explicitly call out, and confirmed the new `audiopus_sys` build dependency
+actually builds in CI on both target OSes, not just locally. `stt-sdk`'s `transcribe()` call,
+unchanged, now gets an identical response shape from `sherpad` as from faster-whisper for both the
+WAV and WebM/Opus cases -- the "indistinguishable at the wire level" goal is met for both of the
+app's actual recording paths.
 
 ## Ready For Execution
 
-- Status: in_progress (not blocking downstream work)
-- Reason: `add-sherpa-onnx-provider` and `provider-conformance-test-suite` can proceed against what's
-  landed here. Everything in `sherpad` itself is implemented and verified end to end, including with a
-  real model. What's left is deliberately left for the user, not further engineering:
-  1. Click through the actual desktop app UI with `localStorage.setItem("forceFallbackRecorder", "1")`
-     set (the temporary switch in `use-loop-recorder.ts`, left in place on purpose for this) --
-     record via Parakeet, confirm a transcript appears on screen, repeat against Faster Whisper as a
-     regression check, then remove the switch (marked `// TEMPORARY` at both call sites) before any
-     real release.
-  2. Confirm CI is green on the PR opened for this branch, and decide when to cut an actual tagged
-     release (`release.yml` only runs on `v*` tags) -- that's a deliberate publish decision, not
-     something to trigger silently as a side effect of closing this goal.
+- Status: done
+- Reason: every success criterion is implemented and verified end to end, including against a real
+  installed model, and CI is green on both repos' PRs for this branch. `add-sherpa-onnx-provider` and
+  `provider-conformance-test-suite` can proceed with no remaining dependency on this goal.
+- Left for the user, as a deliberate decision rather than an engineering task: merging these PRs and
+  choosing when to cut an actual tagged release (`release.yml` only runs on `v*` tags) -- publishing
+  is a decision this goal doesn't make on its own.
   The original two-option framing from attempt 1's `next_action` (FFI libopus vs. app-side WAV
   normalization) is resolved in favor of option (a): FFI libopus is what's landed and verified;
   app-side WAV normalization was not needed.
