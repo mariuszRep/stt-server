@@ -214,10 +214,31 @@ pub async fn bench(
     let manager = Arc::new(RuntimeManager::new(None));
     manager.register_local_installs().await;
 
-    println!(
+    // Stamped into the results file (and printed) so a run is
+    // self-describing when compared against another run on a different
+    // machine, or the same machine at a different time -- no new
+    // dependency, just what the standard library already knows.
+    let system_info = format!(
+        "os={} arch={} cores={}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        std::thread::available_parallelism().map_or(0, |n| n.get())
+    );
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let header = format!(
         "{:<30} {:<16} {:<24} {:>8} {:>8} {:>6}  text",
         "clip", "provider", "model", "dur(s)", "wall(s)", "rtf"
     );
+
+    let mut report_lines = vec![
+        format!("# {system_info} started_at={started_at}"),
+        header.clone(),
+    ];
+    println!("{system_info}");
+    println!("{header}");
 
     for entry in stt_runtime::catalog::CATALOG {
         if let Some(p) = &provider_filter {
@@ -277,7 +298,7 @@ pub async fn bench(
                     .and_then(|v| v.as_str())
                     .unwrap_or("<error>");
                 let rtf = if dur > 0.0 { wall / dur } else { f64::NAN };
-                println!(
+                let row = format!(
                     "{:<30} {:<16} {:<24} {:>8.2} {:>8.3} {:>6.3}  {}",
                     clip.file_name().unwrap_or_default().to_string_lossy(),
                     entry.id,
@@ -287,11 +308,24 @@ pub async fn bench(
                     rtf,
                     text
                 );
+                println!("{row}");
+                report_lines.push(row);
             }
 
             manager.stop(&id).await?;
         }
     }
+
+    // Appended (not overwritten) under a fixed directory so repeated runs --
+    // same machine over time, or different machines -- accumulate a
+    // comparable history instead of each run only living in scrollback.
+    let results_dir = std::path::Path::new("bench-results");
+    std::fs::create_dir_all(results_dir)
+        .with_context(|| format!("creating {}", results_dir.display()))?;
+    let results_path = results_dir.join(format!("{started_at}.txt"));
+    std::fs::write(&results_path, report_lines.join("\n") + "\n")
+        .with_context(|| format!("writing {}", results_path.display()))?;
+    println!("\nresults saved to {}", results_path.display());
 
     Ok(())
 }

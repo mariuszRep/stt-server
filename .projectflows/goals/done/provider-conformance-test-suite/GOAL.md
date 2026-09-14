@@ -2,21 +2,13 @@
 name: provider-conformance-test-suite
 title: Build a Provider Conformance Suite and Benchmark Harness Into stt-server
 description: Add an engine-agnostic conformance suite parameterized over the provider registry, plus room for engine-specific tests and a benchmark mode, so every engine is held to the same protocol contract automatically and model selection is measured rather than guessed.
-status: in_progress
+status: done
 type: feature
 scope: stt-server/crates/runtime/tests/, crates/runtime/src/conformance.rs (new), crates/cli/src/commands.rs (stt verify, stt bench), test audio fixtures
-attempt: 1
+attempt: 2
 max_attempts: 5
-last_result: partial
-next_action: |
-  Core general suite, stt verify, and stt bench all complete and verified against both real
-  engines. Remaining: (1) the engine-specific layer (item 2 in Scope) was not built -- no faster-
-  whisper GPU/compute-type or sherpa-onnx batching tests exist yet, separate from the general suite.
-  (2) CI wiring (item 6) is partial: the general suite runs automatically as part of `cargo test
-  --workspace` in ci.yml's existing `rust` job, but that job never builds sherpad, so sherpa-onnx
-  will SKIP in CI (loudly, correctly) until the `rust` job either builds sherpad itself or downloads
-  the artifact the separate `sherpad` CI job (from make-sherpad-protocol-conformant) produces.
-  faster-whisper's own checks do run for real in CI already, since ci.yml already sets up its venv.
+last_result: passed
+next_action: null
 success_criteria:
   - A general conformance suite asserts protocol compliance and lifecycle behaviour identically for every engine in the provider registry, with no per-engine test code.
   - Adding a new engine to the registry automatically subjects it to the full general suite without writing new tests.
@@ -201,6 +193,53 @@ report -- deliberately narrow, not a general-purpose WAV reader.
 **Not built**: the engine-specific test layer (item 2) and full CI wiring for sherpa-onnx (item 6) --
 see next_action.
 
+### Attempt 2 (2026-09-14)
+
+Closed both remaining items from Attempt 1.
+
+**Engine-specific layer** (item 2): extracted the shared runtime-discovery helper out of
+`protocol_conformance.rs` into `crates/runtime/tests/support/mod.rs` (reused, not duplicated, by the
+new files) and added:
+- `crates/runtime/tests/faster_whisper_specific.rs`: non-default CPU compute type (`float32`) honored
+  end to end via `GET /v1/config`; GPU device variant (skips loudly via `hardware::detect()` when no
+  NVIDIA GPU is present, never requires one); `/v1/admin/model` hot-swap via
+  `RuntimeManager::switch_model`, asserting the live instance actually serves the swapped-in model.
+- `crates/runtime/tests/sherpa_onnx_specific.rs`: fires several transcription requests concurrently
+  (within `recognizer.rs`'s batching window) and asserts every response is correctly correlated to its
+  own caller -- the real risk in the batch/demux code path a sequential test can't catch.
+
+Neither file gates an engine lacking that capability; neither is called from `check_all()`.
+
+**Real finding while writing these**: the hot-swap test failed for real on first run with `401
+Unauthorized` -- `RuntimeManager::switch_model` (`crates/runtime/src/manager.rs`) was POSTing to a
+running instance's own `/v1/admin/model` without the instance's auth token, a genuine bug that would
+break hot-swap on any auth-enabled deployment. Fixed by threading the running instance's
+`auth_token` through and calling `.bearer_auth(&auth_token)`. Separately, the *existing*
+`faster_whisper_integration.rs` test was failing before this attempt touched anything -- its direct
+`reqwest::get(&health_url)` call had no bearer token, which broke once (a previous session's)
+`fix-faster-whisper-auth-enforcement` landed real enforcement. Fixed the same way. Both were regressions
+this attempt caught and fixed, not something reintroduced by this attempt's own changes.
+
+**CI wiring** (item 6): `.github/workflows/ci.yml`'s `sherpad` job now uploads its built binary
+(`actions/upload-artifact@v4`, named `sherpad-${{ matrix.os }}`); the `rust` job now declares
+`needs: sherpad` and downloads that artifact into `runtimes/sherpa-onnx/target/release/` (chmod +x on
+non-Windows) before running tests -- exactly the path `support::point_at_locally_built_runtimes()`
+already points `STT_SHERPA_ONNX_RUNTIME_DIR` at, so no test code needed to change. Trade-off recorded
+openly: `rust` no longer runs in parallel with `sherpad`, which was judged worth it over building
+sherpad a second time inside the `rust` job (the reason that job was split out in the first place).
+This workflow-file change has been exercised locally only (the two jobs' logic reasoned through and
+cross-checked against `support::point_at_locally_built_runtimes()`'s expected path) -- it has not yet
+been proven by an actual GitHub Actions run, since that requires a real push. Flagged, not hidden.
+
+**`stt bench` durability**, requested by the user mid-session (out of this goal's original scope but
+directly extending it, and something the user separately confirmed should stay small rather than grow
+into a benchmarking platform -- "if we need to expand on proper benchmarking, I would suggest creating
+a new goal"): each run now prints and records a one-line system-info header (OS/arch/core count via
+`std::env::consts` and `std::thread::available_parallelism` -- no new dependency) and appends results
+to a timestamped file under `bench-results/` (gitignored) instead of only stdout, so repeated runs on
+the same or different machines accumulate a comparable history. Verified by running it twice against
+the fixture clip and confirming two files accumulated, each carrying the header.
+
 ## Do Not Repeat
 
 None yet.
@@ -219,17 +258,33 @@ None yet.
 - 2026-09-09 — `stt bench --audio crates/runtime/tests/fixtures --provider sherpa-onnx`: Parakeet RTF
   0.075. `--provider faster-whisper --model Systran/faster-whisper-small`: RTF 0.458. Both consistent
   with `validate-parakeet-performance`'s independently-gathered numbers.
+- 2026-09-14 — `cargo test -p stt-runtime --tests --no-fail-fast`: all 4 integration test binaries
+  (76 unit tests + `faster_whisper_integration`, the two new `*_specific.rs` files, and
+  `protocol_conformance`) pass for real against this machine's actual installed faster-whisper and
+  sherpa-onnx engines -- nothing skipped. `cargo fmt --check` and
+  `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- 2026-09-14 — `stt bench --audio crates/runtime/tests/fixtures --provider sherpa-onnx` run twice:
+  confirmed the new system-info header prints/records correctly and two separate timestamped files
+  accumulate under `bench-results/`.
+- 2026-09-14 — CI YAML change (`sherpad` upload-artifact / `rust` download-artifact) reasoned through
+  and cross-checked against test code's expected path, but **not yet exercised by a real GitHub
+  Actions run** -- confirm on the next push/PR.
 
 ## Final Outcome
 
-**General suite, `stt verify`, `stt bench`, and fixtures complete and verified against both real
-engines; engine-specific layer and full CI wiring for the second engine remain.** The core acceptance
-criteria that matter most -- a shared, engine-agnostic suite with zero per-engine branching that both
-existing engines actually pass (with one honestly-tracked, named exception) -- are met and proven,
-including having caught a real bug neither prior manual testing nor code review found.
+**All six acceptance criteria met.** General suite, `stt verify`, `stt bench` (plus its new
+system-info-header/results-history durability), fixtures, the engine-specific layer, and CI wiring for
+sherpa-onnx are all in place and verified locally against both real engines -- with zero
+`if provider == "..."` branches anywhere in the general or engine-specific test code. This attempt also
+caught and fixed a real, previously-undetected auth bug in `RuntimeManager::switch_model` (hot-swap
+silently failed under auth) and repaired a pre-existing test regression from an unrelated auth-enforcement
+fix landing earlier. The one honestly-tracked gap: the CI workflow change itself has not yet been proven
+by an actual GitHub Actions run (requires a push), only reasoned through locally against the same
+discovery path the test code already uses.
 
 ## Ready For Execution
 
-- Status: in_progress
-- Reason: Core functionality lands and works; the two remaining items (engine-specific test layer,
-  full CI coverage for sherpa-onnx) are additive, not blocking anything else in this session's chain.
+- Status: done
+- Reason: All acceptance criteria met and verified locally against both real engines. The CI workflow
+  change is implemented and internally consistent with existing test-discovery paths but awaits
+  confirmation from a real Actions run on the next push -- noted above, not hidden.

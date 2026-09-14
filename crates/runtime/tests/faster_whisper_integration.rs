@@ -144,8 +144,19 @@ async fn real_faster_whisper_runtime_starts_and_serves_health() {
     // start() already blocked on GET /health via the supervisor; re-confirm
     // directly against the descriptor's own base_url as an end-to-end check
     // that the descriptor is actually usable, not just internally consistent.
+    // Every instance carries a non-empty auth token (see `descriptor_for` in
+    // manager.rs) and the sidecar now actually enforces it end to end, so
+    // this direct check must present it too, same as a real caller would.
     let health_url = format!("{}/health", descriptor.base_url);
-    let response = reqwest::get(&health_url)
+    let bearer = descriptor
+        .auth
+        .as_ref()
+        .map(|a| a.value.clone())
+        .unwrap_or_default();
+    let response = reqwest::Client::new()
+        .get(&health_url)
+        .bearer_auth(&bearer)
+        .send()
         .await
         .expect("health endpoint should be reachable at the descriptor's base_url");
     assert!(response.status().is_success());

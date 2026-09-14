@@ -14,63 +14,16 @@
 //! of `cargo test`.
 //!
 //! Engine-specific behaviour (faster-whisper's GPU variant/compute types,
-//! its `/v1/admin/model` hot-swap; sherpa-onnx's request batching) belongs
-//! in a separate engine-specific test file, not here.
-
-use std::path::PathBuf;
+//! its `/v1/admin/model` hot-swap; sherpa-onnx's request batching) lives in
+//! `faster_whisper_specific.rs` / `sherpa_onnx_specific.rs`, not here.
 
 use stt_runtime::conformance::{check_all, ConformanceOutcome};
 
-/// `cargo test`'s working directory is not reliable for the runtime
-/// adapters' own cwd-relative dev-discovery candidates (they're written for
-/// `cargo run`'s cwd, not `cargo test`'s) -- mirrors
-/// `faster_whisper_integration.rs::workspace_root`'s existing fix for the
-/// same issue: compute the real workspace root via `CARGO_MANIFEST_DIR`
-/// instead of trusting the process cwd.
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf()
-}
-
-/// Points each engine's dev-binary env-var override at its real location so
-/// `register_local_installs()` can find what's already built in this
-/// environment, regardless of `cargo test`'s actual cwd.
-///
-/// # Safety contract (process-wide env mutation)
-/// Mutates process-wide env vars. Safe here: this is the only test in this
-/// binary that reads these two vars, and this file has exactly one test
-/// function (no other test in this file to race with).
-fn point_at_locally_built_runtimes() {
-    let root = workspace_root();
-    let faster_whisper_venv_bin = if cfg!(windows) {
-        root.join("runtimes/faster-whisper/venv/Scripts")
-    } else {
-        root.join("runtimes/faster-whisper/venv/bin")
-    };
-    let existing = std::env::var_os("PATH").unwrap_or_default();
-    let new_path = std::env::join_paths(
-        std::iter::once(faster_whisper_venv_bin).chain(std::env::split_paths(&existing)),
-    )
-    .expect("venv and existing PATH entries should form a valid PATH");
-
-    let sherpa_onnx_bin_dir = root.join("runtimes/sherpa-onnx/target/release");
-    let faster_whisper_dir = root.join("runtimes/faster-whisper");
-
-    // SAFETY: see function doc comment above.
-    unsafe {
-        std::env::set_var("PATH", new_path);
-        std::env::set_var("STT_FASTER_WHISPER_RUNTIME_DIR", &faster_whisper_dir);
-        std::env::set_var("STT_SHERPA_ONNX_RUNTIME_DIR", &sherpa_onnx_bin_dir);
-    }
-}
+mod support;
 
 #[tokio::test]
 async fn every_registered_provider_conforms_to_the_local_provider_protocol() {
-    point_at_locally_built_runtimes();
+    support::point_at_locally_built_runtimes();
 
     for (provider_id, outcome) in check_all().await {
         match outcome {

@@ -34,6 +34,7 @@ models/
 
 # Test artifacts
 test-results/
+bench-results/
 
 # Vendored managed-runtime Python source (runtimes/*/): bytecode cache,
 # local virtualenvs, and PyInstaller build output, not the vendored source
