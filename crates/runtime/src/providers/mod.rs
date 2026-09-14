@@ -21,7 +21,12 @@ pub trait ProviderEngine: Send + Sync {
         variant: &str,
         on_progress: ProgressCallback,
     ) -> Result<LaunchBuilder, RuntimeError>;
-    async fn download_model(&self, model_id: &str, output_dir: &Path) -> Result<(), RuntimeError>;
+    async fn download_model(
+        &self,
+        model_id: &str,
+        output_dir: &Path,
+        on_progress: ProgressCallback,
+    ) -> Result<(), RuntimeError>;
     fn verify_cached_model(&self, model_id: &str) -> Result<Option<u64>, RuntimeError>;
 }
 

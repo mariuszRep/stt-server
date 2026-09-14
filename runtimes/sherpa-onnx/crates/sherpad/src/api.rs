@@ -372,11 +372,17 @@ pub async fn transcribe(
         ..Default::default()
     };
 
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?
-    {
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        // `MultipartError`'s `Display` is the same fixed string
+        // ("Error parsing `multipart/form-data` request") for every failure
+        // mode -- body-limit overflow, bad boundary, truncated stream. The
+        // actual cause only shows up via `source()`, so surface both.
+        use std::error::Error as _;
+        ApiError::BadRequest(match e.source() {
+            Some(source) => format!("{e}: {source}"),
+            None => e.to_string(),
+        })
+    })? {
         let name = field.name().unwrap_or("").to_string();
         match name.as_str() {
             "file" => {

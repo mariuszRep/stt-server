@@ -559,11 +559,26 @@ impl RuntimeManager {
         let op_id = operation_id.clone();
         tokio::spawn(async move {
             let output_dir = providers::cache::model_dir(id_owned.as_str(), &model_id_owned);
+            let manager_for_progress = Arc::clone(&manager);
+            let progress_op_id = op_id.clone();
             let result = manager
                 .engines
                 .get(id_owned.as_str())
                 .expect("catalog provider must have a registered engine")
-                .download_model(&model_id_owned, &output_dir)
+                .download_model(
+                    &model_id_owned,
+                    &output_dir,
+                    Box::new(move |progress| {
+                        let mut installs = manager_for_progress
+                            .installs
+                            .lock()
+                            .expect("installs mutex poisoned");
+                        if let Some(state) = installs.get_mut(&progress_op_id) {
+                            state.downloaded_bytes = progress.downloaded_bytes;
+                            state.total_bytes = progress.total_bytes;
+                        }
+                    }),
+                )
                 .await;
             match result {
                 Ok(()) => {

@@ -6,12 +6,23 @@ mod state;
 
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
 use axum::middleware;
 use axum::routing::{delete, get, post};
 use axum::Router;
 use tower_http::cors::CorsLayer;
 
 use state::AppState;
+
+// axum's `Multipart` extractor defaults to a hard 2MB request-body cap when
+// no `DefaultBodyLimit` layer is configured. That's well under a minute of
+// real dictation audio (16kHz mono 16-bit PCM alone is ~32KB/s, and browser
+// MediaRecorder webm/opus can still land well past 2MB for longer clips),
+// so uploads were silently rejected mid-stream with axum's generic
+// "Error parsing `multipart/form-data` request" -- the same message for
+// every Multipart failure regardless of cause. 100MB comfortably covers any
+// realistic single dictation.
+const MAX_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -117,6 +128,7 @@ async fn main() -> anyhow::Result<()> {
             state.clone(),
             api::require_auth,
         ))
+        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .with_state(state);
 
     let addr = format!("{host}:{port}");

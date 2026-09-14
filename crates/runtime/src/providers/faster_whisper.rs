@@ -353,7 +353,18 @@ fn resolve_download_runtime() -> Option<(PathBuf, Vec<String>, PathBuf)> {
 /// clean error is returned rather than attempting to auto-install one
 /// (auto-installing a variant just to pull a model would be a surprising
 /// side effect of what's meant to be an explicit, curated action).
-pub async fn download_model(model_id: &str, output_dir: &Path) -> Result<(), RuntimeError> {
+/// Unlike sherpa-onnx's direct HTTP stream, this shells out to a subprocess
+/// (`download-model`) and only observes its exit status — no chunk-level
+/// byte progress is available to report here. `on_progress` is accepted to
+/// satisfy `ProviderEngine`'s shared signature but deliberately unused;
+/// faking incremental progress would be worse than reporting none. See
+/// `ProviderEngine::download_model`'s doc comment for the follow-up (parsing
+/// the subprocess's own stdout) if this needs real progress later.
+pub async fn download_model(
+    model_id: &str,
+    output_dir: &Path,
+    _on_progress: ProgressCallback,
+) -> Result<(), RuntimeError> {
     let (program, mut args, cwd) = resolve_download_runtime().ok_or_else(|| {
         RuntimeError::ProviderNotInstalled(
             "no local faster-whisper runtime found — install a provider variant first \
@@ -430,8 +441,13 @@ impl ProviderEngine for FasterWhisper {
         download_variant(variant, on_progress).await
     }
 
-    async fn download_model(&self, model_id: &str, output_dir: &Path) -> Result<(), RuntimeError> {
-        download_model(model_id, output_dir).await
+    async fn download_model(
+        &self,
+        model_id: &str,
+        output_dir: &Path,
+        on_progress: ProgressCallback,
+    ) -> Result<(), RuntimeError> {
+        download_model(model_id, output_dir, on_progress).await
     }
 
     fn verify_cached_model(&self, model_id: &str) -> Result<Option<u64>, RuntimeError> {

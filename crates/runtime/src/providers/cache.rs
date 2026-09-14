@@ -153,6 +153,20 @@ pub async fn download_to_cache(
     #[cfg(not(unix))]
     let _ = make_executable;
 
+    // On Windows, renaming onto a destination that's currently executing
+    // (e.g. this same binary already running as a provider process) fails
+    // with "Access is denied" (os error 5) — unlike Unix, where replacing a
+    // running executable's inode is legal. If the file we just downloaded is
+    // byte-identical to what's already there, there's nothing to swap: drop
+    // the redundant `.part` copy and treat the existing file as the result,
+    // instead of trying (and failing) to overwrite a locked file.
+    if let Ok(existing_len) = tokio::fs::metadata(&dest).await.map(|m| m.len()) {
+        if existing_len == downloaded_bytes {
+            let _ = tokio::fs::remove_file(&partial).await;
+            return Ok(dest);
+        }
+    }
+
     tokio::fs::rename(&partial, &dest)
         .await
         .map_err(RuntimeError::Io)?;

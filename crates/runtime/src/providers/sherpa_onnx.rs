@@ -197,7 +197,11 @@ pub async fn download_variant(
 /// runtime as a precondition -- it's a plain HTTP GET, proving the trait
 /// genuinely doesn't presuppose faster-whisper's "spawn the runtime itself
 /// to fetch its own model" shape.
-pub async fn download_model(model_id: &str, output_dir: &Path) -> Result<(), RuntimeError> {
+pub async fn download_model(
+    model_id: &str,
+    output_dir: &Path,
+    on_progress: ProgressCallback,
+) -> Result<(), RuntimeError> {
     let entry = sherpa_manifest::find(model_id).ok_or_else(|| {
         RuntimeError::DownloadFailed(format!("unknown sherpa-onnx model id: {model_id}"))
     })?;
@@ -218,7 +222,7 @@ pub async fn download_model(model_id: &str, output_dir: &Path) -> Result<(), Run
         &parent,
         &archive_name,
         false,
-        Box::new(|_progress| {}),
+        on_progress,
     )
     .await?;
 
@@ -294,8 +298,13 @@ impl ProviderEngine for SherpaOnnx {
         download_variant(on_progress).await
     }
 
-    async fn download_model(&self, model_id: &str, output_dir: &Path) -> Result<(), RuntimeError> {
-        download_model(model_id, output_dir).await
+    async fn download_model(
+        &self,
+        model_id: &str,
+        output_dir: &Path,
+        on_progress: ProgressCallback,
+    ) -> Result<(), RuntimeError> {
+        download_model(model_id, output_dir, on_progress).await
     }
 
     fn verify_cached_model(&self, model_id: &str) -> Result<Option<u64>, RuntimeError> {
