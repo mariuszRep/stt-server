@@ -1,8 +1,13 @@
-name: Release
+name: Server Candidate
+
+# Manually dispatchable validation build only. Builds the same three
+# artifacts as release.yml (stt control plane, faster-whisper sidecar,
+# sherpad) and uploads them as Actions artifacts for manual download/install
+# per RELEASE_PROCESS.md gate 3. Does NOT create a GitHub Release and has no
+# `contents: write` permission — structurally incapable of publishing.
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
 
 jobs:
   build-binaries:
@@ -35,20 +40,6 @@ jobs:
           name: ${{ matrix.asset }}
           path: dist/${{ matrix.asset }}
 
-  # Builds the managed faster-whisper runtime as a standalone PyInstaller
-  # binary, reusing whisper-vibes/.github/workflows/desktop-build.yml's
-  # VOICE_TYPER_BUILD_VARIANT pattern. GPU (bundled CUDA/cuDNN DLLs, much
-  # larger) is Windows-only — CUDA acceleration only matters for the
-  # Windows Tauri consumer; the CPU variant covers Linux/dev use.
-  #
-  # PyInstaller's spec always names its output `voice-typer-backend[.exe]`
-  # regardless of variant, so without renaming, the cpu and gpu legs on the
-  # same OS would upload two files with an identical name and collide. Each
-  # leg renames its output to `stt-runtime`'s own
-  # `faster-whisper-runtime-{os}-{variant}{ext}` convention
-  # (`crates/runtime/src/providers/faster_whisper.rs::asset_name`) before
-  # upload, which is also the exact filename `download_variant` requests at
-  # install time — this naming is a contract between the two, not cosmetic.
   build-faster-whisper-sidecar:
     strategy:
       matrix:
@@ -99,18 +90,6 @@ jobs:
           name: faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}
           path: runtimes/faster-whisper/dist/faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}${{ matrix.ext }}
 
-  # Builds the sherpa-onnx managed runtime (sherpad) as a standalone binary.
-  # Upstream k2-fsa/sherpa-onnx ships no server conforming to this project's
-  # local provider protocol (only demo binaries and its own bespoke
-  # WebSocket-server protocol — verified directly against its releases, see
-  # generalize-provider-engine-installation's goal notes), so — like
-  # faster-whisper — stt-server builds and hosts this binary itself rather
-  # than fetching a ready-made one from sherpa-onnx's own releases. CPU-only
-  # today (sherpad links a CPU-only onnxruntime build; GPU is a separate
-  # future goal), so there is only one variant per OS, unlike
-  # faster-whisper's cpu/gpu split. The asset name
-  # (`sherpad-{os}-cpu{ext}`) is the exact contract
-  # add-sherpa-onnx-provider's `download_variant` resolves against.
   build-sherpad:
     strategy:
       matrix:
@@ -144,46 +123,3 @@ jobs:
         with:
           name: sherpad-${{ matrix.os_slug }}-cpu
           path: runtimes/sherpa-onnx/dist/sherpad-${{ matrix.os_slug }}-cpu${{ matrix.ext }}
-
-  release:
-    needs: [build-binaries, build-faster-whisper-sidecar, build-sherpad]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-      - name: Create release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "${{ github.ref_name }}" \
-            --title "${{ github.ref_name }}" \
-            --notes "protocolVersion: 1, schemaVersion: 1 (RuntimeConnectionDescriptor). See CONVENTIONS.md/VISION.md for compatibility guarantees." \
-            artifacts/*/*
-
-  # Gated: @open-vibe-ai/stt-sdk does have a real npm publish pipeline
-  # (stt-sdk/.github/workflows/release.yml, OIDC trusted publishing), but
-  # there is no confirmed-consumable published version yet — stt-sdk's
-  # source version and its actual npm-published version have drifted (see
-  # RELEASE_PROCESS.md's SDK version-drift checklist item; check with
-  # `node scripts/release-status.mjs` from the voice-typer workspace root).
-  # This job is real — not a placeholder — but is intentionally left
-  # unreachable (`if: false` below) rather than silently skipped, so it's
-  # obvious the requirement isn't satisfied yet rather than looking like it
-  # passed. Flip `if: false` once the SDK version drift is resolved and pin
-  # @open-vibe-ai/stt-sdk@<version> below.
-  sdk-compatibility:
-    if: false
-    needs: [build-faster-whisper-sidecar]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-      - run: npm install @open-vibe-ai/stt-sdk # pin an exact version once published
-      - run: |
-          echo "TODO: start a managed runtime and run stt-sdk's protocol fixtures against its descriptor"
