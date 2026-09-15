@@ -170,26 +170,67 @@ jobs:
             --notes "protocolVersion: 1, schemaVersion: 1 (RuntimeConnectionDescriptor). See CONVENTIONS.md/VISION.md for compatibility guarantees." \
             artifacts/*/*
 
-  # Gated: @open-vibe-ai/stt-sdk does have a real npm publish pipeline
-  # (stt-sdk/.github/workflows/release.yml, OIDC trusted publishing), but
-  # there is no confirmed-consumable published version yet — stt-sdk's
-  # source version and its actual npm-published version have drifted (see
-  # RELEASE_PROCESS.md's SDK version-drift checklist item; check with
-  # `node scripts/release-status.mjs` from the voice-typer workspace root).
-  # This job is real — not a placeholder — but is intentionally left
-  # unreachable (`if: false` below) rather than silently skipped, so it's
-  # obvious the requirement isn't satisfied yet rather than looking like it
-  # passed. Flip `if: false` once the SDK version drift is resolved and pin
-  # @open-vibe-ai/stt-sdk@<version> below.
+  # split-current-functionality-into-three-components's Scope 7 / AC8-9: proves
+  # the latest *published* @open-vibe-ai/stt-sdk actually works against *this*
+  # release's faster-whisper runtime, using only installed/downloaded
+  # artifacts -- no sibling repository checkout or build on either side. Runs
+  # after `release` (not just `build-faster-whisper-sidecar`) specifically so
+  # it downloads the real released asset via `gh release download`, the same
+  # way an external consumer would get it, rather than reusing this run's own
+  # workflow-artifact upload.
   sdk-compatibility:
-    if: false
-    needs: [build-faster-whisper-sidecar]
+    needs: [release]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - run: npm install @open-vibe-ai/stt-sdk # pin an exact version once published
-      - run: |
-          echo "TODO: start a managed runtime and run stt-sdk's protocol fixtures against its descriptor"
+
+      # Always the current npm "latest" dist-tag, not a hardcoded version --
+      # this check's entire point is "does the SDK version consumers are
+      # actually installing right now still work with this new server
+      # release", which goes stale immediately if pinned to whatever version
+      # existed when this job was last edited.
+      - name: Install the latest published stt-sdk
+        run: |
+          mkdir -p /tmp/sdk-compat
+          cd /tmp/sdk-compat
+          npm init -y >/dev/null
+          npm install @open-vibe-ai/stt-sdk@latest
+
+      - name: Download the real released faster-whisper runtime
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --pattern 'faster-whisper-runtime-linux-cpu' \
+            --dir /tmp/fw-runtime
+          chmod +x /tmp/fw-runtime/faster-whisper-runtime-linux-cpu
+
+      - name: Start the released runtime
+        env:
+          VOICE_TYPER_HOST: 127.0.0.1
+          VOICE_TYPER_PORT: "8123"
+          VOICE_TYPER_MODEL: "Systran/faster-whisper-tiny"
+          VOICE_TYPER_AUTH_TOKEN: "compat-check-token"
+        run: |
+          /tmp/fw-runtime/faster-whisper-runtime-linux-cpu &
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8123/health || true)
+            if [ "$code" = "200" ] || [ "$code" = "401" ]; then
+              echo "runtime responding after ${i}0s"; exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::faster-whisper runtime never became healthy"; exit 1
+
+      - name: Run compatibility checks
+        env:
+          COMPAT_BASE_URL: "http://127.0.0.1:8123"
+          COMPAT_TOKEN: "compat-check-token"
+          COMPAT_SERVER_TAG: ${{ github.ref_name }}
+          COMPAT_FIXTURE_WAV: ${{ github.workspace }}/crates/runtime/tests/fixtures/sample.wav
+          COMPAT_SDK_INSTALL_DIR: /tmp/sdk-compat
+        run: node scripts/sdk-compat-check.mjs
