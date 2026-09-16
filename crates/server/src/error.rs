@@ -17,9 +17,9 @@ pub fn runtime_error_response(err: RuntimeError) -> ApiError {
         RuntimeError::ProviderNotFound(_) | RuntimeError::InstallOperationNotFound(_) => {
             StatusCode::NOT_FOUND
         }
-        RuntimeError::ProviderNotInstalled(_) | RuntimeError::RuntimeNotRunning(_) => {
-            StatusCode::CONFLICT
-        }
+        RuntimeError::ProviderNotInstalled(_)
+        | RuntimeError::ModelNotInstalled(_)
+        | RuntimeError::RuntimeNotRunning(_) => StatusCode::CONFLICT,
         RuntimeError::RuntimeStartFailed(_)
         | RuntimeError::Io(_)
         | RuntimeError::DownloadFailed(_)
@@ -31,6 +31,7 @@ pub fn runtime_error_response(err: RuntimeError) -> ApiError {
         RuntimeError::ModelNotFound(_) => "MODEL_NOT_FOUND",
         RuntimeError::ProviderNotFound(_) => "PROVIDER_NOT_FOUND",
         RuntimeError::ProviderNotInstalled(_) => "PROVIDER_NOT_INSTALLED",
+        RuntimeError::ModelNotInstalled(_) => "MODEL_NOT_INSTALLED",
         RuntimeError::RuntimeNotRunning(_) => "RUNTIME_NOT_RUNNING",
         RuntimeError::RuntimeStartFailed(_) => "RUNTIME_START_FAILED",
         RuntimeError::Io(_) => "IO_ERROR",

@@ -28,6 +28,11 @@ pub trait ProviderEngine: Send + Sync {
         on_progress: ProgressCallback,
     ) -> Result<(), RuntimeError>;
     fn verify_cached_model(&self, model_id: &str) -> Result<Option<u64>, RuntimeError>;
+    /// Whether the runtime can only serve a model that was pulled before it
+    /// started. `false` for engines that fetch their model on first load.
+    fn requires_pulled_model(&self) -> bool {
+        false
+    }
 }
 
 pub fn registry() -> HashMap<String, Box<dyn ProviderEngine>> {

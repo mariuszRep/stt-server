@@ -97,13 +97,32 @@ mod auth_tests {
     }
 }
 
+/// Whether the model this instance was launched to serve is in memory. An
+/// instance with no default model has nothing to load, so it counts as ready.
+async fn default_model_loaded(state: &AppState) -> bool {
+    match &state.default_model {
+        Some(id) => matches!(
+            state.registry.read().await.get(id),
+            Some(ModelState::Loaded { .. })
+        ),
+        None => true,
+    }
+}
+
 /// `GET /health` -- required by the Local Provider Protocol; polled by
 /// `stt-server`'s `supervisor::spawn` to decide the runtime has come up.
-pub async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    Json(json!({
-        "status": "ok",
-        "model": state.default_model.clone().unwrap_or_default(),
-    }))
+/// Answers 503 while the launched model isn't loaded, so "healthy" always
+/// means "can transcribe" rather than just "the process is up".
+pub async fn health(State(state): State<Arc<AppState>>) -> Response {
+    let model = state.default_model.clone().unwrap_or_default();
+    if default_model_loaded(&state).await {
+        return Json(json!({ "status": "ok", "model": model })).into_response();
+    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "status": "model_not_loaded", "model": model })),
+    )
+        .into_response()
 }
 
 /// `GET /v1/config` -- required by the Local Provider Protocol.
@@ -115,6 +134,7 @@ pub async fn config(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
     Json(json!({
         "schema_version": 1,
         "model": state.default_model.clone().unwrap_or_default(),
+        "model_loaded": state.default_model.is_some() && default_model_loaded(&state).await,
     }))
 }
 

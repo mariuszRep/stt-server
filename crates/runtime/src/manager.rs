@@ -818,6 +818,17 @@ impl RuntimeManager {
             (entry.launch)(port, &auth_token, selected_model.as_deref(), options)
         };
 
+        // A runtime launched without its model still answers health checks,
+        // so it would look ready and then reject every transcription.
+        if let Some(model_id) = selected_model.as_deref() {
+            let engine = self.engine(id)?;
+            if engine.requires_pulled_model() && engine.verify_cached_model(model_id)?.is_none() {
+                return Err(RuntimeError::ModelNotInstalled(format!(
+                    "{id}/{model_id} is not downloaded; pull it before starting the provider"
+                )));
+            }
+        }
+
         let instance = supervisor::spawn(
             SpawnSpec {
                 program: launch.program,
@@ -1027,7 +1038,7 @@ async fn fetch_streaming_capability(port: u16, auth_token: &str) -> Option<Strea
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::faster_whisper;
+    use crate::providers::{faster_whisper, sherpa_onnx};
 
     /// `python -m venv` only creates `Scripts\python.exe` on Windows — no
     /// `python3.exe` — matching `providers::faster_whisper::python_candidates`'s
@@ -1340,6 +1351,42 @@ http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
             manager.selected_model(&id).await,
             Some("Systran/faster-whisper-tiny".to_string())
         );
+    }
+
+    #[tokio::test]
+    // Same env-lock-across-await reasoning as the model pull tests below.
+    #[allow(clippy::await_holding_lock)]
+    async fn start_refuses_a_selected_model_that_was_never_pulled() {
+        let _guard = faster_whisper::lock_env_test();
+        let root =
+            std::env::temp_dir().join(format!("stt-start-model-missing-test-{}", Uuid::new_v4()));
+        // SAFETY: test-only env var mutation, scoped to this single test.
+        unsafe {
+            std::env::set_var(sherpa_onnx::MODEL_CACHE_DIR_ENV_VAR, &root);
+        }
+        let manager = RuntimeManager::new(None);
+        let id = ProviderId::new("sherpa-onnx").unwrap();
+        manager
+            .register_install(&id, RuntimeVariant::Cpu, fake_launch())
+            .await;
+        manager
+            .select_model(&id, "parakeet-tdt-0.6b-v2")
+            .await
+            .unwrap();
+
+        let result = manager.start(&id, &StartOptions::default()).await;
+        let status = manager.status(&id).await;
+
+        unsafe {
+            std::env::remove_var(sherpa_onnx::MODEL_CACHE_DIR_ENV_VAR);
+        }
+        std::fs::remove_dir_all(&root).ok();
+        assert!(
+            matches!(result, Err(RuntimeError::ModelNotInstalled(_))),
+            "expected ModelNotInstalled, got {:?}",
+            result.map(|d| d.base_url)
+        );
+        assert_eq!(status, RuntimeStatus::Stopped);
     }
 
     #[tokio::test]
