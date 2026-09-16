@@ -362,6 +362,9 @@ struct TranscribeParams {
     want_word_timestamps: bool,
 }
 
+/// Shortest audio sent to the model; see the guard in [`transcribe`].
+pub const MIN_AUDIO_SECS: f64 = 0.25;
+
 pub async fn transcribe(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
@@ -452,7 +455,25 @@ pub async fn transcribe(
             .map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))?
             .map_err(|e| ApiError::BadRequest(format!("could not decode 'file': {e}")))?,
     };
+    if sample_rate <= 0 {
+        return Err(ApiError::BadRequest(
+            "could not decode 'file': invalid sample rate".into(),
+        ));
+    }
     let duration_secs = samples.len() as f64 / sample_rate as f64;
+
+    // Too little audio yields zero encoder frames, and ONNX Runtime then throws
+    // a C++ exception ("Invalid input shape: {0,128}") that Rust cannot catch:
+    // the whole process aborts, taking every other queued request with it.
+    // Nothing that short holds a word, so answer with an empty transcript.
+    if duration_secs < MIN_AUDIO_SECS {
+        return build_response(
+            &params,
+            &model_id,
+            TranscribeResponse::default(),
+            duration_secs,
+        );
+    }
 
     let jobs = get_worker(&state, &model_id).await?;
     let (tx, rx) = tokio::sync::oneshot::channel();
