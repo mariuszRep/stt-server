@@ -110,6 +110,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: runtimes/sherpa-onnx
+          # sherpa-onnx-sys downloads its prebuilt libs into target/sherpa-onnx-prebuilt,
+          # which rust-cache would otherwise prune while keeping the build-script
+          # output -- a cache hit then skips the download and fails to link
+          # `sherpa-onnx-c-api`. The key suffix retires caches saved without it.
+          key: sherpa-prebuilt-v1
+          cache-directories: runtimes/sherpa-onnx/target/sherpa-onnx-prebuilt
       - run: cargo build --release --bin sherpad
       - name: Rename to the sherpad-{os}-cpu release-asset convention
         shell: bash
