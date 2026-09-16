@@ -128,6 +128,40 @@ async fn truncated_real_webm_opus_returns_400_not_a_crash() {
     );
 }
 
+/// A mono 16-bit PCM WAV of `samples` silent samples.
+fn silent_wav(sample_rate: u32, samples: u32) -> Vec<u8> {
+    let data_len = samples * 2;
+    let mut wav = Vec::with_capacity(44 + data_len as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.resize(44 + data_len as usize, 0);
+    wav
+}
+
+#[tokio::test]
+async fn too_short_audio_returns_empty_text_without_touching_the_model() {
+    // Regression: a few milliseconds of audio (one quick hotkey tap) produced
+    // zero encoder frames and aborted the whole process. The model is not
+    // installed here, so reaching it would fail the request instead of 200.
+    for samples in [0, 128, 2_000] {
+        let state = test_state(Some("parakeet-tdt-0.6b-v2"));
+        let wav = silent_wav(48_000, samples);
+        let (status, json) = post_transcribe(state, &[("file", Some("tap.wav"), &wav)]).await;
+        assert_eq!(status, StatusCode::OK, "{samples} samples: {json:?}");
+        assert_eq!(json["text"], "", "{samples} samples: {json:?}");
+    }
+}
+
 #[tokio::test]
 async fn missing_file_field_returns_400() {
     let state = test_state(Some("parakeet-tdt-0.6b-v2"));
