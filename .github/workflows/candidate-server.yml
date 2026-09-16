@@ -104,6 +104,10 @@ jobs:
     defaults:
       run:
         working-directory: runtimes/sherpa-onnx
+    env:
+      # Same as ci.yml/release.yml: audiopus_sys's vendored libopus CMakeLists
+      # predates CMake 3.5, which current runner CMake refuses to configure.
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
