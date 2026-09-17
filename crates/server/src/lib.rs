@@ -71,6 +71,10 @@ pub fn build_router(state: state::AppState) -> Router {
             "/v1/install-operations/:operation_id",
             get(routes::install_operation_status),
         )
+        .route(
+            "/v1/install-operations/:operation_id/cancel",
+            post(routes::cancel_install_operation),
+        )
         .route("/v1/providers/:id/start", post(routes::start_provider))
         .route("/v1/providers/:id/stop", post(routes::stop_provider))
         .route("/v1/providers/:id/status", get(routes::provider_status))

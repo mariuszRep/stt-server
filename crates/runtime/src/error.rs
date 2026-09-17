@@ -36,6 +36,9 @@ pub enum RuntimeError {
     #[error("install operation not found: {0}")]
     InstallOperationNotFound(String),
 
+    #[error("install operation cannot be cancelled: {0}")]
+    OperationNotCancelable(String),
+
     #[error("invalid start options: {0}")]
     InvalidStartOptions(String),
 

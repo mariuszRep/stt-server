@@ -94,6 +94,7 @@ pub enum InstallOperationStatus {
     Downloading,
     Complete,
     Failed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -175,6 +176,14 @@ pub struct RuntimeManager {
     /// sections here are always tiny (a struct field write), never held
     /// across an `.await`.
     installs: StdMutex<HashMap<String, InstallOperationState>>,
+    /// Abort handles for the background `tokio::spawn` task backing each
+    /// still-downloading entry in `installs`, keyed by the same
+    /// `operation_id`. Populated at spawn time, removed once the task
+    /// finishes (`Complete`/`Failed`) or is cancelled. Lets
+    /// [`RuntimeManager::cancel_operation`] stop the in-flight download at
+    /// its next await point without the download logic itself needing to be
+    /// cancellation-aware.
+    install_handles: StdMutex<HashMap<String, tokio::task::AbortHandle>>,
     /// `None` disables idle auto-stop entirely (always-on).
     idle_timeout: Option<Duration>,
 }
@@ -188,6 +197,7 @@ impl RuntimeManager {
             installed: Mutex::new(HashMap::new()),
             selected_models: Mutex::new(HashMap::new()),
             installs: StdMutex::new(HashMap::new()),
+            install_handles: StdMutex::new(HashMap::new()),
             idle_timeout,
         }
     }
@@ -209,6 +219,7 @@ impl RuntimeManager {
             installed: Mutex::new(HashMap::new()),
             selected_models: Mutex::new(HashMap::new()),
             installs: StdMutex::new(HashMap::new()),
+            install_handles: StdMutex::new(HashMap::new()),
             idle_timeout,
         }
     }
@@ -408,7 +419,7 @@ impl RuntimeManager {
         let manager = Arc::clone(self);
         let id_owned = id.clone();
         let op_id = operation_id.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let manager_for_progress = Arc::clone(&manager);
             let progress_op_id = op_id.clone();
             let result = manager
@@ -447,7 +458,16 @@ impl RuntimeManager {
                     }
                 }
             }
+            manager
+                .install_handles
+                .lock()
+                .expect("install_handles mutex poisoned")
+                .remove(&op_id);
         });
+        self.install_handles
+            .lock()
+            .expect("install_handles mutex poisoned")
+            .insert(operation_id.clone(), handle.abort_handle());
 
         Ok(InstallOutcome::Downloading {
             operation_id,
@@ -557,7 +577,7 @@ impl RuntimeManager {
         let id_owned = id.clone();
         let model_id_owned = model_id.to_string();
         let op_id = operation_id.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let output_dir = providers::cache::model_dir(id_owned.as_str(), &model_id_owned);
             let manager_for_progress = Arc::clone(&manager);
             let progress_op_id = op_id.clone();
@@ -596,9 +616,75 @@ impl RuntimeManager {
                     }
                 }
             }
+            manager
+                .install_handles
+                .lock()
+                .expect("install_handles mutex poisoned")
+                .remove(&op_id);
         });
+        self.install_handles
+            .lock()
+            .expect("install_handles mutex poisoned")
+            .insert(operation_id.clone(), handle.abort_handle());
 
         Ok(ModelPullOutcome::Downloading { operation_id })
+    }
+
+    /// Cancel an in-flight install/pull operation: aborts the background
+    /// download task at its next await point and deletes whatever partial
+    /// file the download had written, so a cancelled download never leaves
+    /// a half-downloaded, unusable file mistaken for a complete one by a
+    /// later `verify`. Only valid while the operation is still
+    /// `Downloading` — cancelling an already-`Complete`/`Failed`/`Cancelled`
+    /// operation is rejected rather than silently accepted, since there is
+    /// nothing in flight to stop and the caller's assumption about the
+    /// operation's state is wrong.
+    pub fn cancel_operation(&self, operation_id: &str) -> Result<(), RuntimeError> {
+        let (provider_id, variant, model_id) = {
+            let mut installs = self.installs.lock().expect("installs mutex poisoned");
+            let state = installs
+                .get_mut(operation_id)
+                .ok_or_else(|| RuntimeError::InstallOperationNotFound(operation_id.to_string()))?;
+            if !matches!(state.status, InstallOperationStatus::Downloading) {
+                return Err(RuntimeError::OperationNotCancelable(
+                    operation_id.to_string(),
+                ));
+            }
+            state.status = InstallOperationStatus::Cancelled;
+            (
+                state.provider_id.clone(),
+                state.variant.clone(),
+                state.model_id.clone(),
+            )
+        };
+
+        if let Some(handle) = self
+            .install_handles
+            .lock()
+            .expect("install_handles mutex poisoned")
+            .remove(operation_id)
+        {
+            handle.abort();
+        }
+
+        // Best-effort partial-file cleanup: a variant or model download that
+        // was aborted mid-write may have left an incomplete file on disk.
+        // Errors here are not fatal to cancellation itself (the operation is
+        // already marked `Cancelled` above) — surfaced via `warn!` only, the
+        // same tolerance `uninstall`'s cascade-delete already applies to
+        // per-variant cleanup failures.
+        if let Some(variant) = variant.as_deref() {
+            if let Err(e) = providers::cache::remove_variant(&provider_id, variant) {
+                warn!(provider = %provider_id, variant = %variant, error = %e, "failed to remove partial variant download after cancel");
+            }
+        }
+        if let Some(model_id) = model_id.as_deref() {
+            if let Err(e) = providers::cache::remove_model(&provider_id, model_id) {
+                warn!(provider = %provider_id, model = %model_id, error = %e, "failed to remove partial model download after cancel");
+            }
+        }
+
+        Ok(())
     }
 
     /// Whether `model_id`'s weights are present on disk for `id`, and their
@@ -1770,6 +1856,71 @@ http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
             .install_operation("not-a-real-op-id")
             .await
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_operation_rejects_an_unknown_operation_id() {
+        let manager = RuntimeManager::new(None);
+        let err = manager.cancel_operation("not-a-real-op-id").unwrap_err();
+        assert!(matches!(err, RuntimeError::InstallOperationNotFound(_)));
+    }
+
+    #[tokio::test]
+    // Held across `.await` deliberately: see the identical comment on
+    // `begin_install_returns_installed_immediately_when_the_variant_is_already_cached`.
+    #[allow(clippy::await_holding_lock)]
+    async fn cancel_operation_aborts_an_in_flight_variant_download_and_marks_it_cancelled() {
+        let _guard = faster_whisper::lock_env_test();
+        let unique = std::process::id();
+        let cache_root =
+            std::env::temp_dir().join(format!("stt-manager-cancel-test-cache-{unique}"));
+
+        // Points at a base URL nothing is listening on: `begin_install`
+        // returns before its background task is ever polled (single-thread
+        // `#[tokio::test]` runtime, no `.await` between spawning it and
+        // returning), so `cancel_operation` below aborts it before it makes
+        // any real network attempt — the base URL never needs to work.
+        unsafe {
+            std::env::set_var(
+                faster_whisper::RELEASE_BASE_URL_ENV_VAR,
+                "http://127.0.0.1:1",
+            );
+            std::env::set_var(faster_whisper::RUNTIME_CACHE_DIR_ENV_VAR, &cache_root);
+            std::env::set_var(faster_whisper::RUNTIME_DIR_ENV_VAR, "/nonexistent/for/sure");
+        }
+
+        let manager = Arc::new(RuntimeManager::new(None));
+        let id = ProviderId::new("faster-whisper").unwrap();
+        let outcome = manager
+            .begin_install(&id, Some(RuntimeVariant::Cpu))
+            .await
+            .unwrap();
+        let operation_id = match outcome {
+            InstallOutcome::Downloading { operation_id, .. } => operation_id,
+            InstallOutcome::Installed { .. } => {
+                panic!("expected a fresh cache to require a download")
+            }
+        };
+
+        manager.cancel_operation(&operation_id).unwrap();
+        let state = manager.install_operation(&operation_id).await.unwrap();
+
+        unsafe {
+            std::env::remove_var(faster_whisper::RELEASE_BASE_URL_ENV_VAR);
+            std::env::remove_var(faster_whisper::RUNTIME_CACHE_DIR_ENV_VAR);
+            std::env::remove_var(faster_whisper::RUNTIME_DIR_ENV_VAR);
+        }
+        std::fs::remove_dir_all(&cache_root).ok();
+
+        assert!(
+            matches!(state.status, InstallOperationStatus::Cancelled),
+            "expected Cancelled, got {state:?}"
+        );
+
+        // Cancelling again must be rejected -- the operation already
+        // finished (as Cancelled), so there is nothing left to abort.
+        let err = manager.cancel_operation(&operation_id).unwrap_err();
+        assert!(matches!(err, RuntimeError::OperationNotCancelable(_)));
     }
 
     /// Spins up a local `python3 -m http.server` serving a fake release

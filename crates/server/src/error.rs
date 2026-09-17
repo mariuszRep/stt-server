@@ -19,7 +19,8 @@ pub fn runtime_error_response(err: RuntimeError) -> ApiError {
         }
         RuntimeError::ProviderNotInstalled(_)
         | RuntimeError::ModelNotInstalled(_)
-        | RuntimeError::RuntimeNotRunning(_) => StatusCode::CONFLICT,
+        | RuntimeError::RuntimeNotRunning(_)
+        | RuntimeError::OperationNotCancelable(_) => StatusCode::CONFLICT,
         RuntimeError::RuntimeStartFailed(_)
         | RuntimeError::Io(_)
         | RuntimeError::DownloadFailed(_)
@@ -38,6 +39,7 @@ pub fn runtime_error_response(err: RuntimeError) -> ApiError {
         RuntimeError::DownloadFailed(_) => "DOWNLOAD_FAILED",
         RuntimeError::UnsupportedVariant(_) => "UNSUPPORTED_VARIANT",
         RuntimeError::InstallOperationNotFound(_) => "INSTALL_OPERATION_NOT_FOUND",
+        RuntimeError::OperationNotCancelable(_) => "OPERATION_NOT_CANCELABLE",
         RuntimeError::InvalidStartOptions(_) => "INVALID_START_OPTIONS",
         RuntimeError::ModelSwitchFailed(_) => "MODEL_SWITCH_FAILED",
         RuntimeError::Internal(_) => "INTERNAL_ERROR",

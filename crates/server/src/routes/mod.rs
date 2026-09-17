@@ -10,8 +10,8 @@ pub use models::{
     list_models, pull_model, remove_model, select_model, selected_model, switch_model, verify_model,
 };
 pub use providers::{
-    install_operation_status, install_provider, list_providers, provider_descriptor,
-    provider_heartbeat, provider_logs, provider_status, start_provider, stop_provider,
-    uninstall_provider, uninstall_provider_variant, update_provider,
+    cancel_install_operation, install_operation_status, install_provider, list_providers,
+    provider_descriptor, provider_heartbeat, provider_logs, provider_status, start_provider,
+    stop_provider, uninstall_provider, uninstall_provider_variant, update_provider,
 };
 pub use recommendations::recommendations;
