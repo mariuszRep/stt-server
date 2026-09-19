@@ -1032,7 +1032,12 @@ impl RuntimeManager {
 
         let url = format!("http://127.0.0.1:{port}/v1/models");
         let client = reqwest::Client::new();
-        let resp = client.get(&url).bearer_auth(&auth_token).send().await.ok()?;
+        let resp = client
+            .get(&url)
+            .bearer_auth(&auth_token)
+            .send()
+            .await
+            .ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -1043,7 +1048,9 @@ impl RuntimeManager {
                 array
                     .iter()
                     .filter(|entry| entry.get("status").and_then(|s| s.as_str()) == Some("loaded"))
-                    .filter_map(|entry| entry.get("id").and_then(|v| v.as_str()).map(str::to_string))
+                    .filter_map(|entry| {
+                        entry.get("id").and_then(|v| v.as_str()).map(str::to_string)
+                    })
                     .collect(),
             )
         } else {
@@ -1063,7 +1070,11 @@ impl RuntimeManager {
     /// runtime reported one; `None` either means it was already warm or the
     /// runtime's response didn't include timing, and a caller shouldn't
     /// need to tell those apart to know the model is now ready.
-    pub async fn load_model(&self, id: &ProviderId, model_id: &str) -> Result<Option<f64>, RuntimeError> {
+    pub async fn load_model(
+        &self,
+        id: &ProviderId,
+        model_id: &str,
+    ) -> Result<Option<f64>, RuntimeError> {
         let running_state = {
             let mut instances = self.instances.lock().await;
             match instances.get_mut(id.as_str()) {
