@@ -300,6 +300,16 @@ pub async fn unload_model(
     State(state): State<Arc<AppState>>,
     AxPath(id): AxPath<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Parity with faster-whisper's equivalent guard (added same day, see
+    // concurrent-multi-provider-serving): refuse to unload the model a
+    // model-omitted request currently resolves to, so that path is never
+    // left with nothing to serve out from under it.
+    if state.default_model.read().await.as_deref() == Some(id.as_str()) {
+        return Err(ApiError::BadRequest(format!(
+            "cannot unload '{id}': it is this instance's current default model"
+        )));
+    }
+
     let dir = {
         let registry = state.registry.read().await;
         match registry.get(&id) {

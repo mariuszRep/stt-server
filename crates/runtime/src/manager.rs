@@ -83,6 +83,16 @@ struct RunningEntry {
     instance: ManagedInstance,
     last_activity: Instant,
     streaming: Option<StreamingCapability>,
+    /// Exempts this instance from `sweep_idle` regardless of how long it's
+    /// gone untouched. Deliberate and observable (a caller must explicitly
+    /// pin), not a hidden idle-timeout bump -- see
+    /// concurrent-multi-provider-serving: keeping a second engine's models
+    /// warm in the background means its control-plane activity (start/
+    /// touch/switch calls) may genuinely go quiet for a while even though
+    /// real transcription traffic is flowing straight to it, bypassing the
+    /// control plane entirely. Never set by `start()` itself -- a caller
+    /// pins explicitly via `pin()`.
+    pinned: bool,
 }
 
 /// Status of an in-flight or finished variant download, tracked by
@@ -145,6 +155,24 @@ pub enum SetLanguageOutcome {
     Unchanged,
     /// The runtime rebuilt its recognizer/model for the new language.
     Reloaded { load_seconds: Option<f64> },
+}
+
+/// Wire shape of sherpad's `POST /v1/models/:id/language` response, as
+/// deserialized by [`RuntimeManager::set_model_language`]. Module-level (not
+/// inline in that method) so it has a unit test: `rename_all` must live on
+/// the `Reloaded` variant itself, not just the enum -- an enum-level
+/// `rename_all` only affects tag/variant-name matching, never a struct
+/// variant's own field names. Missing this is exactly what broke
+/// deserializing sherpad's real `{"status":"reloaded","loadSeconds":...}`
+/// response on the first end-to-end run of this code, despite `cargo check`
+/// passing throughout.
+#[derive(serde::Deserialize, Debug, PartialEq)]
+#[serde(tag = "status")]
+enum RuntimeLanguageResponse {
+    #[serde(rename = "unchanged")]
+    Unchanged,
+    #[serde(rename = "reloaded", rename_all = "camelCase")]
+    Reloaded { load_seconds: f64 },
 }
 
 /// Result of [`RuntimeManager::begin_install`]: either the requested
@@ -888,20 +916,6 @@ impl RuntimeManager {
         struct LanguageBody<'a> {
             language: &'a str,
         }
-        #[derive(serde::Deserialize)]
-        #[serde(tag = "status")]
-        enum RuntimeLanguageResponse {
-            #[serde(rename = "unchanged")]
-            Unchanged,
-            // `rename_all` must live on this variant, not just the enum --
-            // an enum-level `rename_all` only affects the tag/variant-name
-            // matching, never a struct variant's own field names. Missing
-            // this is exactly what broke deserializing sherpad's
-            // `{"status":"reloaded","loadSeconds":...}` response on the
-            // first real end-to-end run of this code.
-            #[serde(rename = "reloaded", rename_all = "camelCase")]
-            Reloaded { load_seconds: f64 },
-        }
 
         let url = format!("http://127.0.0.1:{port}/v1/models/{model_id}/language");
         let client = reqwest::Client::new();
@@ -931,6 +945,167 @@ impl RuntimeManager {
                 load_seconds: Some(load_seconds),
             },
         })
+    }
+
+    /// Best-effort lookup of each of `id`'s models' *actually loaded*
+    /// language, keyed by model id, for reconciling a client's persisted
+    /// language pick against reality after e.g. a restart -- only a runtime
+    /// whose language is baked in at build time (sherpa-onnx) has anything
+    /// here to disagree with; a per-request runtime like faster-whisper has
+    /// no such state. Returns `None` when `id` isn't running or doesn't
+    /// expose the field (its `GET /v1/models` 404s, or omits
+    /// `active_language`) -- this only enriches `list_models`, so a miss
+    /// here must never fail that call.
+    pub async fn active_languages(&self, id: &ProviderId) -> Option<HashMap<String, String>> {
+        let running_state = {
+            let mut instances = self.instances.lock().await;
+            match instances.get_mut(id.as_str()) {
+                Some(running) => {
+                    if running.instance.status() == RuntimeStatus::Running {
+                        Some((running.instance.port, running.instance.auth_token.clone()))
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        };
+        let (port, auth_token) = running_state?;
+
+        #[derive(serde::Deserialize)]
+        struct RuntimeModelView {
+            id: String,
+            #[serde(default)]
+            active_language: Option<String>,
+        }
+
+        let url = format!("http://127.0.0.1:{port}/v1/models");
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(&url)
+            .bearer_auth(&auth_token)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let views: Vec<RuntimeModelView> = resp.json().await.ok()?;
+        Some(
+            views
+                .into_iter()
+                .filter_map(|v| v.active_language.map(|lang| (v.id, lang)))
+                .collect(),
+        )
+    }
+
+    /// Which of `id`'s models this running instance currently holds warm.
+    /// Best-effort like [`active_languages`](Self::active_languages) -- a
+    /// miss (not running, or an unexpected response) reports `None` rather
+    /// than erroring, since this only enriches a caller's own view of state.
+    ///
+    /// The two engines' `GET /v1/models` responses have genuinely different
+    /// shapes and this parses both, by shape rather than by hardcoding a
+    /// provider id (so a third provider slots in under whichever shape
+    /// fits without another branch here):
+    /// - sherpa-onnx: a JSON array of `{"id": ..., "status": "loaded"|...}`
+    ///   objects (its full catalog view -- richer than this needs).
+    /// - faster-whisper: `{"loaded": ["<model_id>", ...]}` -- deliberately
+    ///   not a catalog mirror, since the curated catalog lives only in this
+    ///   Rust process, not in that Python runtime (see its `ModelsResponse`
+    ///   doc comment).
+    pub async fn loaded_models(&self, id: &ProviderId) -> Option<Vec<String>> {
+        let running_state = {
+            let mut instances = self.instances.lock().await;
+            match instances.get_mut(id.as_str()) {
+                Some(running) => {
+                    if running.instance.status() == RuntimeStatus::Running {
+                        Some((running.instance.port, running.instance.auth_token.clone()))
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        };
+        let (port, auth_token) = running_state?;
+
+        let url = format!("http://127.0.0.1:{port}/v1/models");
+        let client = reqwest::Client::new();
+        let resp = client.get(&url).bearer_auth(&auth_token).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body: serde_json::Value = resp.json().await.ok()?;
+
+        if let Some(array) = body.as_array() {
+            Some(
+                array
+                    .iter()
+                    .filter(|entry| entry.get("status").and_then(|s| s.as_str()) == Some("loaded"))
+                    .filter_map(|entry| entry.get("id").and_then(|v| v.as_str()).map(str::to_string))
+                    .collect(),
+            )
+        } else {
+            body.get("loaded").and_then(|v| v.as_array()).map(|array| {
+                array
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+        }
+    }
+
+    /// Pre-warms `model_id` on a running instance of `id` without making it
+    /// the default -- proxies to `POST /v1/models/:id/load`, an endpoint
+    /// both engines now implement identically for exactly this purpose (see
+    /// concurrent-multi-provider-serving). Returns the load time if the
+    /// runtime reported one; `None` either means it was already warm or the
+    /// runtime's response didn't include timing, and a caller shouldn't
+    /// need to tell those apart to know the model is now ready.
+    pub async fn load_model(&self, id: &ProviderId, model_id: &str) -> Result<Option<f64>, RuntimeError> {
+        let running_state = {
+            let mut instances = self.instances.lock().await;
+            match instances.get_mut(id.as_str()) {
+                Some(running) => {
+                    if running.instance.status() == RuntimeStatus::Running {
+                        running.last_activity = Instant::now();
+                        Some((running.instance.port, running.instance.auth_token.clone()))
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        };
+
+        let Some((port, auth_token)) = running_state else {
+            return Err(RuntimeError::ModelSwitchFailed(format!(
+                "{id} is not running -- start it before pre-warming a model"
+            )));
+        };
+
+        let url = format!("http://127.0.0.1:{port}/v1/models/{model_id}/load");
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&url)
+            .bearer_auth(&auth_token)
+            .send()
+            .await
+            .map_err(|e| RuntimeError::ModelSwitchFailed(format!("could not reach {url}: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RuntimeError::ModelSwitchFailed(format!(
+                "runtime rejected model load ({status}): {body}"
+            )));
+        }
+
+        let body: serde_json::Value = resp.json().await.map_err(|e| {
+            RuntimeError::ModelSwitchFailed(format!("unexpected response shape: {e}"))
+        })?;
+        Ok(body.get("load_seconds").and_then(|v| v.as_f64()))
     }
 
     /// Start (or return the descriptor of an already-running instance of) a
@@ -1040,6 +1215,7 @@ impl RuntimeManager {
                 instance,
                 last_activity: Instant::now(),
                 streaming,
+                pinned: false,
             },
         );
         Ok(descriptor)
@@ -1104,10 +1280,36 @@ impl RuntimeManager {
         Ok(())
     }
 
-    /// Stop any running instance that hasn't been started, queried, or
-    /// heartbeated within the configured idle timeout. Returns the ids of
-    /// providers that were stopped, for logging by the caller's sweep loop.
-    /// A no-op (returns empty) if idle auto-stop is disabled.
+    /// Exempts a running instance from `sweep_idle` until `unpin`'d. See
+    /// `RunningEntry::pinned`'s doc comment for why this exists instead of
+    /// just disabling the idle timeout globally.
+    pub async fn pin(&self, id: &ProviderId) -> Result<(), RuntimeError> {
+        let mut instances = self.instances.lock().await;
+        let running = instances
+            .get_mut(id.as_str())
+            .ok_or_else(|| RuntimeError::RuntimeNotRunning(id.to_string()))?;
+        running.pinned = true;
+        running.last_activity = Instant::now();
+        Ok(())
+    }
+
+    /// Reverses `pin` -- the instance becomes eligible for `sweep_idle`
+    /// again, subject to its own idle clock from this moment (not
+    /// retroactively idle just because it was pinned for a while).
+    pub async fn unpin(&self, id: &ProviderId) -> Result<(), RuntimeError> {
+        let mut instances = self.instances.lock().await;
+        let running = instances
+            .get_mut(id.as_str())
+            .ok_or_else(|| RuntimeError::RuntimeNotRunning(id.to_string()))?;
+        running.pinned = false;
+        running.last_activity = Instant::now();
+        Ok(())
+    }
+
+    /// Stop any running, unpinned instance that hasn't been started,
+    /// queried, or heartbeated within the configured idle timeout. Returns
+    /// the ids of providers that were stopped, for logging by the caller's
+    /// sweep loop. A no-op (returns empty) if idle auto-stop is disabled.
     pub async fn sweep_idle(&self) -> Vec<String> {
         let Some(idle_timeout) = self.idle_timeout else {
             return Vec::new();
@@ -1118,7 +1320,9 @@ impl RuntimeManager {
             let mut instances = self.instances.lock().await;
             let expired_ids: Vec<String> = instances
                 .iter()
-                .filter(|(_, entry)| now.duration_since(entry.last_activity) >= idle_timeout)
+                .filter(|(_, entry)| {
+                    !entry.pinned && now.duration_since(entry.last_activity) >= idle_timeout
+                })
                 .map(|(id, _)| id.clone())
                 .collect();
             expired_ids
@@ -1517,6 +1721,33 @@ http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
         assert_eq!(manager.status(&id).await, RuntimeStatus::Running);
 
         manager.stop(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pinned_instance_survives_a_sweep_that_would_otherwise_stop_it() {
+        let manager = manager_with_faster_whisper_installed(Some(Duration::from_millis(50))).await;
+        let id = ProviderId::new("faster-whisper").unwrap();
+
+        manager.start(&id, &StartOptions::default()).await.unwrap();
+        manager.pin(&id).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let stopped = manager.sweep_idle().await;
+        assert!(
+            stopped.is_empty(),
+            "a pinned instance must never be swept, regardless of idle time: {stopped:?}"
+        );
+        assert_eq!(manager.status(&id).await, RuntimeStatus::Running);
+
+        // Unpin and confirm it becomes sweepable again on its own idle clock
+        // (not retroactively idle just because it was pinned for a while --
+        // `unpin` resets `last_activity`).
+        manager.unpin(&id).await.unwrap();
+        assert_eq!(manager.status(&id).await, RuntimeStatus::Running);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let stopped = manager.sweep_idle().await;
+        assert_eq!(stopped, vec!["faster-whisper".to_string()]);
     }
 
     #[tokio::test]
@@ -2473,5 +2704,27 @@ http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
             !gpu_survived,
             "expected the never-registered gpu variant's stray cache to be gone too"
         );
+    }
+
+    /// Regression test for the bug `RuntimeLanguageResponse`'s doc comment
+    /// describes: an enum-level `#[serde(rename_all)]` does not reach into a
+    /// struct variant's own fields, so `loadSeconds` was silently unmatched
+    /// (`cargo check` was green throughout) until this was caught by an
+    /// actual request against a running sherpad instance.
+    #[test]
+    fn runtime_language_response_deserializes_sherpad_reloaded_shape() {
+        let parsed: RuntimeLanguageResponse =
+            serde_json::from_str(r#"{"status":"reloaded","loadSeconds":1.23}"#).unwrap();
+        assert_eq!(
+            parsed,
+            RuntimeLanguageResponse::Reloaded { load_seconds: 1.23 }
+        );
+    }
+
+    #[test]
+    fn runtime_language_response_deserializes_sherpad_unchanged_shape() {
+        let parsed: RuntimeLanguageResponse =
+            serde_json::from_str(r#"{"status":"unchanged"}"#).unwrap();
+        assert_eq!(parsed, RuntimeLanguageResponse::Unchanged);
     }
 }

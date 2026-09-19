@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::Json;
@@ -24,18 +26,52 @@ pub struct ModelInfo {
     /// model picker UI) tell a single-language model from a multilingual one
     /// without parsing `display_name`.
     pub languages: Vec<String>,
+    /// The language this model's recognizer is *actually* built with right
+    /// now, for a runtime whose language is baked in at load time rather
+    /// than a per-request field (sherpa-onnx today). `None` when the
+    /// provider isn't running or the concept doesn't apply (faster-whisper's
+    /// language is a per-request hint with no runtime state to reconcile
+    /// against). Lets a client catch its persisted language pick going
+    /// stale -- e.g. after a restart, sherpad always reloads at its catalog
+    /// default, not whatever was last selected -- and correct itself instead
+    /// of asserting a language the runtime isn't serving.
+    pub active_language: Option<String>,
+    /// Whether this model is currently resident in its provider's memory --
+    /// `true`/`false` when the provider is running and reported its warm
+    /// set, `None` when the provider isn't running (nothing to be warm in).
+    /// Lets a client show "instant" vs "will pay a load cost" per model,
+    /// and is the basis for a future per-workflow model picker (see
+    /// concurrent-multi-provider-serving) to know which of a workflow's
+    /// models are already ready.
+    pub loaded: Option<bool>,
 }
 
 /// Flat curated model list across all providers (there's one today).
-pub async fn list_models() -> Json<Vec<ModelInfo>> {
+pub async fn list_models(State(state): State<AppState>) -> Json<Vec<ModelInfo>> {
+    let mut active_by_provider = HashMap::new();
+    let mut loaded_by_provider = HashMap::new();
+    for entry in CATALOG.iter() {
+        let provider_id = ProviderId::new(entry.id.to_string()).expect("catalog ids are valid");
+        if let Some(languages) = state.runtime_manager.active_languages(&provider_id).await {
+            active_by_provider.insert(entry.id, languages);
+        }
+        if let Some(loaded) = state.runtime_manager.loaded_models(&provider_id).await {
+            loaded_by_provider.insert(entry.id, loaded);
+        }
+    }
+
     let models = CATALOG
         .iter()
         .flat_map(|entry| {
+            let active = active_by_provider.get(entry.id);
+            let loaded = loaded_by_provider.get(entry.id);
             entry.models.iter().map(move |m| ModelInfo {
                 id: m.id.to_string(),
                 display_name: m.display_name.to_string(),
                 provider_id: entry.id.to_string(),
                 languages: m.languages.iter().map(|lang| lang.to_string()).collect(),
+                active_language: active.and_then(|map| map.get(m.id)).cloned(),
+                loaded: loaded.map(|list| list.iter().any(|id| id == m.id)),
             })
         })
         .collect();
@@ -146,6 +182,38 @@ pub async fn set_model_language(
             SetLanguageResponse::Reloaded { load_seconds }
         }
     }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadModelRequest {
+    provider_id: String,
+    model_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadModelResponse {
+    load_seconds: Option<f64>,
+}
+
+/// `POST /v1/models/load` -- pre-warms `model_id` on a running provider
+/// without making it the default or touching any other model already warm.
+/// Both engines implement the underlying per-provider endpoint identically
+/// (see `RuntimeManager::load_model`'s doc comment) -- this is the uniform
+/// front door for either. Requires the provider to already be running, same
+/// as `set_model_language` above.
+pub async fn load_model(
+    State(state): State<AppState>,
+    Json(req): Json<LoadModelRequest>,
+) -> Result<Json<LoadModelResponse>, ApiError> {
+    let provider_id = ProviderId::new(req.provider_id).map_err(runtime_error_response)?;
+    let load_seconds = state
+        .runtime_manager
+        .load_model(&provider_id, &req.model_id)
+        .await
+        .map_err(runtime_error_response)?;
+    Ok(Json(LoadModelResponse { load_seconds }))
 }
 
 #[derive(Deserialize)]

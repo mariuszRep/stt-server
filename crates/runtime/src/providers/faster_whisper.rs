@@ -457,13 +457,17 @@ impl ProviderEngine for FasterWhisper {
 
 /// Env vars every launch form shares: host/port/auth/model/model
 /// dir/device/compute_type, the `VOICE_TYPER_*` contract both the packaged
-/// exe and `run_sidecar.py` read identically. `VOICE_TYPER_MODEL_DIR` is
-/// `cached_model_dir(model)` — an explicit, stt-server-owned download
-/// location passed to `WhisperModel(download_root=...)` instead of letting
-/// weights land wherever the OS-default HuggingFace cache happens to be,
-/// per CONVENTIONS.md's "no invisible model download" rule: the location is
-/// now explicit and inspectable even though the lazy download-on-first-use
-/// behavior itself is unchanged. `VOICE_TYPER_HOST` follows
+/// exe and `run_sidecar.py` read identically. `VOICE_TYPER_MODEL_DIR` is the
+/// *provider's whole model root* (every model's weights live under
+/// `<this>/<model_id>/`), not one model's own directory — this changed
+/// (see concurrent-multi-provider-serving) to match sherpa_onnx.rs's
+/// identically-named env var, now that faster-whisper's Python runtime can
+/// hold more than one model resident at once and needs to derive each
+/// one's own download root itself (`config.model_download_root`), the same
+/// way sherpad's registry already did. An explicit, stt-server-owned
+/// download location instead of letting weights land wherever the
+/// OS-default HuggingFace cache happens to be, per CONVENTIONS.md's "no
+/// invisible model download" rule. `VOICE_TYPER_HOST` follows
 /// `options.bind_host` (default loopback) so LAN mode actually binds where
 /// the caller asked —
 /// `RuntimeManager::start` has already validated it's either loopback or the
@@ -477,13 +481,15 @@ fn build_env(
     let mut env = vec![
         ("VOICE_TYPER_HOST".to_string(), host.to_string()),
         ("VOICE_TYPER_AUTH_TOKEN".to_string(), auth_token.to_string()),
+        (
+            "VOICE_TYPER_MODEL_DIR".to_string(),
+            crate::providers::cache::provider_model_root("faster-whisper")
+                .to_string_lossy()
+                .to_string(),
+        ),
     ];
     if let Some(model) = selected_model {
         env.push(("VOICE_TYPER_MODEL".to_string(), model.to_string()));
-        env.push((
-            "VOICE_TYPER_MODEL_DIR".to_string(),
-            cached_model_dir(model).to_string_lossy().to_string(),
-        ));
     }
     if let Some(device) = &options.device {
         env.push(("VOICE_TYPER_DEVICE".to_string(), device.clone()));

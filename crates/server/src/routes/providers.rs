@@ -320,3 +320,32 @@ pub async fn provider_heartbeat(
         .map_err(runtime_error_response)?;
     Ok(StatusCode::NO_CONTENT)
 }
+
+/// `POST /v1/providers/:id/pin` -- exempts a running provider from idle
+/// shutdown until unpinned. See `RuntimeManager::pin`'s doc comment.
+pub async fn pin_provider(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let provider_id = parse_provider_id(id)?;
+    state
+        .runtime_manager
+        .pin(&provider_id)
+        .await
+        .map_err(runtime_error_response)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /v1/providers/:id/unpin` -- reverses `pin_provider`.
+pub async fn unpin_provider(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let provider_id = parse_provider_id(id)?;
+    state
+        .runtime_manager
+        .unpin(&provider_id)
+        .await
+        .map_err(runtime_error_response)?;
+    Ok(StatusCode::NO_CONTENT)
+}
