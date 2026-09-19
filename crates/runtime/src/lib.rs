@@ -15,7 +15,7 @@ pub use error::RuntimeError;
 pub use hardware::HardwareReport;
 pub use manager::{
     InstallOperationState, InstallOperationStatus, InstallOutcome, Launch, LaunchBuilder,
-    ModelPullOutcome, RuntimeManager, StartOptions, SwitchModelOutcome,
+    ModelPullOutcome, RuntimeManager, SetLanguageOutcome, StartOptions, SwitchModelOutcome,
 };
 pub use recommend::{recommend, ModelRecommendation};
 pub use supervisor::{ManagedInstance, RuntimeStatus, SpawnSpec};

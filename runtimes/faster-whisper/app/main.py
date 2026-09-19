@@ -209,6 +209,7 @@ async def get_config() -> ConfigResponse:
 async def audio_transcriptions(
     file: UploadFile = File(...),
     prompt: str | None = Form(default=None),
+    language: str | None = Form(default=None),
 ) -> TranscriptionResponse:
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file provided")
@@ -226,7 +227,7 @@ async def audio_transcriptions(
         # Offload the blocking, CPU/GPU-bound inference to a worker thread so the
         # event loop stays responsive (health checks, uploads) while a chunk is
         # being transcribed. Inference itself is serialized inside transcribe().
-        result = await run_in_threadpool(transcribe, tmp_path, prompt)
+        result = await run_in_threadpool(transcribe, tmp_path, prompt, language)
     except Exception as exc:
         elapsed = time.perf_counter() - started
         print(f"[voice-typer] {request_id} failed after {elapsed:.2f}s: {exc}", flush=True)

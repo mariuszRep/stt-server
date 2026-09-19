@@ -3,7 +3,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use stt_runtime::{ModelPullOutcome, ProviderId, SwitchModelOutcome, CATALOG};
+use stt_runtime::{ModelPullOutcome, ProviderId, SetLanguageOutcome, SwitchModelOutcome, CATALOG};
 
 use crate::error::{runtime_error_response, ApiError};
 use crate::state::AppState;
@@ -18,6 +18,12 @@ pub struct ModelInfo {
     pub id: String,
     pub display_name: String,
     pub provider_id: String,
+    /// BCP-47-ish language tags this model covers, or `["auto"]` for a
+    /// language-agnostic/auto-detecting model -- mirrors
+    /// `runtime::catalog::ModelEntry::languages` verbatim. Lets callers (the
+    /// model picker UI) tell a single-language model from a multilingual one
+    /// without parsing `display_name`.
+    pub languages: Vec<String>,
 }
 
 /// Flat curated model list across all providers (there's one today).
@@ -29,6 +35,7 @@ pub async fn list_models() -> Json<Vec<ModelInfo>> {
                 id: m.id.to_string(),
                 display_name: m.display_name.to_string(),
                 provider_id: entry.id.to_string(),
+                languages: m.languages.iter().map(|lang| lang.to_string()).collect(),
             })
         })
         .collect();
@@ -93,6 +100,50 @@ pub async fn switch_model(
         SwitchModelOutcome::Selected => SwitchModelResponse::Selected,
         SwitchModelOutcome::Swapped { load_seconds } => {
             SwitchModelResponse::Swapped { load_seconds }
+        }
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetLanguageRequest {
+    provider_id: String,
+    model_id: String,
+    language: String,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "status")]
+pub enum SetLanguageResponse {
+    /// Already serving the requested language; nothing rebuilt.
+    #[serde(rename = "unchanged")]
+    Unchanged,
+    /// The runtime rebuilt its recognizer/model for the new language.
+    #[serde(rename = "reloaded", rename_all = "camelCase")]
+    Reloaded { load_seconds: Option<f64> },
+}
+
+/// `POST /v1/models/language` -- for a runtime whose language is baked into
+/// the loaded model rather than a per-request field (sherpa-onnx's
+/// `sense-voice-multi` today). Faster-whisper has no reason to call this:
+/// its language is a per-request form field on the transcription request
+/// itself (see the transcription-language-selection goal). Requires the
+/// provider to already be running -- see
+/// `RuntimeManager::set_model_language`'s doc comment.
+pub async fn set_model_language(
+    State(state): State<AppState>,
+    Json(req): Json<SetLanguageRequest>,
+) -> Result<Json<SetLanguageResponse>, ApiError> {
+    let provider_id = ProviderId::new(req.provider_id).map_err(runtime_error_response)?;
+    let outcome = state
+        .runtime_manager
+        .set_model_language(&provider_id, &req.model_id, &req.language)
+        .await
+        .map_err(runtime_error_response)?;
+    Ok(Json(match outcome {
+        SetLanguageOutcome::Unchanged => SetLanguageResponse::Unchanged,
+        SetLanguageOutcome::Reloaded { load_seconds } => {
+            SetLanguageResponse::Reloaded { load_seconds }
         }
     }))
 }

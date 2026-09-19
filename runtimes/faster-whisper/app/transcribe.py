@@ -161,7 +161,7 @@ def _resample_to_whisper_rate(pcm: np.ndarray, src_rate: int) -> np.ndarray:
 
 
 def _run(
-    model: WhisperModel, audio: str | np.ndarray, initial_prompt: str | None
+    model: WhisperModel, audio: str | np.ndarray, initial_prompt: str | None, language: str | None
 ) -> TranscriptionOutput:
     # word_timestamps=False: per-word start/end/probability costs a real extra
     # cross-attention alignment pass and nothing in the protocol or its only consumer
@@ -181,7 +181,7 @@ def _run(
     # triggers, instead of paying for up to 6 re-decodes.
     segments_iter, info = model.transcribe(
         audio,
-        language=config.DEFAULT_LANGUAGE,
+        language=language,
         beam_size=config.BEAM_SIZE,
         vad_filter=config.VAD_FILTER,
         initial_prompt=initial_prompt,
@@ -214,8 +214,13 @@ def _fmt(seconds: float | None, digits: int = 3) -> str:
     return f"{seconds:.{digits}f}s" if seconds is not None else "n/a"
 
 
-def transcribe(audio_path: str, prompt: str | None = None) -> TranscriptionOutput:
+def transcribe(audio_path: str, prompt: str | None = None, language: str | None = None) -> TranscriptionOutput:
     initial_prompt = prompt.strip() if prompt and prompt.strip() else None
+    # Request-level override, falling back to the process-level env var --
+    # never the other way around, so a request that doesn't specify a
+    # language keeps today's exact behavior (VOICE_TYPER_LANGUAGE, or
+    # faster-whisper's own auto-detect when that's unset too).
+    resolved_language = language.strip() if language and language.strip() else config.DEFAULT_LANGUAGE
     started_at = time.perf_counter()
     print(
         f"[voice-typer] transcription queued file={audio_path} requested={config.REQUESTED_DEVICE} active={config.DEVICE}/{config.COMPUTE_TYPE}",
@@ -244,7 +249,7 @@ def transcribe(audio_path: str, prompt: str | None = None) -> TranscriptionOutpu
         try:
             model = get_model(config.DEVICE, config.COMPUTE_TYPE)
             infer_start = time.perf_counter()
-            result = _run(model, audio, initial_prompt)
+            result = _run(model, audio, initial_prompt, resolved_language)
             return result
         except Exception as exc:
             # CUDA device-count detection can report a device whose runtime
@@ -265,7 +270,7 @@ def transcribe(audio_path: str, prompt: str | None = None) -> TranscriptionOutpu
             )
             model = get_model("cpu", "int8")
             infer_start = time.perf_counter()
-            result = _run(model, audio, initial_prompt)
+            result = _run(model, audio, initial_prompt, resolved_language)
             return result
         finally:
             infer_seconds = time.perf_counter() - infer_start if "infer_start" in locals() else None

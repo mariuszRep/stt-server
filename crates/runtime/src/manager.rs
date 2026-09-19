@@ -134,6 +134,19 @@ pub enum SwitchModelOutcome {
     Swapped { load_seconds: Option<f64> },
 }
 
+/// Result of [`RuntimeManager::set_model_language`]. Unlike
+/// [`SwitchModelOutcome`], there is no persist-only path: a language
+/// override only ever makes sense against an already-running instance
+/// (there is nothing to "select for next launch" -- the runtime must be up
+/// to know whether it can even honor the request).
+#[derive(Debug, Clone)]
+pub enum SetLanguageOutcome {
+    /// Already serving the requested language; nothing rebuilt.
+    Unchanged,
+    /// The runtime rebuilt its recognizer/model for the new language.
+    Reloaded { load_seconds: Option<f64> },
+}
+
 /// Result of [`RuntimeManager::begin_install`]: either the requested
 /// variant was already available locally (instant, no network — the
 /// common case), or a download was kicked off in the background.
@@ -828,6 +841,95 @@ impl RuntimeManager {
 
         Ok(SwitchModelOutcome::Swapped {
             load_seconds: parsed.load_seconds,
+        })
+    }
+
+    /// Changes `model_id`'s active language on an already-running instance
+    /// of `id`, for a runtime whose model bakes language into its config at
+    /// load time rather than accepting it per-request (sherpa-onnx's
+    /// `sense-voice-multi`, for instance -- see the
+    /// transcription-language-selection goal). Proxies to the runtime's own
+    /// `POST /v1/models/:id/language`, mirroring `switch_model`'s
+    /// `/v1/admin/model` proxy above. Faster-whisper (and any runtime whose
+    /// language is a per-request field, not a rebuild) has no reason to call
+    /// this at all -- that path stays exactly as-is, unaffected.
+    pub async fn set_model_language(
+        &self,
+        id: &ProviderId,
+        model_id: &str,
+        language: &str,
+    ) -> Result<SetLanguageOutcome, RuntimeError> {
+        let entry = catalog::find_provider(id)?;
+        catalog::find_model(entry, model_id)
+            .ok_or_else(|| RuntimeError::ModelNotFound(model_id.to_string()))?;
+
+        let running_state = {
+            let mut instances = self.instances.lock().await;
+            match instances.get_mut(id.as_str()) {
+                Some(running) => {
+                    if running.instance.status() == RuntimeStatus::Running {
+                        running.last_activity = Instant::now();
+                        Some((running.instance.port, running.instance.auth_token.clone()))
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        };
+
+        let Some((port, auth_token)) = running_state else {
+            return Err(RuntimeError::ModelSwitchFailed(format!(
+                "{id} is not running -- start it before changing its language"
+            )));
+        };
+
+        #[derive(serde::Serialize)]
+        struct LanguageBody<'a> {
+            language: &'a str,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "status")]
+        enum RuntimeLanguageResponse {
+            #[serde(rename = "unchanged")]
+            Unchanged,
+            // `rename_all` must live on this variant, not just the enum --
+            // an enum-level `rename_all` only affects the tag/variant-name
+            // matching, never a struct variant's own field names. Missing
+            // this is exactly what broke deserializing sherpad's
+            // `{"status":"reloaded","loadSeconds":...}` response on the
+            // first real end-to-end run of this code.
+            #[serde(rename = "reloaded", rename_all = "camelCase")]
+            Reloaded { load_seconds: f64 },
+        }
+
+        let url = format!("http://127.0.0.1:{port}/v1/models/{model_id}/language");
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&url)
+            .bearer_auth(&auth_token)
+            .json(&LanguageBody { language })
+            .send()
+            .await
+            .map_err(|e| RuntimeError::ModelSwitchFailed(format!("could not reach {url}: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RuntimeError::ModelSwitchFailed(format!(
+                "runtime rejected language change ({status}): {body}"
+            )));
+        }
+
+        let parsed: RuntimeLanguageResponse = resp.json().await.map_err(|e| {
+            RuntimeError::ModelSwitchFailed(format!("unexpected response shape: {e}"))
+        })?;
+
+        Ok(match parsed {
+            RuntimeLanguageResponse::Unchanged => SetLanguageOutcome::Unchanged,
+            RuntimeLanguageResponse::Reloaded { load_seconds } => SetLanguageOutcome::Reloaded {
+                load_seconds: Some(load_seconds),
+            },
         })
     }
 

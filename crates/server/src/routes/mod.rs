@@ -7,7 +7,8 @@ pub mod recommendations;
 pub use hardware::get_hardware;
 pub use health::{health, readiness};
 pub use models::{
-    list_models, pull_model, remove_model, select_model, selected_model, switch_model, verify_model,
+    list_models, pull_model, remove_model, select_model, selected_model, set_model_language,
+    switch_model, verify_model,
 };
 pub use providers::{
     cancel_install_operation, install_operation_status, install_provider, list_providers,

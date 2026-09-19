@@ -100,7 +100,7 @@ mod auth_tests {
 /// Whether the model this instance was launched to serve is in memory. An
 /// instance with no default model has nothing to load, so it counts as ready.
 async fn default_model_loaded(state: &AppState) -> bool {
-    match &state.default_model {
+    match state.default_model.read().await.as_ref() {
         Some(id) => matches!(
             state.registry.read().await.get(id),
             Some(ModelState::Loaded { .. })
@@ -114,7 +114,7 @@ async fn default_model_loaded(state: &AppState) -> bool {
 /// Answers 503 while the launched model isn't loaded, so "healthy" always
 /// means "can transcribe" rather than just "the process is up".
 pub async fn health(State(state): State<Arc<AppState>>) -> Response {
-    let model = state.default_model.clone().unwrap_or_default();
+    let model = state.default_model.read().await.clone().unwrap_or_default();
     if default_model_loaded(&state).await {
         return Json(json!({ "status": "ok", "model": model })).into_response();
     }
@@ -131,10 +131,11 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Response {
 /// (matches faster-whisper -- real streaming is a separate future goal), so
 /// the `streaming` key is simply omitted rather than a hardcoded `false`.
 pub async fn config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let default_model = state.default_model.read().await.clone();
     Json(json!({
         "schema_version": 1,
-        "model": state.default_model.clone().unwrap_or_default(),
-        "model_loaded": state.default_model.is_some() && default_model_loaded(&state).await,
+        "model": default_model.clone().unwrap_or_default(),
+        "model_loaded": default_model.is_some() && default_model_loaded(&state).await,
     }))
 }
 
@@ -169,6 +170,10 @@ pub struct ModelView {
     languages: &'static [&'static str],
     download_bytes: u64,
     status: &'static str,
+    /// The language the loaded recognizer was actually built with, or the
+    /// catalog default when not loaded -- lets a caller show the current
+    /// state of `set_model_language` without a separate round trip.
+    active_language: String,
 }
 
 pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<Vec<ModelView>> {
@@ -176,10 +181,10 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<Vec<ModelVi
     let views = sherpa_manifest::MODELS
         .iter()
         .map(|m| {
-            let status = match registry.get(m.id) {
-                Some(ModelState::Loaded { .. }) => "loaded",
-                Some(ModelState::Installed { .. }) => "installed",
-                None => "available",
+            let (status, active_language) = match registry.get(m.id) {
+                Some(ModelState::Loaded { language, .. }) => ("loaded", language.clone()),
+                Some(ModelState::Installed { .. }) => ("installed", m.default_language.to_string()),
+                None => ("available", m.default_language.to_string()),
             };
             ModelView {
                 id: m.id,
@@ -187,6 +192,7 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<Vec<ModelVi
                 languages: m.languages,
                 download_bytes: m.download_bytes,
                 status,
+                active_language,
             }
         })
         .collect();
@@ -263,8 +269,10 @@ pub async fn load_model_by_id(state: &Arc<AppState>, id: &str) -> Result<(), Api
         .min(4);
 
     let dir_for_build = dir.clone();
+    let language = entry.default_language.to_string();
+    let language_for_build = language.clone();
     let recognizer = tokio::task::spawn_blocking(move || {
-        let config = recognizer::build_config(entry, &dir_for_build, num_threads);
+        let config = recognizer::build_config(entry, &dir_for_build, num_threads, &language_for_build);
         sherpa_onnx::OfflineRecognizer::create(&config)
     })
     .await
@@ -276,7 +284,7 @@ pub async fn load_model_by_id(state: &Arc<AppState>, id: &str) -> Result<(), Api
         .registry
         .write()
         .await
-        .insert(id.to_string(), ModelState::Loaded { dir, jobs });
+        .insert(id.to_string(), ModelState::Loaded { dir, jobs, language });
     Ok(())
 }
 
@@ -355,8 +363,10 @@ async fn get_worker(
         .unwrap_or(2)
         .min(4);
     let dir_for_build = dir.clone();
+    let language = entry.default_language.to_string();
+    let language_for_build = language.clone();
     let recognizer = tokio::task::spawn_blocking(move || {
-        let config = recognizer::build_config(entry, &dir_for_build, num_threads);
+        let config = recognizer::build_config(entry, &dir_for_build, num_threads, &language_for_build);
         sherpa_onnx::OfflineRecognizer::create(&config)
     })
     .await
@@ -369,10 +379,151 @@ async fn get_worker(
         ModelState::Loaded {
             dir,
             jobs: jobs.clone(),
+            language,
         },
     );
 
     Ok(jobs)
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetLanguageRequest {
+    language: String,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "status")]
+pub enum SetLanguageResponse {
+    /// Already serving the requested language -- no rebuild needed.
+    #[serde(rename = "unchanged")]
+    Unchanged,
+    /// Rebuilt the recognizer for the new language.
+    #[serde(rename = "reloaded", rename_all = "camelCase")]
+    Reloaded { load_seconds: f64 },
+}
+
+/// `POST /v1/models/:id/language` -- unlike faster-whisper's per-request
+/// `language` form field, sherpa-onnx has no such request-time hook: a
+/// model's language is baked into the recognizer at build time. Changing it
+/// means rebuilding and replacing the loaded recognizer, which is why this
+/// is its own explicit reload operation (with a measured `load_seconds`,
+/// mirroring `stt-server`'s own model-switch response) rather than a field
+/// on the transcribe request.
+pub async fn set_model_language(
+    State(state): State<Arc<AppState>>,
+    AxPath(id): AxPath<String>,
+    Json(req): Json<SetLanguageRequest>,
+) -> Result<Json<SetLanguageResponse>, ApiError> {
+    let entry = find_entry(&id)?;
+    // Not `.contains(&req.language.as_str())`: that requires unifying
+    // `req.language`'s borrow with `languages`' `&'static str` element type,
+    // which a request-scoped `String` can never satisfy. Compare values
+    // instead of trying to match reference lifetimes.
+    if !entry.languages.iter().any(|&lang| lang == req.language) {
+        return Err(ApiError::BadRequest(format!(
+            "model '{id}' does not support language '{}': supported are {:?}",
+            req.language, entry.languages
+        )));
+    }
+
+    let dir = {
+        let registry = state.registry.read().await;
+        match registry.get(&id) {
+            Some(ModelState::Loaded { language, .. }) if *language == req.language => {
+                return Ok(Json(SetLanguageResponse::Unchanged));
+            }
+            Some(ModelState::Loaded { dir, .. }) => dir.clone(),
+            Some(ModelState::Installed { dir }) => dir.clone(),
+            None => {
+                return Err(ApiError::BadRequest(format!(
+                    "model '{id}' is not installed; POST /v1/models/{id}/pull first"
+                )))
+            }
+        }
+    };
+
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get() as i32)
+        .unwrap_or(2)
+        .min(4);
+    let dir_for_build = dir.clone();
+    let language_for_build = req.language.clone();
+    let started = std::time::Instant::now();
+    let recognizer = tokio::task::spawn_blocking(move || {
+        let config = recognizer::build_config(entry, &dir_for_build, num_threads, &language_for_build);
+        sherpa_onnx::OfflineRecognizer::create(&config)
+    })
+    .await
+    .map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))?
+    .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("failed to create recognizer for {id}")))?;
+    let load_seconds = started.elapsed().as_secs_f64();
+
+    let jobs = recognizer::spawn_worker(recognizer);
+    state.registry.write().await.insert(
+        id.clone(),
+        ModelState::Loaded {
+            dir,
+            jobs,
+            language: req.language,
+        },
+    );
+
+    Ok(Json(SetLanguageResponse::Reloaded { load_seconds }))
+}
+
+#[derive(serde::Deserialize)]
+pub struct AdminModelBody {
+    model: String,
+    // `device`/`compute_type` are accepted for wire-shape parity with
+    // faster-whisper's identically-named endpoint (`stt-server`'s
+    // `RuntimeManager::switch_model` posts the same body to every provider
+    // uniformly) but sherpad links a CPU-only onnxruntime build with no
+    // per-model device/compute_type concept, so both are silently ignored.
+    #[allow(dead_code)]
+    device: Option<String>,
+    #[allow(dead_code)]
+    compute_type: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminModelResponse {
+    status: &'static str,
+    model: String,
+    load_seconds: Option<f64>,
+}
+
+/// `POST /v1/admin/model` -- sherpad's side of the in-process model-swap
+/// contract `stt-server`'s `RuntimeManager::switch_model` already calls
+/// uniformly for every provider (see `manager.rs`'s doc comment on that
+/// method); only faster-whisper's Python runtime implemented it until now,
+/// so switching sherpa-onnx's active model on an already-running instance
+/// always 404'd. Ensures `model` is loaded (reusing the same lazy-load path
+/// `get_worker` uses for a transcribe request), then makes it the default
+/// model every request-without-an-explicit-`model` resolves to.
+pub async fn admin_switch_model(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AdminModelBody>,
+) -> Result<Json<AdminModelResponse>, ApiError> {
+    let already_loaded = matches!(
+        state.registry.read().await.get(&req.model),
+        Some(ModelState::Loaded { .. })
+    );
+    let load_seconds = if already_loaded {
+        None
+    } else {
+        let started = std::time::Instant::now();
+        get_worker(&state, &req.model).await?;
+        Some(started.elapsed().as_secs_f64())
+    };
+
+    *state.default_model.write().await = Some(req.model.clone());
+
+    Ok(Json(AdminModelResponse {
+        status: "ok",
+        model: req.model,
+        load_seconds,
+    }))
 }
 
 #[derive(Default)]
@@ -435,10 +586,10 @@ pub async fn transcribe(
     // model it was launched with (`VOICE_TYPER_MODEL`, captured as
     // `state.default_model`). An explicit `model` field is still honored as
     // an optional per-request override, for direct/standalone callers.
-    let model_id = params
-        .model
-        .clone()
-        .or_else(|| state.default_model.clone())
+    let model_id = match params.model.clone() {
+        Some(model) => Some(model),
+        None => state.default_model.read().await.clone(),
+    }
         .ok_or_else(|| {
             ApiError::BadRequest(
                 "no 'model' field given and this instance has no default model configured".into(),
@@ -487,15 +638,17 @@ pub async fn transcribe(
     // the whole process aborts, taking every other queued request with it.
     // Nothing that short holds a word, so answer with an empty transcript.
     if duration_secs < MIN_AUDIO_SECS {
+        let language = active_language(&state, &model_id).await?;
         return build_response(
             &params,
-            &model_id,
+            &language,
             TranscribeResponse::default(),
             duration_secs,
         );
     }
 
     let jobs = get_worker(&state, &model_id).await?;
+    let language = active_language(&state, &model_id).await?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     jobs.send(Job {
         request: TranscribeRequest {
@@ -516,7 +669,19 @@ pub async fn transcribe(
         .map_err(|_| ApiError::Internal(anyhow::anyhow!("transcription timed out")))?
         .map_err(|_| ApiError::Internal(anyhow::anyhow!("model worker dropped the request")))?;
 
-    build_response(&params, &model_id, result, duration_secs)
+    build_response(&params, &language, result, duration_secs)
+}
+
+/// The language currently baked into `model_id`'s loaded recognizer, or its
+/// catalog default when not loaded yet -- matches what `get_worker`'s
+/// lazy-load path would build it with, so a caller who never touched
+/// `set_model_language` still sees today's exact reported value.
+async fn active_language(state: &AppState, model_id: &str) -> Result<String, ApiError> {
+    if let Some(ModelState::Loaded { language, .. }) = state.registry.read().await.get(model_id) {
+        return Ok(language.clone());
+    }
+    let entry = find_entry(model_id)?;
+    Ok(entry.default_language.to_string())
 }
 
 /// Builds the response. `text` format returns bare text (a convenience
@@ -534,7 +699,7 @@ pub async fn transcribe(
 /// protocol marks them optional for exactly this reason.
 fn build_response(
     params: &TranscribeParams,
-    model_id: &str,
+    active_language: &str,
     result: TranscribeResponse,
     duration_secs: f64,
 ) -> Result<Response, ApiError> {
@@ -542,11 +707,10 @@ fn build_response(
         return Ok(result.text.into_response());
     }
 
-    let entry = find_entry(model_id)?;
-    let language = if entry.default_language == "auto" {
+    let language = if active_language == "auto" {
         serde_json::Value::Null
     } else {
-        serde_json::Value::String(entry.default_language.to_string())
+        serde_json::Value::String(active_language.to_string())
     };
 
     let words = if params.want_word_timestamps {

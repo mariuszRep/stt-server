@@ -36,6 +36,7 @@ async fn mark_loaded(state: &AppState, id: &str) {
         ModelState::Loaded {
             dir: state.models_dir.join(id),
             jobs,
+            language: "auto".to_string(),
         },
     );
 }
