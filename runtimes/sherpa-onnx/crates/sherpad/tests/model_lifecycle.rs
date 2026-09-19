@@ -14,7 +14,8 @@ use sherpad::state::{AppState, ModelState};
 use tower::ServiceExt;
 
 fn test_state(default_model: Option<&str>) -> Arc<AppState> {
-    let base = std::env::temp_dir().join(format!("sherpad-lifecycle-test-{}", uuid::Uuid::new_v4()));
+    let base =
+        std::env::temp_dir().join(format!("sherpad-lifecycle-test-{}", uuid::Uuid::new_v4()));
     Arc::new(AppState::new(
         base.join("models"),
         base.join("tmp"),

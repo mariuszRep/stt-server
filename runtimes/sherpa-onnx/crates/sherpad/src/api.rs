@@ -272,7 +272,8 @@ pub async fn load_model_by_id(state: &Arc<AppState>, id: &str) -> Result<(), Api
     let language = entry.default_language.to_string();
     let language_for_build = language.clone();
     let recognizer = tokio::task::spawn_blocking(move || {
-        let config = recognizer::build_config(entry, &dir_for_build, num_threads, &language_for_build);
+        let config =
+            recognizer::build_config(entry, &dir_for_build, num_threads, &language_for_build);
         sherpa_onnx::OfflineRecognizer::create(&config)
     })
     .await
@@ -280,11 +281,14 @@ pub async fn load_model_by_id(state: &Arc<AppState>, id: &str) -> Result<(), Api
     .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("failed to create recognizer for {id}")))?;
 
     let jobs = recognizer::spawn_worker(recognizer);
-    state
-        .registry
-        .write()
-        .await
-        .insert(id.to_string(), ModelState::Loaded { dir, jobs, language });
+    state.registry.write().await.insert(
+        id.to_string(),
+        ModelState::Loaded {
+            dir,
+            jobs,
+            language,
+        },
+    );
     Ok(())
 }
 
@@ -376,7 +380,8 @@ async fn get_worker(
     let language = entry.default_language.to_string();
     let language_for_build = language.clone();
     let recognizer = tokio::task::spawn_blocking(move || {
-        let config = recognizer::build_config(entry, &dir_for_build, num_threads, &language_for_build);
+        let config =
+            recognizer::build_config(entry, &dir_for_build, num_threads, &language_for_build);
         sherpa_onnx::OfflineRecognizer::create(&config)
     })
     .await
@@ -460,7 +465,8 @@ pub async fn set_model_language(
     let language_for_build = req.language.clone();
     let started = std::time::Instant::now();
     let recognizer = tokio::task::spawn_blocking(move || {
-        let config = recognizer::build_config(entry, &dir_for_build, num_threads, &language_for_build);
+        let config =
+            recognizer::build_config(entry, &dir_for_build, num_threads, &language_for_build);
         sherpa_onnx::OfflineRecognizer::create(&config)
     })
     .await
@@ -600,11 +606,11 @@ pub async fn transcribe(
         Some(model) => Some(model),
         None => state.default_model.read().await.clone(),
     }
-        .ok_or_else(|| {
-            ApiError::BadRequest(
-                "no 'model' field given and this instance has no default model configured".into(),
-            )
-        })?;
+    .ok_or_else(|| {
+        ApiError::BadRequest(
+            "no 'model' field given and this instance has no default model configured".into(),
+        )
+    })?;
 
     let tmp_path = state.tmp_dir.join(format!("{}", uuid::Uuid::new_v4()));
     tokio::fs::create_dir_all(&state.tmp_dir)

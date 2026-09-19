@@ -37,7 +37,11 @@ async fn mark_loaded(state: &AppState, id: &str, language: &str) {
     );
 }
 
-async fn post_json(state: Arc<AppState>, uri: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+async fn post_json(
+    state: Arc<AppState>,
+    uri: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
     let request = Request::builder()
         .method("POST")
         .uri(uri)
