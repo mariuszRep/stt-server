@@ -310,6 +310,12 @@ impl ProviderEngine for SherpaOnnx {
     fn verify_cached_model(&self, model_id: &str) -> Result<Option<u64>, RuntimeError> {
         verify_cached_model(model_id)
     }
+
+    /// `sherpad` scans its model directory once at startup and never
+    /// downloads on its own, so a model pulled later is invisible to it.
+    fn requires_pulled_model(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

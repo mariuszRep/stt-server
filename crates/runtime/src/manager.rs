@@ -83,6 +83,16 @@ struct RunningEntry {
     instance: ManagedInstance,
     last_activity: Instant,
     streaming: Option<StreamingCapability>,
+    /// Exempts this instance from `sweep_idle` regardless of how long it's
+    /// gone untouched. Deliberate and observable (a caller must explicitly
+    /// pin), not a hidden idle-timeout bump -- see
+    /// concurrent-multi-provider-serving: keeping a second engine's models
+    /// warm in the background means its control-plane activity (start/
+    /// touch/switch calls) may genuinely go quiet for a while even though
+    /// real transcription traffic is flowing straight to it, bypassing the
+    /// control plane entirely. Never set by `start()` itself -- a caller
+    /// pins explicitly via `pin()`.
+    pinned: bool,
 }
 
 /// Status of an in-flight or finished variant download, tracked by
@@ -94,6 +104,7 @@ pub enum InstallOperationStatus {
     Downloading,
     Complete,
     Failed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -131,6 +142,37 @@ pub enum ModelPullOutcome {
 pub enum SwitchModelOutcome {
     Selected,
     Swapped { load_seconds: Option<f64> },
+}
+
+/// Result of [`RuntimeManager::set_model_language`]. Unlike
+/// [`SwitchModelOutcome`], there is no persist-only path: a language
+/// override only ever makes sense against an already-running instance
+/// (there is nothing to "select for next launch" -- the runtime must be up
+/// to know whether it can even honor the request).
+#[derive(Debug, Clone)]
+pub enum SetLanguageOutcome {
+    /// Already serving the requested language; nothing rebuilt.
+    Unchanged,
+    /// The runtime rebuilt its recognizer/model for the new language.
+    Reloaded { load_seconds: Option<f64> },
+}
+
+/// Wire shape of sherpad's `POST /v1/models/:id/language` response, as
+/// deserialized by [`RuntimeManager::set_model_language`]. Module-level (not
+/// inline in that method) so it has a unit test: `rename_all` must live on
+/// the `Reloaded` variant itself, not just the enum -- an enum-level
+/// `rename_all` only affects tag/variant-name matching, never a struct
+/// variant's own field names. Missing this is exactly what broke
+/// deserializing sherpad's real `{"status":"reloaded","loadSeconds":...}`
+/// response on the first end-to-end run of this code, despite `cargo check`
+/// passing throughout.
+#[derive(serde::Deserialize, Debug, PartialEq)]
+#[serde(tag = "status")]
+enum RuntimeLanguageResponse {
+    #[serde(rename = "unchanged")]
+    Unchanged,
+    #[serde(rename = "reloaded", rename_all = "camelCase")]
+    Reloaded { load_seconds: f64 },
 }
 
 /// Result of [`RuntimeManager::begin_install`]: either the requested
@@ -175,6 +217,14 @@ pub struct RuntimeManager {
     /// sections here are always tiny (a struct field write), never held
     /// across an `.await`.
     installs: StdMutex<HashMap<String, InstallOperationState>>,
+    /// Abort handles for the background `tokio::spawn` task backing each
+    /// still-downloading entry in `installs`, keyed by the same
+    /// `operation_id`. Populated at spawn time, removed once the task
+    /// finishes (`Complete`/`Failed`) or is cancelled. Lets
+    /// [`RuntimeManager::cancel_operation`] stop the in-flight download at
+    /// its next await point without the download logic itself needing to be
+    /// cancellation-aware.
+    install_handles: StdMutex<HashMap<String, tokio::task::AbortHandle>>,
     /// `None` disables idle auto-stop entirely (always-on).
     idle_timeout: Option<Duration>,
 }
@@ -188,6 +238,7 @@ impl RuntimeManager {
             installed: Mutex::new(HashMap::new()),
             selected_models: Mutex::new(HashMap::new()),
             installs: StdMutex::new(HashMap::new()),
+            install_handles: StdMutex::new(HashMap::new()),
             idle_timeout,
         }
     }
@@ -209,6 +260,7 @@ impl RuntimeManager {
             installed: Mutex::new(HashMap::new()),
             selected_models: Mutex::new(HashMap::new()),
             installs: StdMutex::new(HashMap::new()),
+            install_handles: StdMutex::new(HashMap::new()),
             idle_timeout,
         }
     }
@@ -408,7 +460,7 @@ impl RuntimeManager {
         let manager = Arc::clone(self);
         let id_owned = id.clone();
         let op_id = operation_id.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let manager_for_progress = Arc::clone(&manager);
             let progress_op_id = op_id.clone();
             let result = manager
@@ -447,7 +499,16 @@ impl RuntimeManager {
                     }
                 }
             }
+            manager
+                .install_handles
+                .lock()
+                .expect("install_handles mutex poisoned")
+                .remove(&op_id);
         });
+        self.install_handles
+            .lock()
+            .expect("install_handles mutex poisoned")
+            .insert(operation_id.clone(), handle.abort_handle());
 
         Ok(InstallOutcome::Downloading {
             operation_id,
@@ -557,7 +618,7 @@ impl RuntimeManager {
         let id_owned = id.clone();
         let model_id_owned = model_id.to_string();
         let op_id = operation_id.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let output_dir = providers::cache::model_dir(id_owned.as_str(), &model_id_owned);
             let manager_for_progress = Arc::clone(&manager);
             let progress_op_id = op_id.clone();
@@ -596,9 +657,75 @@ impl RuntimeManager {
                     }
                 }
             }
+            manager
+                .install_handles
+                .lock()
+                .expect("install_handles mutex poisoned")
+                .remove(&op_id);
         });
+        self.install_handles
+            .lock()
+            .expect("install_handles mutex poisoned")
+            .insert(operation_id.clone(), handle.abort_handle());
 
         Ok(ModelPullOutcome::Downloading { operation_id })
+    }
+
+    /// Cancel an in-flight install/pull operation: aborts the background
+    /// download task at its next await point and deletes whatever partial
+    /// file the download had written, so a cancelled download never leaves
+    /// a half-downloaded, unusable file mistaken for a complete one by a
+    /// later `verify`. Only valid while the operation is still
+    /// `Downloading` — cancelling an already-`Complete`/`Failed`/`Cancelled`
+    /// operation is rejected rather than silently accepted, since there is
+    /// nothing in flight to stop and the caller's assumption about the
+    /// operation's state is wrong.
+    pub fn cancel_operation(&self, operation_id: &str) -> Result<(), RuntimeError> {
+        let (provider_id, variant, model_id) = {
+            let mut installs = self.installs.lock().expect("installs mutex poisoned");
+            let state = installs
+                .get_mut(operation_id)
+                .ok_or_else(|| RuntimeError::InstallOperationNotFound(operation_id.to_string()))?;
+            if !matches!(state.status, InstallOperationStatus::Downloading) {
+                return Err(RuntimeError::OperationNotCancelable(
+                    operation_id.to_string(),
+                ));
+            }
+            state.status = InstallOperationStatus::Cancelled;
+            (
+                state.provider_id.clone(),
+                state.variant.clone(),
+                state.model_id.clone(),
+            )
+        };
+
+        if let Some(handle) = self
+            .install_handles
+            .lock()
+            .expect("install_handles mutex poisoned")
+            .remove(operation_id)
+        {
+            handle.abort();
+        }
+
+        // Best-effort partial-file cleanup: a variant or model download that
+        // was aborted mid-write may have left an incomplete file on disk.
+        // Errors here are not fatal to cancellation itself (the operation is
+        // already marked `Cancelled` above) — surfaced via `warn!` only, the
+        // same tolerance `uninstall`'s cascade-delete already applies to
+        // per-variant cleanup failures.
+        if let Some(variant) = variant.as_deref() {
+            if let Err(e) = providers::cache::remove_variant(&provider_id, variant) {
+                warn!(provider = %provider_id, variant = %variant, error = %e, "failed to remove partial variant download after cancel");
+            }
+        }
+        if let Some(model_id) = model_id.as_deref() {
+            if let Err(e) = providers::cache::remove_model(&provider_id, model_id) {
+                warn!(provider = %provider_id, model = %model_id, error = %e, "failed to remove partial model download after cancel");
+            }
+        }
+
+        Ok(())
     }
 
     /// Whether `model_id`'s weights are present on disk for `id`, and their
@@ -745,6 +872,253 @@ impl RuntimeManager {
         })
     }
 
+    /// Changes `model_id`'s active language on an already-running instance
+    /// of `id`, for a runtime whose model bakes language into its config at
+    /// load time rather than accepting it per-request (sherpa-onnx's
+    /// `sense-voice-multi`, for instance -- see the
+    /// transcription-language-selection goal). Proxies to the runtime's own
+    /// `POST /v1/models/:id/language`, mirroring `switch_model`'s
+    /// `/v1/admin/model` proxy above. Faster-whisper (and any runtime whose
+    /// language is a per-request field, not a rebuild) has no reason to call
+    /// this at all -- that path stays exactly as-is, unaffected.
+    pub async fn set_model_language(
+        &self,
+        id: &ProviderId,
+        model_id: &str,
+        language: &str,
+    ) -> Result<SetLanguageOutcome, RuntimeError> {
+        let entry = catalog::find_provider(id)?;
+        catalog::find_model(entry, model_id)
+            .ok_or_else(|| RuntimeError::ModelNotFound(model_id.to_string()))?;
+
+        let running_state = {
+            let mut instances = self.instances.lock().await;
+            match instances.get_mut(id.as_str()) {
+                Some(running) => {
+                    if running.instance.status() == RuntimeStatus::Running {
+                        running.last_activity = Instant::now();
+                        Some((running.instance.port, running.instance.auth_token.clone()))
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        };
+
+        let Some((port, auth_token)) = running_state else {
+            return Err(RuntimeError::ModelSwitchFailed(format!(
+                "{id} is not running -- start it before changing its language"
+            )));
+        };
+
+        #[derive(serde::Serialize)]
+        struct LanguageBody<'a> {
+            language: &'a str,
+        }
+
+        let url = format!("http://127.0.0.1:{port}/v1/models/{model_id}/language");
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&url)
+            .bearer_auth(&auth_token)
+            .json(&LanguageBody { language })
+            .send()
+            .await
+            .map_err(|e| RuntimeError::ModelSwitchFailed(format!("could not reach {url}: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RuntimeError::ModelSwitchFailed(format!(
+                "runtime rejected language change ({status}): {body}"
+            )));
+        }
+
+        let parsed: RuntimeLanguageResponse = resp.json().await.map_err(|e| {
+            RuntimeError::ModelSwitchFailed(format!("unexpected response shape: {e}"))
+        })?;
+
+        Ok(match parsed {
+            RuntimeLanguageResponse::Unchanged => SetLanguageOutcome::Unchanged,
+            RuntimeLanguageResponse::Reloaded { load_seconds } => SetLanguageOutcome::Reloaded {
+                load_seconds: Some(load_seconds),
+            },
+        })
+    }
+
+    /// Best-effort lookup of each of `id`'s models' *actually loaded*
+    /// language, keyed by model id, for reconciling a client's persisted
+    /// language pick against reality after e.g. a restart -- only a runtime
+    /// whose language is baked in at build time (sherpa-onnx) has anything
+    /// here to disagree with; a per-request runtime like faster-whisper has
+    /// no such state. Returns `None` when `id` isn't running or doesn't
+    /// expose the field (its `GET /v1/models` 404s, or omits
+    /// `active_language`) -- this only enriches `list_models`, so a miss
+    /// here must never fail that call.
+    pub async fn active_languages(&self, id: &ProviderId) -> Option<HashMap<String, String>> {
+        let running_state = {
+            let mut instances = self.instances.lock().await;
+            match instances.get_mut(id.as_str()) {
+                Some(running) => {
+                    if running.instance.status() == RuntimeStatus::Running {
+                        Some((running.instance.port, running.instance.auth_token.clone()))
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        };
+        let (port, auth_token) = running_state?;
+
+        #[derive(serde::Deserialize)]
+        struct RuntimeModelView {
+            id: String,
+            #[serde(default)]
+            active_language: Option<String>,
+        }
+
+        let url = format!("http://127.0.0.1:{port}/v1/models");
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(&url)
+            .bearer_auth(&auth_token)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let views: Vec<RuntimeModelView> = resp.json().await.ok()?;
+        Some(
+            views
+                .into_iter()
+                .filter_map(|v| v.active_language.map(|lang| (v.id, lang)))
+                .collect(),
+        )
+    }
+
+    /// Which of `id`'s models this running instance currently holds warm.
+    /// Best-effort like [`active_languages`](Self::active_languages) -- a
+    /// miss (not running, or an unexpected response) reports `None` rather
+    /// than erroring, since this only enriches a caller's own view of state.
+    ///
+    /// The two engines' `GET /v1/models` responses have genuinely different
+    /// shapes and this parses both, by shape rather than by hardcoding a
+    /// provider id (so a third provider slots in under whichever shape
+    /// fits without another branch here):
+    /// - sherpa-onnx: a JSON array of `{"id": ..., "status": "loaded"|...}`
+    ///   objects (its full catalog view -- richer than this needs).
+    /// - faster-whisper: `{"loaded": ["<model_id>", ...]}` -- deliberately
+    ///   not a catalog mirror, since the curated catalog lives only in this
+    ///   Rust process, not in that Python runtime (see its `ModelsResponse`
+    ///   doc comment).
+    pub async fn loaded_models(&self, id: &ProviderId) -> Option<Vec<String>> {
+        let running_state = {
+            let mut instances = self.instances.lock().await;
+            match instances.get_mut(id.as_str()) {
+                Some(running) => {
+                    if running.instance.status() == RuntimeStatus::Running {
+                        Some((running.instance.port, running.instance.auth_token.clone()))
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        };
+        let (port, auth_token) = running_state?;
+
+        let url = format!("http://127.0.0.1:{port}/v1/models");
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(&url)
+            .bearer_auth(&auth_token)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body: serde_json::Value = resp.json().await.ok()?;
+
+        if let Some(array) = body.as_array() {
+            Some(
+                array
+                    .iter()
+                    .filter(|entry| entry.get("status").and_then(|s| s.as_str()) == Some("loaded"))
+                    .filter_map(|entry| {
+                        entry.get("id").and_then(|v| v.as_str()).map(str::to_string)
+                    })
+                    .collect(),
+            )
+        } else {
+            body.get("loaded").and_then(|v| v.as_array()).map(|array| {
+                array
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+        }
+    }
+
+    /// Pre-warms `model_id` on a running instance of `id` without making it
+    /// the default -- proxies to `POST /v1/models/:id/load`, an endpoint
+    /// both engines now implement identically for exactly this purpose (see
+    /// concurrent-multi-provider-serving). Returns the load time if the
+    /// runtime reported one; `None` either means it was already warm or the
+    /// runtime's response didn't include timing, and a caller shouldn't
+    /// need to tell those apart to know the model is now ready.
+    pub async fn load_model(
+        &self,
+        id: &ProviderId,
+        model_id: &str,
+    ) -> Result<Option<f64>, RuntimeError> {
+        let running_state = {
+            let mut instances = self.instances.lock().await;
+            match instances.get_mut(id.as_str()) {
+                Some(running) => {
+                    if running.instance.status() == RuntimeStatus::Running {
+                        running.last_activity = Instant::now();
+                        Some((running.instance.port, running.instance.auth_token.clone()))
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        };
+
+        let Some((port, auth_token)) = running_state else {
+            return Err(RuntimeError::ModelSwitchFailed(format!(
+                "{id} is not running -- start it before pre-warming a model"
+            )));
+        };
+
+        let url = format!("http://127.0.0.1:{port}/v1/models/{model_id}/load");
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&url)
+            .bearer_auth(&auth_token)
+            .send()
+            .await
+            .map_err(|e| RuntimeError::ModelSwitchFailed(format!("could not reach {url}: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RuntimeError::ModelSwitchFailed(format!(
+                "runtime rejected model load ({status}): {body}"
+            )));
+        }
+
+        let body: serde_json::Value = resp.json().await.map_err(|e| {
+            RuntimeError::ModelSwitchFailed(format!("unexpected response shape: {e}"))
+        })?;
+        Ok(body.get("load_seconds").and_then(|v| v.as_f64()))
+    }
+
     /// Start (or return the descriptor of an already-running instance of) a
     /// managed provider. Blocks until the runtime reports healthy.
     pub async fn start(
@@ -818,6 +1192,17 @@ impl RuntimeManager {
             (entry.launch)(port, &auth_token, selected_model.as_deref(), options)
         };
 
+        // A runtime launched without its model still answers health checks,
+        // so it would look ready and then reject every transcription.
+        if let Some(model_id) = selected_model.as_deref() {
+            let engine = self.engine(id)?;
+            if engine.requires_pulled_model() && engine.verify_cached_model(model_id)?.is_none() {
+                return Err(RuntimeError::ModelNotInstalled(format!(
+                    "{id}/{model_id} is not downloaded; pull it before starting the provider"
+                )));
+            }
+        }
+
         let instance = supervisor::spawn(
             SpawnSpec {
                 program: launch.program,
@@ -841,6 +1226,7 @@ impl RuntimeManager {
                 instance,
                 last_activity: Instant::now(),
                 streaming,
+                pinned: false,
             },
         );
         Ok(descriptor)
@@ -905,10 +1291,36 @@ impl RuntimeManager {
         Ok(())
     }
 
-    /// Stop any running instance that hasn't been started, queried, or
-    /// heartbeated within the configured idle timeout. Returns the ids of
-    /// providers that were stopped, for logging by the caller's sweep loop.
-    /// A no-op (returns empty) if idle auto-stop is disabled.
+    /// Exempts a running instance from `sweep_idle` until `unpin`'d. See
+    /// `RunningEntry::pinned`'s doc comment for why this exists instead of
+    /// just disabling the idle timeout globally.
+    pub async fn pin(&self, id: &ProviderId) -> Result<(), RuntimeError> {
+        let mut instances = self.instances.lock().await;
+        let running = instances
+            .get_mut(id.as_str())
+            .ok_or_else(|| RuntimeError::RuntimeNotRunning(id.to_string()))?;
+        running.pinned = true;
+        running.last_activity = Instant::now();
+        Ok(())
+    }
+
+    /// Reverses `pin` -- the instance becomes eligible for `sweep_idle`
+    /// again, subject to its own idle clock from this moment (not
+    /// retroactively idle just because it was pinned for a while).
+    pub async fn unpin(&self, id: &ProviderId) -> Result<(), RuntimeError> {
+        let mut instances = self.instances.lock().await;
+        let running = instances
+            .get_mut(id.as_str())
+            .ok_or_else(|| RuntimeError::RuntimeNotRunning(id.to_string()))?;
+        running.pinned = false;
+        running.last_activity = Instant::now();
+        Ok(())
+    }
+
+    /// Stop any running, unpinned instance that hasn't been started,
+    /// queried, or heartbeated within the configured idle timeout. Returns
+    /// the ids of providers that were stopped, for logging by the caller's
+    /// sweep loop. A no-op (returns empty) if idle auto-stop is disabled.
     pub async fn sweep_idle(&self) -> Vec<String> {
         let Some(idle_timeout) = self.idle_timeout else {
             return Vec::new();
@@ -919,7 +1331,9 @@ impl RuntimeManager {
             let mut instances = self.instances.lock().await;
             let expired_ids: Vec<String> = instances
                 .iter()
-                .filter(|(_, entry)| now.duration_since(entry.last_activity) >= idle_timeout)
+                .filter(|(_, entry)| {
+                    !entry.pinned && now.duration_since(entry.last_activity) >= idle_timeout
+                })
                 .map(|(id, _)| id.clone())
                 .collect();
             expired_ids
@@ -1027,7 +1441,7 @@ async fn fetch_streaming_capability(port: u16, auth_token: &str) -> Option<Strea
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::faster_whisper;
+    use crate::providers::{faster_whisper, sherpa_onnx};
 
     /// `python -m venv` only creates `Scripts\python.exe` on Windows — no
     /// `python3.exe` — matching `providers::faster_whisper::python_candidates`'s
@@ -1321,6 +1735,33 @@ http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
     }
 
     #[tokio::test]
+    async fn pinned_instance_survives_a_sweep_that_would_otherwise_stop_it() {
+        let manager = manager_with_faster_whisper_installed(Some(Duration::from_millis(50))).await;
+        let id = ProviderId::new("faster-whisper").unwrap();
+
+        manager.start(&id, &StartOptions::default()).await.unwrap();
+        manager.pin(&id).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let stopped = manager.sweep_idle().await;
+        assert!(
+            stopped.is_empty(),
+            "a pinned instance must never be swept, regardless of idle time: {stopped:?}"
+        );
+        assert_eq!(manager.status(&id).await, RuntimeStatus::Running);
+
+        // Unpin and confirm it becomes sweepable again on its own idle clock
+        // (not retroactively idle just because it was pinned for a while --
+        // `unpin` resets `last_activity`).
+        manager.unpin(&id).await.unwrap();
+        assert_eq!(manager.status(&id).await, RuntimeStatus::Running);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let stopped = manager.sweep_idle().await;
+        assert_eq!(stopped, vec!["faster-whisper".to_string()]);
+    }
+
+    #[tokio::test]
     async fn select_model_validates_against_the_provider_catalog() {
         let manager = manager_with_faster_whisper_installed(None).await;
         let id = ProviderId::new("faster-whisper").unwrap();
@@ -1340,6 +1781,42 @@ http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
             manager.selected_model(&id).await,
             Some("Systran/faster-whisper-tiny".to_string())
         );
+    }
+
+    #[tokio::test]
+    // Same env-lock-across-await reasoning as the model pull tests below.
+    #[allow(clippy::await_holding_lock)]
+    async fn start_refuses_a_selected_model_that_was_never_pulled() {
+        let _guard = faster_whisper::lock_env_test();
+        let root =
+            std::env::temp_dir().join(format!("stt-start-model-missing-test-{}", Uuid::new_v4()));
+        // SAFETY: test-only env var mutation, scoped to this single test.
+        unsafe {
+            std::env::set_var(sherpa_onnx::MODEL_CACHE_DIR_ENV_VAR, &root);
+        }
+        let manager = RuntimeManager::new(None);
+        let id = ProviderId::new("sherpa-onnx").unwrap();
+        manager
+            .register_install(&id, RuntimeVariant::Cpu, fake_launch())
+            .await;
+        manager
+            .select_model(&id, "parakeet-tdt-0.6b-v2")
+            .await
+            .unwrap();
+
+        let result = manager.start(&id, &StartOptions::default()).await;
+        let status = manager.status(&id).await;
+
+        unsafe {
+            std::env::remove_var(sherpa_onnx::MODEL_CACHE_DIR_ENV_VAR);
+        }
+        std::fs::remove_dir_all(&root).ok();
+        assert!(
+            matches!(result, Err(RuntimeError::ModelNotInstalled(_))),
+            "expected ModelNotInstalled, got {:?}",
+            result.map(|d| d.base_url)
+        );
+        assert_eq!(status, RuntimeStatus::Stopped);
     }
 
     #[tokio::test]
@@ -1723,6 +2200,71 @@ http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
             .install_operation("not-a-real-op-id")
             .await
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_operation_rejects_an_unknown_operation_id() {
+        let manager = RuntimeManager::new(None);
+        let err = manager.cancel_operation("not-a-real-op-id").unwrap_err();
+        assert!(matches!(err, RuntimeError::InstallOperationNotFound(_)));
+    }
+
+    #[tokio::test]
+    // Held across `.await` deliberately: see the identical comment on
+    // `begin_install_returns_installed_immediately_when_the_variant_is_already_cached`.
+    #[allow(clippy::await_holding_lock)]
+    async fn cancel_operation_aborts_an_in_flight_variant_download_and_marks_it_cancelled() {
+        let _guard = faster_whisper::lock_env_test();
+        let unique = std::process::id();
+        let cache_root =
+            std::env::temp_dir().join(format!("stt-manager-cancel-test-cache-{unique}"));
+
+        // Points at a base URL nothing is listening on: `begin_install`
+        // returns before its background task is ever polled (single-thread
+        // `#[tokio::test]` runtime, no `.await` between spawning it and
+        // returning), so `cancel_operation` below aborts it before it makes
+        // any real network attempt — the base URL never needs to work.
+        unsafe {
+            std::env::set_var(
+                faster_whisper::RELEASE_BASE_URL_ENV_VAR,
+                "http://127.0.0.1:1",
+            );
+            std::env::set_var(faster_whisper::RUNTIME_CACHE_DIR_ENV_VAR, &cache_root);
+            std::env::set_var(faster_whisper::RUNTIME_DIR_ENV_VAR, "/nonexistent/for/sure");
+        }
+
+        let manager = Arc::new(RuntimeManager::new(None));
+        let id = ProviderId::new("faster-whisper").unwrap();
+        let outcome = manager
+            .begin_install(&id, Some(RuntimeVariant::Cpu))
+            .await
+            .unwrap();
+        let operation_id = match outcome {
+            InstallOutcome::Downloading { operation_id, .. } => operation_id,
+            InstallOutcome::Installed { .. } => {
+                panic!("expected a fresh cache to require a download")
+            }
+        };
+
+        manager.cancel_operation(&operation_id).unwrap();
+        let state = manager.install_operation(&operation_id).await.unwrap();
+
+        unsafe {
+            std::env::remove_var(faster_whisper::RELEASE_BASE_URL_ENV_VAR);
+            std::env::remove_var(faster_whisper::RUNTIME_CACHE_DIR_ENV_VAR);
+            std::env::remove_var(faster_whisper::RUNTIME_DIR_ENV_VAR);
+        }
+        std::fs::remove_dir_all(&cache_root).ok();
+
+        assert!(
+            matches!(state.status, InstallOperationStatus::Cancelled),
+            "expected Cancelled, got {state:?}"
+        );
+
+        // Cancelling again must be rejected -- the operation already
+        // finished (as Cancelled), so there is nothing left to abort.
+        let err = manager.cancel_operation(&operation_id).unwrap_err();
+        assert!(matches!(err, RuntimeError::OperationNotCancelable(_)));
     }
 
     /// Spins up a local `python3 -m http.server` serving a fake release
@@ -2173,5 +2715,27 @@ http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
             !gpu_survived,
             "expected the never-registered gpu variant's stray cache to be gone too"
         );
+    }
+
+    /// Regression test for the bug `RuntimeLanguageResponse`'s doc comment
+    /// describes: an enum-level `#[serde(rename_all)]` does not reach into a
+    /// struct variant's own fields, so `loadSeconds` was silently unmatched
+    /// (`cargo check` was green throughout) until this was caught by an
+    /// actual request against a running sherpad instance.
+    #[test]
+    fn runtime_language_response_deserializes_sherpad_reloaded_shape() {
+        let parsed: RuntimeLanguageResponse =
+            serde_json::from_str(r#"{"status":"reloaded","loadSeconds":1.23}"#).unwrap();
+        assert_eq!(
+            parsed,
+            RuntimeLanguageResponse::Reloaded { load_seconds: 1.23 }
+        );
+    }
+
+    #[test]
+    fn runtime_language_response_deserializes_sherpad_unchanged_shape() {
+        let parsed: RuntimeLanguageResponse =
+            serde_json::from_str(r#"{"status":"unchanged"}"#).unwrap();
+        assert_eq!(parsed, RuntimeLanguageResponse::Unchanged);
     }
 }

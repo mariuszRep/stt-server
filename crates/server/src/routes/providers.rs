@@ -163,6 +163,22 @@ pub async fn install_operation_status(
         .ok_or_else(|| runtime_error_response(RuntimeError::InstallOperationNotFound(operation_id)))
 }
 
+/// `POST /v1/install-operations/:id/cancel` — cancels a still-`Downloading`
+/// provider-variant or model-pull operation, aborting the in-flight
+/// download and removing whatever partial file it had written. `409
+/// OPERATION_NOT_CANCELABLE` if the operation already finished
+/// (`Complete`/`Failed`/`Cancelled`); `404` if the id is unknown.
+pub async fn cancel_install_operation(
+    State(state): State<AppState>,
+    Path(operation_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .runtime_manager
+        .cancel_operation(&operation_id)
+        .map_err(runtime_error_response)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Optional device/compute_type/bind_host/auth_token hints. `POST
 /// /v1/providers/:id/start` with no body (or `{}`) keeps today's
 /// loopback/auto-detect behavior; existing callers (the CLI's no-flag case,
@@ -300,6 +316,35 @@ pub async fn provider_heartbeat(
     state
         .runtime_manager
         .touch(&provider_id)
+        .await
+        .map_err(runtime_error_response)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /v1/providers/:id/pin` -- exempts a running provider from idle
+/// shutdown until unpinned. See `RuntimeManager::pin`'s doc comment.
+pub async fn pin_provider(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let provider_id = parse_provider_id(id)?;
+    state
+        .runtime_manager
+        .pin(&provider_id)
+        .await
+        .map_err(runtime_error_response)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /v1/providers/:id/unpin` -- reverses `pin_provider`.
+pub async fn unpin_provider(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let provider_id = parse_provider_id(id)?;
+    state
+        .runtime_manager
+        .unpin(&provider_id)
         .await
         .map_err(runtime_error_response)?;
     Ok(StatusCode::NO_CONTENT)

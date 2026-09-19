@@ -36,11 +36,16 @@ fn path_str(dir: &Path, rel: &str) -> String {
 }
 
 /// Build an `OfflineRecognizerConfig` for `entry` from files already
-/// extracted at `install_dir`, per its model family.
+/// extracted at `install_dir`, per its model family. `language` overrides
+/// `entry.default_language` -- callers building the recognizer for an
+/// explicit language selection (see `api::set_model_language`) pass the
+/// requested language; the lazy-load lookup path passes
+/// `entry.default_language` to preserve today's exact behavior.
 pub fn build_config(
     entry: &ModelEntry,
     install_dir: &Path,
     num_threads: i32,
+    language: &str,
 ) -> OfflineRecognizerConfig {
     let mut config = OfflineRecognizerConfig::default();
 
@@ -48,7 +53,7 @@ pub fn build_config(
         ModelFiles::SenseVoice { model, tokens } => {
             config.model_config.sense_voice = OfflineSenseVoiceModelConfig {
                 model: Some(path_str(install_dir, model)),
-                language: Some(entry.default_language.to_string()),
+                language: Some(language.to_string()),
                 use_itn: true,
             };
             config.model_config.tokens = Some(path_str(install_dir, tokens));
@@ -61,7 +66,7 @@ pub fn build_config(
             config.model_config.whisper = OfflineWhisperModelConfig {
                 encoder: Some(path_str(install_dir, encoder)),
                 decoder: Some(path_str(install_dir, decoder)),
-                language: Some(entry.default_language.to_string()),
+                language: Some(language.to_string()),
                 task: Some("transcribe".to_string()),
                 tail_paddings: -1,
                 enable_token_timestamps: true,

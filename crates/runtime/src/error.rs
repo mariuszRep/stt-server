@@ -15,6 +15,9 @@ pub enum RuntimeError {
     #[error("model not found for provider: {0}")]
     ModelNotFound(String),
 
+    #[error("model not installed: {0}")]
+    ModelNotInstalled(String),
+
     #[error("runtime not running: {0}")]
     RuntimeNotRunning(String),
 
@@ -32,6 +35,9 @@ pub enum RuntimeError {
 
     #[error("install operation not found: {0}")]
     InstallOperationNotFound(String),
+
+    #[error("install operation cannot be cancelled: {0}")]
+    OperationNotCancelable(String),
 
     #[error("invalid start options: {0}")]
     InvalidStartOptions(String),

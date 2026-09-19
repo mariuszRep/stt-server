@@ -10,13 +10,20 @@ from app import config
 
 WHISPER_SAMPLE_RATE = 16000
 
-_model: WhisperModel | None = None
-_model_device: str | None = None
-_model_compute_type: str | None = None
-_model_name: str | None = None
+# Every model this process has loaded, keyed by (model_id, device,
+# compute_type) so the same model on two different devices/compute types
+# (e.g. mid CUDA-fallback) is never confused for the same cache entry.
+# Mirrors sherpad's multi-model registry (`sherpad/src/state.rs`'s
+# `ModelState::Loaded` map) -- parity between the two engines' warm-pool
+# behavior is the whole point (see concurrent-multi-provider-serving).
+# Nothing evicts automatically, same as sherpad; `unload_model()` is the
+# only way an entry leaves this dict.
+_models: dict[tuple[str, str, str], WhisperModel] = {}
 # faster-whisper's transcribe() is CPU/GPU-bound and not safe to run concurrently
 # on a single model instance. Serialize inference so parallel requests queue
-# instead of corrupting shared state or thrashing the device.
+# instead of corrupting shared state or thrashing the device. Also guards
+# `_models` itself -- every read/write of that dict happens while holding
+# this lock, so it needs no lock of its own.
 _infer_lock = threading.Lock()
 _state_lock = threading.Lock()
 
@@ -68,35 +75,69 @@ def get_runtime_status() -> dict[str, object]:
     return data
 
 
-def get_model(device: str, compute_type: str) -> WhisperModel:
-    global _model, _model_device, _model_compute_type, _model_name
-    if (
-        _model is None
-        or _model_device != device
-        or _model_compute_type != compute_type
-        or _model_name != config.MODEL
-    ):
+def get_model(model_id: str, device: str, compute_type: str) -> WhisperModel:
+    """Returns `model_id`'s `WhisperModel` for `(device, compute_type)`,
+    loading and caching it if this is the first time this exact combination
+    has been requested. Must be called while holding `_infer_lock` -- every
+    caller in this file already does (`transcribe()`'s two `get_model` call
+    sites, `admin_switch_model`'s `_swap()` via `main.py`, and warm-up/preload
+    calls), so `_models` is never read or written unlocked.
+    """
+    key = (model_id, device, compute_type)
+    model = _models.get(key)
+    if model is None:
         start = time.perf_counter()
         print(
-            f"[voice-typer] loading model={config.MODEL} device={device} compute_type={compute_type}",
+            f"[voice-typer] loading model={model_id} device={device} compute_type={compute_type}",
             flush=True,
         )
-        _model = WhisperModel(
-            config.MODEL,
+        model = WhisperModel(
+            model_id,
             device=device,
             compute_type=compute_type,
-            download_root=config.MODEL_DIR,
+            download_root=config.model_download_root(model_id),
         )
-        _model_device = device
-        _model_compute_type = compute_type
-        _model_name = config.MODEL
+        _models[key] = model
         load_seconds = time.perf_counter() - start
         _set_stats(model_loaded=True, last_model_load_seconds=load_seconds)
         print(
-            f"[voice-typer] model loaded in {load_seconds:.2f}s on {device}/{compute_type}",
+            f"[voice-typer] model {model_id} loaded in {load_seconds:.2f}s on {device}/{compute_type}",
             flush=True,
         )
-    return _model
+    return model
+
+
+def is_model_loaded(model_id: str, device: str, compute_type: str) -> bool:
+    with _infer_lock:
+        return (model_id, device, compute_type) in _models
+
+
+def loaded_models() -> list[str]:
+    """Distinct model ids this process currently holds resident, regardless
+    of which device/compute_type they were loaded under -- what
+    `GET /v1/models` reports, mirroring sherpad's `status: "loaded"`.
+    """
+    with _infer_lock:
+        seen: list[str] = []
+        for (model_id, _device, _compute_type) in _models.keys():
+            if model_id not in seen:
+                seen.append(model_id)
+        return seen
+
+
+def unload_model(model_id: str) -> bool:
+    """Frees every cached entry for `model_id` (all device/compute_type
+    combinations). Returns whether anything was actually unloaded. Mirrors
+    sherpad's `unload_model` endpoint -- added for parity, even though
+    nothing calls it automatically yet (sherpad's own registry never evicts
+    either; freeing memory is an explicit, deliberate operation on both
+    engines, not an automatic one).
+    """
+    with _infer_lock:
+        keys = [key for key in _models if key[0] == model_id]
+        for key in keys:
+            del _models[key]
+        return bool(keys)
 
 
 @dataclass
@@ -161,7 +202,7 @@ def _resample_to_whisper_rate(pcm: np.ndarray, src_rate: int) -> np.ndarray:
 
 
 def _run(
-    model: WhisperModel, audio: str | np.ndarray, initial_prompt: str | None
+    model: WhisperModel, audio: str | np.ndarray, initial_prompt: str | None, language: str | None
 ) -> TranscriptionOutput:
     # word_timestamps=False: per-word start/end/probability costs a real extra
     # cross-attention alignment pass and nothing in the protocol or its only consumer
@@ -181,7 +222,7 @@ def _run(
     # triggers, instead of paying for up to 6 re-decodes.
     segments_iter, info = model.transcribe(
         audio,
-        language=config.DEFAULT_LANGUAGE,
+        language=language,
         beam_size=config.BEAM_SIZE,
         vad_filter=config.VAD_FILTER,
         initial_prompt=initial_prompt,
@@ -214,11 +255,28 @@ def _fmt(seconds: float | None, digits: int = 3) -> str:
     return f"{seconds:.{digits}f}s" if seconds is not None else "n/a"
 
 
-def transcribe(audio_path: str, prompt: str | None = None) -> TranscriptionOutput:
+def transcribe(
+    audio_path: str,
+    prompt: str | None = None,
+    language: str | None = None,
+    model_id: str | None = None,
+) -> TranscriptionOutput:
     initial_prompt = prompt.strip() if prompt and prompt.strip() else None
+    # Request-level override, falling back to the process-level env var --
+    # never the other way around, so a request that doesn't specify a
+    # language keeps today's exact behavior (VOICE_TYPER_LANGUAGE, or
+    # faster-whisper's own auto-detect when that's unset too).
+    resolved_language = language.strip() if language and language.strip() else config.DEFAULT_LANGUAGE
+    # Same pattern, mirroring sherpad's `params.model -> state.default_model`
+    # (`sherpad/src/api.rs:589-597`): an explicit per-request model always
+    # wins, an omitted one keeps today's exact single-model behavior. This is
+    # what lets a caller hold several models warm and pick one per request
+    # instead of "switching" the process's active model at all.
+    resolved_model = model_id.strip() if model_id and model_id.strip() else config.MODEL
     started_at = time.perf_counter()
     print(
-        f"[voice-typer] transcription queued file={audio_path} requested={config.REQUESTED_DEVICE} active={config.DEVICE}/{config.COMPUTE_TYPE}",
+        f"[voice-typer] transcription queued file={audio_path} model={resolved_model} "
+        f"requested={config.REQUESTED_DEVICE} active={config.DEVICE}/{config.COMPUTE_TYPE}",
         flush=True,
     )
 
@@ -242,9 +300,9 @@ def transcribe(audio_path: str, prompt: str | None = None) -> TranscriptionOutpu
         queue_wait = time.perf_counter() - pre_lock_at
         result: TranscriptionOutput | None = None
         try:
-            model = get_model(config.DEVICE, config.COMPUTE_TYPE)
+            model = get_model(resolved_model, config.DEVICE, config.COMPUTE_TYPE)
             infer_start = time.perf_counter()
-            result = _run(model, audio, initial_prompt)
+            result = _run(model, audio, initial_prompt, resolved_language)
             return result
         except Exception as exc:
             # CUDA device-count detection can report a device whose runtime
@@ -263,9 +321,9 @@ def transcribe(audio_path: str, prompt: str | None = None) -> TranscriptionOutpu
                 cuda_runtime_ok=config.CUDA_RUNTIME_OK,
                 cuda_error=config.CUDA_ERROR,
             )
-            model = get_model("cpu", "int8")
+            model = get_model(resolved_model, "cpu", "int8")
             infer_start = time.perf_counter()
-            result = _run(model, audio, initial_prompt)
+            result = _run(model, audio, initial_prompt, resolved_language)
             return result
         finally:
             infer_seconds = time.perf_counter() - infer_start if "infer_start" in locals() else None
