@@ -1,180 +1,90 @@
 name: Release
 
+# Tag-triggered release: promotes the exact artifacts a successful
+# candidate-server.yml run already produced for the tagged commit — it does
+# NOT rebuild. Fails hard when no successful candidate run exists for
+# github.sha (dispatch candidate-server.yml on the SHA first), and again if
+# the fetched files don't match the candidate's SHA256SUMS manifests. The
+# version in the artifacts is whatever was committed on the ref at candidate
+# time — version bumps land on the branch before the final candidate run
+# (RELEASE_PROCESS.md gate 3).
+
 on:
   push:
     tags: ["v*"]
 
 jobs:
-  build-binaries:
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            asset: stt-linux-x86_64
-          - os: windows-latest
-            asset: stt-windows-x86_64.exe
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --bin stt
-      - shell: bash
-        run: |
-          mkdir -p dist
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            cp target/release/stt.exe "dist/${{ matrix.asset }}"
-          else
-            cp target/release/stt "dist/${{ matrix.asset }}"
-          fi
-      - name: Audit release artifact
-        shell: bash
-        run: bash scripts/verify-release-artifact.sh dist
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.asset }}
-          path: dist/${{ matrix.asset }}
-
-  # Builds the managed faster-whisper runtime as a standalone PyInstaller
-  # binary, reusing whisper-vibes/.github/workflows/desktop-build.yml's
-  # VOICE_TYPER_BUILD_VARIANT pattern. GPU (bundled CUDA/cuDNN DLLs, much
-  # larger) is Windows-only — CUDA acceleration only matters for the
-  # Windows Tauri consumer; the CPU variant covers Linux/dev use.
-  #
-  # PyInstaller's spec always names its output `voice-typer-backend[.exe]`
-  # regardless of variant, so without renaming, the cpu and gpu legs on the
-  # same OS would upload two files with an identical name and collide. Each
-  # leg renames its output to `stt-runtime`'s own
-  # `faster-whisper-runtime-{os}-{variant}{ext}` convention
-  # (`crates/runtime/src/providers/faster_whisper.rs::asset_name`) before
-  # upload, which is also the exact filename `download_variant` requests at
-  # install time — this naming is a contract between the two, not cosmetic.
-  build-faster-whisper-sidecar:
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            os_slug: linux
-            variant: cpu
-            ext: ""
-          - os: windows-latest
-            os_slug: windows
-            variant: cpu
-            ext: ".exe"
-          - os: windows-latest
-            os_slug: windows
-            variant: gpu
-            ext: ".exe"
-    runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        working-directory: runtimes/faster-whisper
-    env:
-      VOICE_TYPER_BUILD_VARIANT: ${{ matrix.variant }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - shell: bash
-        run: |
-          python -m venv venv
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            venv/Scripts/pip install -r requirements.txt pyinstaller
-            venv/Scripts/pyinstaller --clean --noconfirm voice-typer-backend.spec
-          else
-            venv/bin/pip install -r requirements.txt pyinstaller
-            venv/bin/pyinstaller --clean --noconfirm voice-typer-backend.spec
-          fi
-      - name: Rename to the faster-whisper-runtime-{os}-{variant} release-asset convention
-        shell: bash
-        run: |
-          mv "dist/voice-typer-backend${{ matrix.ext }}" \
-             "dist/faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}${{ matrix.ext }}"
-      - name: Audit release artifact
-        shell: bash
-        run: bash ../../scripts/verify-release-artifact.sh dist
-      - uses: actions/upload-artifact@v4
-        with:
-          name: faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}
-          path: runtimes/faster-whisper/dist/faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}${{ matrix.ext }}
-
-  # Builds the sherpa-onnx managed runtime (sherpad) as a standalone binary.
-  # Upstream k2-fsa/sherpa-onnx ships no server conforming to this project's
-  # local provider protocol (only demo binaries and its own bespoke
-  # WebSocket-server protocol — verified directly against its releases, see
-  # generalize-provider-engine-installation's goal notes), so — like
-  # faster-whisper — stt-server builds and hosts this binary itself rather
-  # than fetching a ready-made one from sherpa-onnx's own releases. CPU-only
-  # today (sherpad links a CPU-only onnxruntime build; GPU is a separate
-  # future goal), so there is only one variant per OS, unlike
-  # faster-whisper's cpu/gpu split. The asset name
-  # (`sherpad-{os}-cpu{ext}`) is the exact contract
-  # add-sherpa-onnx-provider's `download_variant` resolves against.
-  build-sherpad:
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            os_slug: linux
-            ext: ""
-          - os: windows-latest
-            os_slug: windows
-            ext: ".exe"
-    runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        working-directory: runtimes/sherpa-onnx
-    env:
-      # See the matching comment in ci.yml's `sherpad` job: audiopus_sys's
-      # vendored libopus CMakeLists predates CMake 3.5's minimum-version
-      # floor, so a current CMake (the runner images' default) refuses to
-      # configure it without this.
-      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: runtimes/sherpa-onnx
-          # sherpa-onnx-sys downloads its prebuilt libs into target/sherpa-onnx-prebuilt,
-          # which rust-cache would otherwise prune while keeping the build-script
-          # output -- a cache hit then skips the download and fails to link
-          # `sherpa-onnx-c-api`. The key suffix retires caches saved without it.
-          key: sherpa-prebuilt-v1
-          cache-directories: runtimes/sherpa-onnx/target/sherpa-onnx-prebuilt
-      - run: cargo build --release --bin sherpad
-      - name: Rename to the sherpad-{os}-cpu release-asset convention
-        shell: bash
-        run: |
-          mkdir -p dist
-          cp "target/release/sherpad${{ matrix.ext }}" "dist/sherpad-${{ matrix.os_slug }}-cpu${{ matrix.ext }}"
-      - name: Audit release artifact
-        shell: bash
-        run: bash ../../scripts/verify-release-artifact.sh dist
-      - uses: actions/upload-artifact@v4
-        with:
-          name: sherpad-${{ matrix.os_slug }}-cpu
-          path: runtimes/sherpa-onnx/dist/sherpad-${{ matrix.os_slug }}-cpu${{ matrix.ext }}
-
   release:
-    needs: [build-binaries, build-faster-whisper-sidecar, build-sherpad]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
+      - name: Find the successful candidate run for this commit
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHA="${{ github.sha }}"
+          echo "Looking for a successful candidate-server.yml run on ${SHA}"
+          run_id=$(gh run list --workflow candidate-server.yml --commit "${SHA}" --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+          if [ -z "${run_id}" ]; then
+            echo "::error::No successful candidate-server.yml run found for ${SHA}."
+            echo "::error::Dispatch one first: gh workflow run candidate-server.yml --ref ${SHA}"
+            exit 1
+          fi
+          echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
+          echo "Found candidate run ${run_id}"
+
+      - name: Download candidate artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download "${{ steps.candidate.outputs.run_id }}" --dir artifacts
+
+      # Each artifact dir (artifacts/<artifact-name>/) carries the
+      # SHA256SUMS.txt the candidate job generated beside its binary; refuse
+      # to publish anything that doesn't match.
+      - name: Verify checksums against candidate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          for d in artifacts/*/; do
+            if [ ! -f "${d}SHA256SUMS.txt" ]; then
+              echo "::error::${d} has no SHA256SUMS.txt — candidate artifacts must carry their checksum manifest"
+              exit 1
+            fi
+            (cd "${d}" && sha256sum -c SHA256SUMS.txt)
+          done
+          echo "All promoted artifacts verified against candidate SHA256SUMS."
+
+      - name: Stage release assets
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f ! -name 'SHA256SUMS.txt' -exec cp {} release-assets/ \;
+          # Publish a combined manifest so consumers can verify downloads too.
+          (cd release-assets && sha256sum * > SHA256SUMS.txt)
+          ls -lh release-assets/
+
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          STATIC_NOTES="protocolVersion: 1, schemaVersion: 1 (RuntimeConnectionDescriptor). See CONVENTIONS.md/VISION.md for compatibility guarantees."
+          # Append the auto-generated change list under the static line. It
+          # comes from the generate-notes API (gh CLI can't combine --notes
+          # with --generate-notes) and describes THIS repo's own history —
+          # appropriate for a public source-repo release.
+          GENERATED=$(gh api "repos/${{ github.repository }}/releases/generate-notes" \
+            -f tag_name="${{ github.ref_name }}" --jq '.body' 2>/dev/null || true)
+          if [ -n "${GENERATED}" ]; then
+            printf '%s\n\n## What'"'"'s Changed\n\n%s\n' "${STATIC_NOTES}" "${GENERATED}" > /tmp/release-notes.md
+          else
+            printf '%s\n' "${STATIC_NOTES}" > /tmp/release-notes.md
+          fi
           gh release create "${{ github.ref_name }}" \
             --title "${{ github.ref_name }}" \
-            --notes "protocolVersion: 1, schemaVersion: 1 (RuntimeConnectionDescriptor). See CONVENTIONS.md/VISION.md for compatibility guarantees." \
-            artifacts/*/*
+            --notes-file /tmp/release-notes.md \
+            release-assets/*
 
   # split-current-functionality-into-three-components's Scope 7 / AC8-9: proves
   # the latest *published* @open-vibe-ai/stt-sdk actually works against *this*

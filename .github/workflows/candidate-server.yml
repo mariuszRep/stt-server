@@ -1,13 +1,20 @@
 name: Server Candidate
 
-# Manually dispatchable validation build only. Builds the same three
-# artifacts as release.yml (stt control plane, faster-whisper sidecar,
+# Manually dispatchable validation build only. Builds the same artifacts
+# release.yml later promotes (stt control plane, faster-whisper sidecar,
 # sherpad) and uploads them as Actions artifacts for manual download/install
-# per RELEASE_PROCESS.md gate 3. Does NOT create a GitHub Release and has no
-# `contents: write` permission — structurally incapable of publishing.
+# per RELEASE_PROCESS.md gate 3. Each artifact carries a SHA256SUMS.txt that
+# release.yml's promote step verifies before publishing. Does NOT create a
+# GitHub Release and has no `contents: write` permission — structurally
+# incapable of publishing.
 
 on:
   workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch or commit to build (defaults to the current default branch)"
+        required: false
+        type: string
 
 jobs:
   build-binaries:
@@ -21,6 +28,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --bin stt
@@ -35,10 +44,19 @@ jobs:
       - name: Audit release artifact
         shell: bash
         run: bash scripts/verify-release-artifact.sh dist
+      - name: Generate SHA256SUMS manifest
+        shell: bash
+        run: |
+          cd dist
+          sha256sum "${{ matrix.asset }}" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
-          path: dist/${{ matrix.asset }}
+          path: |
+            dist/${{ matrix.asset }}
+            dist/SHA256SUMS.txt
+          retention-days: 30
 
   build-faster-whisper-sidecar:
     strategy:
@@ -64,6 +82,8 @@ jobs:
       VOICE_TYPER_BUILD_VARIANT: ${{ matrix.variant }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -85,10 +105,19 @@ jobs:
       - name: Audit release artifact
         shell: bash
         run: bash ../../scripts/verify-release-artifact.sh dist
+      - name: Generate SHA256SUMS manifest
+        shell: bash
+        run: |
+          cd dist
+          sha256sum "faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}${{ matrix.ext }}" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
         with:
           name: faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}
-          path: runtimes/faster-whisper/dist/faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}${{ matrix.ext }}
+          path: |
+            runtimes/faster-whisper/dist/faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}${{ matrix.ext }}
+            runtimes/faster-whisper/dist/SHA256SUMS.txt
+          retention-days: 30
 
   build-sherpad:
     strategy:
@@ -110,6 +139,8 @@ jobs:
       CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -129,7 +160,16 @@ jobs:
       - name: Audit release artifact
         shell: bash
         run: bash ../../scripts/verify-release-artifact.sh dist
+      - name: Generate SHA256SUMS manifest
+        shell: bash
+        run: |
+          cd dist
+          sha256sum "sherpad-${{ matrix.os_slug }}-cpu${{ matrix.ext }}" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
         with:
           name: sherpad-${{ matrix.os_slug }}-cpu
-          path: runtimes/sherpa-onnx/dist/sherpad-${{ matrix.os_slug }}-cpu${{ matrix.ext }}
+          path: |
+            runtimes/sherpa-onnx/dist/sherpad-${{ matrix.os_slug }}-cpu${{ matrix.ext }}
+            runtimes/sherpa-onnx/dist/SHA256SUMS.txt
+          retention-days: 30
