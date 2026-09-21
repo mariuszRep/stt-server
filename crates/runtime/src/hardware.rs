@@ -58,7 +58,8 @@ fn detect_nvidia_gpu() -> (bool, Option<String>, Option<String>, Option<u64>) {
 /// a pin/eviction decision) so both read from the same `nvidia-smi` call
 /// shape instead of drifting apart. `None` whenever there's no NVIDIA GPU or
 /// the query fails — never blocks the caller on a missing signal.
-fn detect_nvidia_gpu_memory() -> Option<(Option<String>, Option<String>, Option<u64>, Option<u64>)> {
+fn detect_nvidia_gpu_memory() -> Option<(Option<String>, Option<String>, Option<u64>, Option<u64>)>
+{
     let output = Command::new("nvidia-smi")
         .args([
             "--query-gpu=name,driver_version,memory.total,memory.free",
