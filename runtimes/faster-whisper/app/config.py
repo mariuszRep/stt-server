@@ -135,14 +135,39 @@ def _own_build_variant() -> str | None:
 HOST = os.environ.get("VOICE_TYPER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("VOICE_TYPER_PORT", "8000"))
 MODEL = os.environ.get("VOICE_TYPER_MODEL", "Systran/faster-whisper-small")
-# Explicit, stt-server-owned download location for this model's weights
-# (crates/runtime/src/providers/faster_whisper.rs::cached_model_dir) instead
-# of whatever the OS-default HuggingFace cache happens to be — the
-# CONVENTIONS.md "no invisible model download" rule requires the location
-# be explicit and inspectable. `None` (unset) falls back to faster_whisper's
-# own default cache resolution, which only real-world callers outside the
-# managed-runtime launch path (build_env always sets this) would hit.
-MODEL_DIR = os.environ.get("VOICE_TYPER_MODEL_DIR") or None
+# The provider's whole model cache root (every model's weights live under
+# `<this>/<model_id>/`), not one model's own directory -- mirrors sherpad's
+# identically-named env var (`sherpad/src/main.rs`'s doc comment), so both
+# engines interpret it the same way now that faster-whisper can hold more
+# than one model resident at once (see `transcribe.py`'s per-model cache).
+# `VOICE_TYPER_MODEL_DIR` is not part of the normative Local Provider
+# Protocol (checked: not referenced by `specify-local-provider-protocol-v1`)
+# so redefining it is safe -- every reader (this file, and both Rust
+# provider engines) changed together in the same pass. `None` (unset) falls
+# back to faster_whisper's own default HuggingFace cache resolution, which
+# only real-world callers outside the managed-runtime launch path (build_env
+# always sets this) would hit.
+MODEL_ROOT = os.environ.get("VOICE_TYPER_MODEL_DIR") or None
+
+
+def model_download_root(model_id: str) -> str | None:
+    """Explicit, stt-server-owned download location for `model_id`'s weights
+    (`<MODEL_ROOT>/<model_id>/`, e.g. `.../faster-whisper/Systran/
+    faster-whisper-small/`) instead of whatever the OS-default HuggingFace
+    cache happens to be -- the CONVENTIONS.md "no invisible model download"
+    rule requires the location be explicit and inspectable. A pure function
+    of `model_id`, not process-global mutable state: `transcribe.py`'s model
+    cache can hold several models at once, each loaded with its own root,
+    with no risk of one load's directory leaking into another's the way a
+    single mutable `MODEL_DIR` global once could (and did -- see
+    `model-hot-swap-no-restart`'s fixed bug). `None` when `MODEL_ROOT` is
+    unset, matching the old `MODEL_DIR = None` fallback exactly.
+    """
+    if MODEL_ROOT is None:
+        return None
+    return str(Path(MODEL_ROOT).joinpath(*Path(model_id).parts))
+
+
 BUILD_VARIANT = _own_build_variant()
 CUDA_AVAILABLE = _cuda_available()
 CUDA_SUPPORTED_COMPUTE_TYPES = _cuda_supported_compute_types()

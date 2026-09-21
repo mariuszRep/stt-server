@@ -71,6 +71,10 @@ pub fn build_router(state: state::AppState) -> Router {
             "/v1/install-operations/:operation_id",
             get(routes::install_operation_status),
         )
+        .route(
+            "/v1/install-operations/:operation_id/cancel",
+            post(routes::cancel_install_operation),
+        )
         .route("/v1/providers/:id/start", post(routes::start_provider))
         .route("/v1/providers/:id/stop", post(routes::stop_provider))
         .route("/v1/providers/:id/status", get(routes::provider_status))
@@ -83,9 +87,13 @@ pub fn build_router(state: state::AppState) -> Router {
             "/v1/providers/:id/heartbeat",
             post(routes::provider_heartbeat),
         )
+        .route("/v1/providers/:id/pin", post(routes::pin_provider))
+        .route("/v1/providers/:id/unpin", post(routes::unpin_provider))
         .route("/v1/models", get(routes::list_models))
         .route("/v1/models/select", post(routes::select_model))
         .route("/v1/models/switch", post(routes::switch_model))
+        .route("/v1/models/language", post(routes::set_model_language))
+        .route("/v1/models/load", post(routes::load_model))
         .route("/v1/models/selected", get(routes::selected_model))
         .route("/v1/models/pull", post(routes::pull_model))
         .route("/v1/models/verify", post(routes::verify_model))

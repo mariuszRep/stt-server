@@ -40,6 +40,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/models/{id}", delete(api::delete_model))
         .route("/v1/models/{id}/load", post(api::load_model))
         .route("/v1/models/{id}/unload", post(api::unload_model))
+        .route("/v1/models/{id}/language", post(api::set_model_language))
+        .route("/v1/admin/model", post(api::admin_switch_model))
         .route("/v1/audio/transcriptions", post(api::transcribe))
         // Additive diagnostic route, not part of the protocol -- kept
         // alongside /health and /v1/config rather than replaced by them.

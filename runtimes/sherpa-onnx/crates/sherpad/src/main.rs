@@ -71,8 +71,8 @@ async fn main() -> anyhow::Result<()> {
     // cost the control plane's health poll already hid. If it isn't
     // installed yet (control plane's pull contract wasn't honored, or this
     // is a bare standalone run), log and continue rather than failing to
-    // start: matches supervisor::spawn's own healthcheck-driven readiness
-    // model rather than crashing the process over it.
+    // start; `GET /health` then answers 503 until the model is loaded, so
+    // supervisor::spawn never reports this instance as ready.
     if let Some(model_id) = &default_model {
         match api::load_model_by_id(&state, model_id).await {
             Ok(()) => tracing::info!(model = %model_id, "default model loaded"),

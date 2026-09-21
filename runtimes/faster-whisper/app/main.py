@@ -6,7 +6,7 @@ import sys
 import tempfile
 import time
 import wave
-from pathlib import Path, PurePath
+from pathlib import Path
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -14,7 +14,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from app import config
-from app.transcribe import _infer_lock, get_model, get_runtime_status, transcribe
+from app.transcribe import (
+    _infer_lock,
+    get_model,
+    get_runtime_status,
+    is_model_loaded,
+    loaded_models,
+    transcribe,
+    unload_model,
+)
 
 
 async def require_auth(authorization: str | None = Header(default=None)) -> None:
@@ -128,6 +136,33 @@ class AdminModelBody(BaseModel):
     compute_type: str | None = None
 
 
+class ModelsResponse(BaseModel):
+    # Deliberately not a full catalog mirror of sherpad's `/v1/models`
+    # (id/languages/status per curated entry): the curated model catalog
+    # lives entirely in the Rust control plane (`crates/runtime/src/
+    # catalog.rs`), not in this Python process, which only ever knows about
+    # whatever it has actually loaded. This reports exactly that -- dynamic
+    # state, not static metadata -- which is all `RuntimeManager::
+    # loaded_models`-style proxying needs.
+    loaded: list[str]
+
+
+class LoadModelResponse(BaseModel):
+    # `id`/`status` field names match sherpad's `POST /v1/models/:id/load`
+    # response exactly (`{"id": ..., "status": "loaded"}`) so
+    # `RuntimeManager`'s proxy can parse both engines' responses the same
+    # way. `load_seconds` is additive -- sherpad's equivalent omits it, and
+    # a caller that doesn't need it can just ignore the field.
+    id: str
+    status: str
+    load_seconds: float | None = None
+
+
+class UnloadModelResponse(BaseModel):
+    id: str
+    status: str
+
+
 class AdminModelResponse(BaseModel):
     status: str
     model: str
@@ -209,6 +244,8 @@ async def get_config() -> ConfigResponse:
 async def audio_transcriptions(
     file: UploadFile = File(...),
     prompt: str | None = Form(default=None),
+    language: str | None = Form(default=None),
+    model: str | None = Form(default=None),
 ) -> TranscriptionResponse:
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file provided")
@@ -226,7 +263,7 @@ async def audio_transcriptions(
         # Offload the blocking, CPU/GPU-bound inference to a worker thread so the
         # event loop stays responsive (health checks, uploads) while a chunk is
         # being transcribed. Inference itself is serialized inside transcribe().
-        result = await run_in_threadpool(transcribe, tmp_path, prompt)
+        result = await run_in_threadpool(transcribe, tmp_path, prompt, language, model)
     except Exception as exc:
         elapsed = time.perf_counter() - started
         print(f"[voice-typer] {request_id} failed after {elapsed:.2f}s: {exc}", flush=True)
@@ -260,47 +297,87 @@ async def audio_transcriptions(
     )
 
 
+@app.get("/v1/models")
+async def list_models() -> ModelsResponse:
+    """Which models this process currently holds warm. Mirrors sherpad's
+    `GET /v1/models` closely enough for `RuntimeManager` to proxy both
+    engines the same way (see `active_languages`'s "is it running / GET its
+    /v1/models / map the response" pattern) -- see `ModelsResponse` for what
+    "closely enough" means here.
+    """
+    return ModelsResponse(loaded=loaded_models())
+
+
+@app.post("/v1/models/{model_id:path}/load")
+async def load_model(model_id: str) -> LoadModelResponse:
+    """Pre-warms `model_id` without making it the default -- lets a caller
+    get a model ready ahead of the request that will actually use it
+    (mirrors sherpad's `POST /v1/models/:id/load`). A no-op, reported as
+    such, if it's already warm.
+    """
+    already_loaded = is_model_loaded(model_id, config.DEVICE, config.COMPUTE_TYPE)
+
+    def _load() -> float | None:
+        with _infer_lock:
+            get_model(model_id, config.DEVICE, config.COMPUTE_TYPE)
+        return get_runtime_status()["last_model_load_seconds"]
+
+    try:
+        load_seconds = None if already_loaded else await run_in_threadpool(_load)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Model load failed: {exc}")
+
+    return LoadModelResponse(
+        id=model_id,
+        status="unchanged" if already_loaded else "loaded",
+        load_seconds=load_seconds,
+    )
+
+
+@app.post("/v1/models/{model_id:path}/unload")
+async def unload_model_route(model_id: str) -> UnloadModelResponse:
+    """Frees `model_id` from the warm pool (mirrors sherpad's
+    `POST /v1/models/:id/unload`). Refuses to unload the process's current
+    default model -- the one a request with no explicit `model` field
+    resolves to -- the same way sherpad's launched model can't be unloaded
+    out from under `default_model`, since that would leave a bare
+    model-omitted request with nothing to serve.
+    """
+    if model_id == config.MODEL:
+        raise HTTPException(
+            status_code=400,
+            detail=f"cannot unload '{model_id}': it is this instance's current default model",
+        )
+    unloaded = await run_in_threadpool(unload_model, model_id)
+    return UnloadModelResponse(id=model_id, status="unloaded" if unloaded else "not_loaded")
+
+
 @app.post("/v1/admin/model")
 async def admin_switch_model(body: AdminModelBody) -> AdminModelResponse:
-    """Swap the loaded model in-process, without restarting the server.
+    """Changes which model a request that omits `model` resolves to, loading
+    it first if this process hasn't already got it warm.
 
-    Reuses get_model()'s existing model/device/compute_type mismatch check
-    (transcribe.py) by mutating config.MODEL (and DEVICE/COMPUTE_TYPE, if
-    given) before calling it — the same call transcribe() itself makes, so
-    no new loading logic is needed here, just making config.MODEL mutable
-    at runtime. Runs under the same _infer_lock every inference call already
-    holds while loading, so a swap can't race in-flight inference; requests
-    made after the swap resolves see the new model automatically.
+    Now that `transcribe.py` holds a dict of models rather than one mutable
+    global (see `get_model`'s docstring), this no longer needs the fragile
+    per-model download-root path surgery it used to (deriving the new
+    model's directory by string-editing the old one's) -- `config.
+    model_download_root(model_id)` computes it fresh, correctly, for any
+    model id, every time. Runs under the same `_infer_lock` every inference
+    call already holds while loading, so a swap can't race in-flight
+    inference; requests made after this resolves see the new default model
+    automatically. Does not evict the previous default model from the
+    cache -- it stays warm, exactly as a direct per-request `model` field
+    would leave it (see concurrent-multi-provider-serving).
     """
 
     def _swap() -> float | None:
-        # config.MODEL_DIR is an explicit per-model download_root, computed by
-        # the Rust side as `<data-root>/models/faster-whisper/<model_id>`
-        # (faster_whisper.rs::cached_model_dir) -- a flat, predictable layout,
-        # deliberately not HuggingFace's own hashed cache scheme. It is set
-        # once at process launch for the *old* model only, so a swap that
-        # changes config.MODEL without also recomputing MODEL_DIR would load
-        # (or, worse, re-download) the new model into the old model's
-        # directory instead of its own -- verified to actually happen before
-        # this fix was added. Re-derive the new directory by stripping the
-        # old model id's path components off the tail of the old
-        # MODEL_DIR and re-joining the new model id, mirroring
-        # cached_model_dir's own `root.join("faster-whisper").join(model_id)`
-        # construction exactly.
-        if config.MODEL_DIR is not None:
-            old_dir = PurePath(config.MODEL_DIR)
-            old_model_parts = PurePath(config.MODEL).parts
-            if old_dir.parts[-len(old_model_parts):] == old_model_parts:
-                root = PurePath(*old_dir.parts[: -len(old_model_parts)])
-                config.MODEL_DIR = str(root.joinpath(*PurePath(body.model).parts))
-
         config.MODEL = body.model
         if body.device is not None:
             config.DEVICE = body.device
         if body.compute_type is not None:
             config.COMPUTE_TYPE = body.compute_type
         with _infer_lock:
-            get_model(config.DEVICE, config.COMPUTE_TYPE)
+            get_model(config.MODEL, config.DEVICE, config.COMPUTE_TYPE)
         return get_runtime_status()["last_model_load_seconds"]
 
     try:

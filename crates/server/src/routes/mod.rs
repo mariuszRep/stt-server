@@ -7,11 +7,13 @@ pub mod recommendations;
 pub use hardware::get_hardware;
 pub use health::{health, readiness};
 pub use models::{
-    list_models, pull_model, remove_model, select_model, selected_model, switch_model, verify_model,
+    list_models, load_model, pull_model, remove_model, select_model, selected_model,
+    set_model_language, switch_model, verify_model,
 };
 pub use providers::{
-    install_operation_status, install_provider, list_providers, provider_descriptor,
-    provider_heartbeat, provider_logs, provider_status, start_provider, stop_provider,
-    uninstall_provider, uninstall_provider_variant, update_provider,
+    cancel_install_operation, install_operation_status, install_provider, list_providers,
+    pin_provider, provider_descriptor, provider_heartbeat, provider_logs, provider_status,
+    start_provider, stop_provider, uninstall_provider, uninstall_provider_variant, unpin_provider,
+    update_provider,
 };
 pub use recommendations::recommendations;
