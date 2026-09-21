@@ -16,8 +16,19 @@ on:
 jobs:
   release:
     runs-on: ubuntu-latest
+    # actions:read is required for the gh run list/download calls below (this
+    # job reads its own repo's Actions runs/artifacts); declaring `permissions`
+    # at all zeroes out every unlisted scope, so it must be listed explicitly
+    # alongside contents:write, not left to default.
     permissions:
       contents: write
+      actions: read
+    # No checkout in this job (it only talks to the GitHub API) — gh does not
+    # read GITHUB_REPOSITORY on its own, so GH_REPO must be set explicitly or
+    # every `gh run ...` / `gh release ...` call below fails to resolve a
+    # target repo.
+    env:
+      GH_REPO: ${{ github.repository }}
     steps:
       - name: Find the successful candidate run for this commit
         id: candidate
