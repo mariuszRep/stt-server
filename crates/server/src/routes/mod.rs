@@ -4,7 +4,7 @@ pub mod models;
 pub mod providers;
 pub mod recommendations;
 
-pub use hardware::get_hardware;
+pub use hardware::{get_hardware, get_system_memory};
 pub use health::{health, readiness};
 pub use models::{
     list_models, load_model, pull_model, remove_model, select_model, selected_model,
