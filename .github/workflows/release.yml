@@ -151,6 +151,33 @@ jobs:
             --notes-file /tmp/release-notes.md \
             release-assets/*
 
+      # Post-release housekeeping: bump to the next patch version on the
+      # integration branch (not main — that's where the next round of work
+      # continues from), so nobody has to remember to do it by hand before
+      # the next tag. This job has no earlier checkout (it only used `gh`
+      # API calls), so check out voice-typer-windows fresh, isolated in its
+      # own path so it can't collide with artifacts/release-assets above.
+      - name: Checkout integration branch
+        uses: actions/checkout@v4
+        with:
+          ref: voice-typer-windows
+          path: source
+
+      - name: Bump to next version on the integration branch
+        working-directory: source
+        run: |
+          set -euo pipefail
+          current=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          IFS='.' read -r major minor patch <<< "$current"
+          next="${major}.${minor}.$((patch + 1))"
+          sed -i "0,/^version = \"${current}\"/s//version = \"${next}\"/" Cargo.toml
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml
+          git commit -m "chore: bump version to ${next} (post-release)"
+          git push origin voice-typer-windows
+          echo "Bumped voice-typer-windows to ${next}."
+
   # split-current-functionality-into-three-components's Scope 7 / AC8-9: proves
   # the latest *published* @open-vibe-ai/stt-sdk actually works against *this*
   # release's faster-whisper runtime, using only installed/downloaded
