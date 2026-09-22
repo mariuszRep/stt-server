@@ -93,13 +93,15 @@ The candidate produces: `stt-linux-x86_64`, `stt-windows-x86_64.exe`,
 `faster-whisper-runtime-windows-cpu`, and — only when its opt-in dispatch input is set —
 `faster-whisper-runtime-windows-gpu` (617MB, off by default).
 
-- Version bumps are ordinary commits on the branch before the final candidate run:
-  `[workspace.package] version` in the root `Cargo.toml`. The candidate workflow's version
-  guard fails the build if the manifest version isn't ahead of the latest release tag.
+- Candidates build the current commit as-is — no version-ahead check blocks them, so it's
+  fine to build/test the same version repeatedly (most merges have nothing to bump anyway).
+  `[workspace.package] version` in the root `Cargo.toml` only needs to be new at the moment
+  you actually tag a release.
 - Release (explicit instruction only): `git tag vX.Y.Z <tested-sha>` →
   `git push origin vX.Y.Z`. The tag need not sit on `main`. `release.yml` hard-fails when
   no successful candidate run exists for that SHA — re-dispatch `candidate-server.yml` on
-  the SHA first if the artifacts expired.
+  the SHA first if the artifacts expired. Right after a successful release, it auto-bumps
+  the next patch version back onto `voice-typer-windows` — rarely something to do by hand.
 - **Rollback is free**: re-tag an older already-tested SHA and let promote republish it —
   seconds, no rebuild, no new test cycle.
 
