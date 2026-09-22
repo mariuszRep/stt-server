@@ -1,0 +1,40 @@
+name: Ensure Integration PR
+
+# Keeps exactly one draft PR open from the integration branch to main, titled
+# for the next release version. This is what makes CI useful from commit #1:
+# the PR gives every push a check context and a running "next release" view.
+# Merging it is the release-readiness signal — see AGENTS.md.
+# No-ops when a PR from this branch is already open (e.g. one opened by hand).
+
+on:
+  push:
+    branches: [voice-typer-windows]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  ensure-pr:
+    runs-on: ubuntu-latest
+    env:
+      # gh needs an explicit repo target in this job.
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Open a placeholder PR if none is open
+        shell: bash
+        run: |
+          set -euo pipefail
+          open=$(gh pr list --head "${{ github.ref_name }}" --base main --state open --json number --jq 'length')
+          if [ "${open}" != "0" ]; then
+            echo "An open PR already exists for ${{ github.ref_name }} — nothing to do."
+            exit 0
+          fi
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          gh pr create --draft --base main --head "${{ github.ref_name }}" \
+            --title "v${version}" \
+            --body "Placeholder PR for the next release (${version}). ci.yml runs on every push to this branch. Merging to main fires a candidate-server.yml build — see AGENTS.md's build/test/release section."
+          echo "Opened draft PR v${version}."

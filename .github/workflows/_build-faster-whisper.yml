@@ -1,0 +1,149 @@
+name: _build-faster-whisper
+
+# Reusable workflow — the single definition of the faster-whisper managed-runtime
+# PyInstaller build. candidate-server.yml calls it with upload: true; the
+# ~617MB GPU variant only builds when include-gpu is set (it's rarely the
+# thing under test, and a release asserts its presence downstream instead).
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "SHA/branch to check out"
+        required: false
+        type: string
+      upload:
+        description: "Upload the built binary as a workflow artifact"
+        required: false
+        type: boolean
+        default: false
+      retention-days:
+        required: false
+        type: number
+        default: 7
+      upload-checksums:
+        description: "Also generate SHA256SUMS.txt + manifest.json in dist/"
+        required: false
+        type: boolean
+        default: false
+      include-gpu:
+        description: "Also build the faster-whisper-runtime-windows-gpu variant"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            os_slug: linux
+            variant: cpu
+            ext: ""
+          - os: windows-latest
+            os_slug: windows
+            variant: cpu
+            ext: ".exe"
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: runtimes/faster-whisper
+    env:
+      VOICE_TYPER_BUILD_VARIANT: ${{ matrix.variant }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          # pip's own wheel cache, keyed on requirements.txt — re-installs
+          # from cache instead of re-downloading on every build. (A venv-dir
+          # cache was considered and rejected: venvs embed absolute paths and
+          # stale badly if the workspace path ever moves.)
+          cache: pip
+          cache-dependency-path: runtimes/faster-whisper/requirements.txt
+      - shell: bash
+        run: |
+          python -m venv venv
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            venv/Scripts/pip install -r requirements.txt pyinstaller
+            venv/Scripts/pyinstaller --clean --noconfirm voice-typer-backend.spec
+          else
+            venv/bin/pip install -r requirements.txt pyinstaller
+            venv/bin/pyinstaller --clean --noconfirm voice-typer-backend.spec
+          fi
+      - name: Stage release asset
+        if: ${{ inputs.upload }}
+        shell: bash
+        env:
+          CHECKSUMS: ${{ inputs.upload-checksums }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          mv "dist/voice-typer-backend${{ matrix.ext }}" \
+             "dist/faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}${{ matrix.ext }}"
+          bash ../../scripts/verify-release-artifact.sh dist
+          if [ "${CHECKSUMS}" = "true" ]; then
+            (cd dist && sha256sum "faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}${{ matrix.ext }}" > SHA256SUMS.txt && cat SHA256SUMS.txt)
+            printf '{"commit":"%s","run_id":"%s","run_url":"%s","builder":"%s","built_at":"%s"}\n' \
+              "$(git rev-parse HEAD)" "${{ github.run_id }}" "${RUN_URL}" \
+              "${{ github.workflow }}/${{ github.job }}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              > dist/manifest.json
+            cat dist/manifest.json
+          fi
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.upload }}
+        with:
+          name: faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}
+          path: runtimes/faster-whisper/dist/
+          retention-days: ${{ inputs.retention-days }}
+
+  build-gpu:
+    if: ${{ inputs.include-gpu }}
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: runtimes/faster-whisper
+    env:
+      VOICE_TYPER_BUILD_VARIANT: gpu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: runtimes/faster-whisper/requirements.txt
+      - shell: bash
+        run: |
+          python -m venv venv
+          venv/Scripts/pip install -r requirements.txt pyinstaller
+          venv/Scripts/pyinstaller --clean --noconfirm voice-typer-backend.spec
+      - name: Stage release asset
+        if: ${{ inputs.upload }}
+        shell: bash
+        env:
+          CHECKSUMS: ${{ inputs.upload-checksums }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          mv "dist/voice-typer-backend.exe" \
+             "dist/faster-whisper-runtime-windows-gpu.exe"
+          bash ../../scripts/verify-release-artifact.sh dist
+          if [ "${CHECKSUMS}" = "true" ]; then
+            (cd dist && sha256sum "faster-whisper-runtime-windows-gpu.exe" > SHA256SUMS.txt && cat SHA256SUMS.txt)
+            printf '{"commit":"%s","run_id":"%s","run_url":"%s","builder":"%s","built_at":"%s"}\n' \
+              "$(git rev-parse HEAD)" "${{ github.run_id }}" "${RUN_URL}" \
+              "${{ github.workflow }}/${{ github.job }}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              > dist/manifest.json
+            cat dist/manifest.json
+          fi
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.upload }}
+        with:
+          name: faster-whisper-runtime-windows-gpu
+          path: runtimes/faster-whisper/dist/
+          retention-days: ${{ inputs.retention-days }}

@@ -7,7 +7,7 @@ name: Release
 # the fetched files don't match the candidate's SHA256SUMS manifests. The
 # version in the artifacts is whatever was committed on the ref at candidate
 # time — version bumps land on the branch before the final candidate run
-# (RELEASE_PROCESS.md gate 3).
+# (candidate-server.yml's version-guard enforces this).
 
 on:
   push:
@@ -23,6 +23,12 @@ jobs:
     permissions:
       contents: write
       actions: read
+      # Sigstore attestation (attest-build-provenance) mints an OIDC identity
+      # and writes the attestation to this repo's store — both scopes are
+      # required and must be listed explicitly since `permissions` zeroes the
+      # rest.
+      id-token: write
+      attestations: write
     # No checkout in this job (it only talks to the GitHub API) — gh does not
     # read GITHUB_REPOSITORY on its own, so GH_REPO must be set explicitly or
     # every `gh run ...` / `gh release ...` call below fails to resolve a
@@ -97,11 +103,32 @@ jobs:
       - name: Stage release assets
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p release-assets
-          find artifacts -type f ! -name 'SHA256SUMS.txt' -exec cp {} release-assets/ \;
+          for d in artifacts/*/; do
+            name=$(basename "$d")
+            for f in "$d"*; do
+              case "$(basename "$f")" in
+                SHA256SUMS.txt) ;;
+                # Each artifact dir's manifest.json is renamed per-asset so
+                # build provenance ({commit, run_id, run_url, builder,
+                # built_at}) ships beside the binaries without collisions.
+                manifest.json) cp "$f" "release-assets/${name}.manifest.json" ;;
+                *) cp "$f" release-assets/ ;;
+              esac
+            done
+          done
           # Publish a combined manifest so consumers can verify downloads too.
           (cd release-assets && sha256sum * > SHA256SUMS.txt)
           ls -lh release-assets/
+
+      # Cryptographic provenance for every shipped asset — recorded in this
+      # repo's attestation store, verifiable with
+      # `gh attestation verify <asset> --repo mariuszRep/stt-server`.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: release-assets/*
 
       - name: Create release
         env:

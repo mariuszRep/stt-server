@@ -84,6 +84,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          # pip's own wheel cache, keyed on requirements.txt — the venv is
+          # rebuilt per run but installs come from cache, not the network.
+          cache: pip
+          cache-dependency-path: runtimes/faster-whisper/requirements.txt
 
       - name: Install managed-runtime Python dependencies
         working-directory: runtimes/faster-whisper
