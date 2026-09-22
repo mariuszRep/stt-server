@@ -11,11 +11,18 @@ on:
 # criteria ("Clean Server CI builds/tests without App or SDK checkouts").
 jobs:
   rust:
-    needs: sherpad
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      # audiopus_sys vendors and cmake-builds libopus from source (its
+      # "static" feature -- see runtimes/sherpa-onnx/Cargo.toml). Its bundled
+      # libopus CMakeLists still declares `cmake_minimum_required(VERSION 2.8)`;
+      # a current CMake (verified: 4.x, which GitHub-hosted runners ship)
+      # refuses to configure projects requiring < 3.5 at all, not just with a
+      # warning. This is CMake's own documented escape hatch for exactly that case.
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
       - uses: actions/checkout@v4
 
@@ -34,20 +41,38 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
-      # Fetch the sherpad binary built by the `sherpad` job below, at exactly
-      # the path crates/runtime/tests/support/mod.rs's
+      # The sherpa-onnx managed runtime (runtimes/sherpa-onnx/) is deliberately
+      # its own cargo workspace, not a member of the root one — its native
+      # ONNX-runtime library download/static-link shouldn't lengthen every
+      # `cargo build --workspace` run. Built here as a step of this job (a
+      # separate --release build, still not a workspace member) so the
+      # conformance tests below run against it for real: the binary lands at
+      # exactly the path crates/runtime/tests/support/mod.rs's
       # point_at_locally_built_runtimes() points STT_SHERPA_ONNX_RUNTIME_DIR
-      # at -- so sherpa-onnx's general/engine-specific conformance tests run
-      # for real here instead of loudly skipping for lack of a runtime
-      # binary. Downloaded, not built a second time here, since the whole
-      # point of splitting `sherpad` into its own job (see that job's own
-      # comment) is to keep sherpa-onnx's native ONNX-runtime link out of
-      # every `cargo build --workspace` run.
-      - name: Fetch built sherpad binary
-        uses: actions/download-artifact@v4
+      # at. It used to cross jobs via upload-artifact — that created a
+      # per-push artifact stream that fed the storage quota; building it
+      # in-job creates nothing external at all.
+      - uses: Swatinem/rust-cache@v2
         with:
-          name: sherpad-${{ matrix.os }}
-          path: runtimes/sherpa-onnx/target/release
+          workspaces: runtimes/sherpa-onnx
+          # sherpa-onnx-sys downloads its prebuilt libs into target/sherpa-onnx-prebuilt,
+          # which rust-cache would otherwise prune while keeping the build-script
+          # output -- a cache hit then skips the download and fails to link
+          # `sherpa-onnx-c-api`. The key suffix retires caches saved without it.
+          key: sherpa-prebuilt-v1
+          cache-directories: runtimes/sherpa-onnx/target/sherpa-onnx-prebuilt
+
+      - name: Format check (sherpa-onnx)
+        working-directory: runtimes/sherpa-onnx
+        run: cargo fmt --check
+
+      - name: Clippy (sherpa-onnx)
+        working-directory: runtimes/sherpa-onnx
+        run: cargo clippy --release --all-targets -- -D warnings
+
+      - name: Build sherpad
+        working-directory: runtimes/sherpa-onnx
+        run: cargo build --release --bin sherpad
 
       - name: Make sherpad executable
         if: matrix.os != 'windows-latest'
@@ -96,54 +121,3 @@ jobs:
             exit 1
           fi
 
-  # The sherpa-onnx managed runtime (runtimes/sherpa-onnx/) is deliberately
-  # its own cargo workspace, not a member of the root one above — its native
-  # ONNX-runtime library download/static-link shouldn't lengthen every
-  # `cargo build --workspace` run. Built here as its own job for that reason.
-  sherpad:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        working-directory: runtimes/sherpa-onnx
-    env:
-      # audiopus_sys vendors and cmake-builds libopus from source (its
-      # "static" feature -- see Cargo.toml). Its bundled libopus CMakeLists
-      # still declares `cmake_minimum_required(VERSION 2.8)`; a current
-      # CMake (verified: 4.x, which GitHub-hosted runners ship) refuses to
-      # configure projects requiring < 3.5 at all, not just with a warning.
-      # This is CMake's own documented escape hatch for exactly that case.
-      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: runtimes/sherpa-onnx
-          # sherpa-onnx-sys downloads its prebuilt libs into target/sherpa-onnx-prebuilt,
-          # which rust-cache would otherwise prune while keeping the build-script
-          # output -- a cache hit then skips the download and fails to link
-          # `sherpa-onnx-c-api`. The key suffix retires caches saved without it.
-          key: sherpa-prebuilt-v1
-          cache-directories: runtimes/sherpa-onnx/target/sherpa-onnx-prebuilt
-      - name: Format check
-        run: cargo fmt --check
-      - name: Clippy
-        run: cargo clippy --release --all-targets -- -D warnings
-      - name: Build
-        run: cargo build --release --bin sherpad
-      # Handed to the `rust` job above so it can run sherpa-onnx's
-      # conformance tests for real, without building sherpad a second time.
-      - name: Upload sherpad binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: sherpad-${{ matrix.os }}
-          path: |
-            runtimes/sherpa-onnx/target/release/sherpad
-            runtimes/sherpa-onnx/target/release/sherpad.exe
-          if-no-files-found: error
-          retention-days: 1

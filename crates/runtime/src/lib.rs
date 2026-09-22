@@ -12,7 +12,7 @@ pub use catalog::{
     VariantInfo, CATALOG,
 };
 pub use error::RuntimeError;
-pub use hardware::HardwareReport;
+pub use hardware::{snapshot_memory, HardwareReport, MemorySnapshot};
 pub use manager::{
     InstallOperationState, InstallOperationStatus, InstallOutcome, Launch, LaunchBuilder,
     ModelPullOutcome, RuntimeManager, SetLanguageOutcome, StartOptions, SwitchModelOutcome,

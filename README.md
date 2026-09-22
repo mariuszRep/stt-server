@@ -6,7 +6,7 @@ A local, self-hosted, vendor-neutral control plane for speech-to-text provider r
 local hardware capability, installs/starts/stops curated provider runtimes (faster-whisper
 today; whisper.cpp and others are typed seams), and hands back a versioned
 **runtime connection descriptor** that a client uses with [`@open-vibe-ai/stt-sdk`](../stt-sdk)
-to talk to the runtime directly. See the root [`VISION.md`](../VISION.md) and this repo's own
+to talk to the runtime directly. See this repo's own
 [`VISION.md`](VISION.md)/[`CONVENTIONS.md`](CONVENTIONS.md) for the full architectural boundary.
 
 ## Architecture
