@@ -1,15 +1,20 @@
 name: Server Candidate
 
-# Manually dispatchable validation build only. Builds the same artifacts
-# release.yml later promotes (stt control plane, faster-whisper sidecar,
-# sherpad) and uploads them as Actions artifacts for manual download/install —
-# the candidate build is what a human acceptance-tests before tagging. Each
-# artifact carries a SHA256SUMS.txt that release.yml's promote step verifies
-# before publishing. Does NOT create a GitHub Release and has no
-# `contents: write` permission — structurally incapable of publishing. The
-# 617MB faster-whisper GPU variant builds only behind the `gpu` input.
+# Builds the same artifacts release.yml later promotes (stt control plane,
+# faster-whisper sidecar, sherpad) and uploads them as Actions artifacts for
+# manual download/install — the candidate build is what a human
+# acceptance-tests before tagging. Fires on merge to main (the "I'm ready"
+# signal) and on workflow_dispatch for re-testing any SHA. Each artifact
+# carries a SHA256SUMS.txt that release.yml's promote step verifies before
+# publishing. Does NOT create a GitHub Release and has no `contents: write`
+# permission — structurally incapable of publishing. The 617MB faster-whisper
+# GPU variant builds only behind the `gpu` input (push-triggered runs skip it).
 
 on:
+  # Merging the integration PR to main is the "I'm ready" signal — it fires
+  # this build. workflow_dispatch stays for re-testing any SHA by hand.
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       ref:
@@ -23,7 +28,35 @@ on:
         default: false
 
 jobs:
+  # Fail fast, before burning build minutes: a candidate must be built on a
+  # manifest version ahead of the latest published release, or the binaries
+  # come out mislabeled (this is what "forgot to bump" looks like today).
+  version-guard:
+    runs-on: ubuntu-latest
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - name: Assert version is ahead of the latest release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          src=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          latest=$(gh release view --json tagName --jq '.tagName' 2>/dev/null | sed 's/^v//' || true)
+          echo "manifest: ${src}   latest release: ${latest:-none}"
+          if [ -n "${latest}" ]; then
+            top=$(printf '%s\n%s\n' "${latest}" "${src}" | sort -V | tail -1)
+            if [ "${src}" = "${latest}" ] || [ "${top}" = "${latest}" ]; then
+              echo "::error::Cargo.toml version ${src} is not ahead of latest release v${latest} — bump [workspace.package] version on the branch first"
+              exit 1
+            fi
+          fi
+
   build-binaries:
+    needs: version-guard
     strategy:
       matrix:
         include:
@@ -65,6 +98,7 @@ jobs:
           retention-days: 7
 
   build-faster-whisper-sidecar:
+    needs: version-guard
     strategy:
       matrix:
         include:
@@ -127,6 +161,7 @@ jobs:
   # faster-whisper-runtime-windows-gpu, so dispatch this once with gpu=true on
   # the tested SHA before tagging.
   build-faster-whisper-gpu:
+    needs: version-guard
     if: ${{ inputs.gpu == true }}
     runs-on: windows-latest
     defaults:
@@ -169,6 +204,7 @@ jobs:
           retention-days: 7
 
   build-sherpad:
+    needs: version-guard
     strategy:
       matrix:
         include:
