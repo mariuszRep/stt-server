@@ -43,10 +43,13 @@ jobs:
       # point of splitting `sherpad` into its own job (see that job's own
       # comment) is to keep sherpa-onnx's native ONNX-runtime link out of
       # every `cargo build --workspace` run.
+      # Handoff is via actions/cache, not upload-artifact: this job runs on
+      # every push and artifact storage is the quota that kept filling up;
+      # the cache is a separate quota and run-scoped keys make it transient.
       - name: Fetch built sherpad binary
-        uses: actions/download-artifact@v4
+        uses: actions/cache/restore@v4
         with:
-          name: sherpad-${{ matrix.os }}
+          key: sherpad-${{ github.run_id }}-${{ matrix.os }}
           path: runtimes/sherpa-onnx/target/release
 
       - name: Make sherpad executable
@@ -138,12 +141,11 @@ jobs:
         run: cargo build --release --bin sherpad
       # Handed to the `rust` job above so it can run sherpa-onnx's
       # conformance tests for real, without building sherpad a second time.
-      - name: Upload sherpad binary
-        uses: actions/upload-artifact@v4
+      # actions/cache, not upload-artifact: artifacts never leave storage on
+      # their own schedule and this runs per-push; run-scoped key = no reuse
+      # across runs, separate quota from Actions artifact storage.
+      - name: Cache sherpad binary for the rust job
+        uses: actions/cache/save@v4
         with:
-          name: sherpad-${{ matrix.os }}
-          path: |
-            runtimes/sherpa-onnx/target/release/sherpad
-            runtimes/sherpa-onnx/target/release/sherpad.exe
-          if-no-files-found: error
-          retention-days: 1
+          key: sherpad-${{ github.run_id }}-${{ matrix.os }}
+          path: runtimes/sherpa-onnx/target/release/sherpad*

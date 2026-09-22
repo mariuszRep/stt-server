@@ -51,6 +51,33 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh run download "${{ steps.candidate.outputs.run_id }}" --dir artifacts
 
+      # A release must carry the complete asset set — including the
+      # faster-whisper GPU variant, which candidate-server.yml only builds
+      # behind its opt-in `gpu` input. A merge-triggered (or default
+      # dispatch) run omits it; refuse to publish an incomplete release
+      # rather than silently shipping a version that can't serve GPU installs.
+      - name: Assert the candidate produced the complete artifact set
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in \
+            stt-linux-x86_64 stt-windows-x86_64.exe \
+            sherpad-linux-cpu sherpad-windows-cpu \
+            faster-whisper-runtime-linux-cpu \
+            faster-whisper-runtime-windows-cpu \
+            faster-whisper-runtime-windows-gpu; do
+            if [ ! -d "artifacts/${name}" ] || [ -z "$(ls -A "artifacts/${name}")" ]; then
+              echo "::error::candidate run lacks artifact '${name}'"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::Re-dispatch a complete candidate for this commit, then retag:"
+            echo "::error::  gh workflow run candidate-server.yml --repo ${GH_REPO} --ref ${{ github.sha }} -f gpu=true"
+            exit 1
+          fi
+
       # Each artifact dir (artifacts/<artifact-name>/) carries the
       # SHA256SUMS.txt the candidate job generated beside its binary; refuse
       # to publish anything that doesn't match.
