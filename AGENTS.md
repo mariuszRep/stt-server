@@ -80,9 +80,9 @@ push to voice-typer-windows ──▶ a draft PR titled "vX.Y.Z" stays open (ens
                                 opens one if none exists) — build/test happens locally
                                 first (Verify Commands below); ci.yml is dispatch-only,
                                 not an automatic push guard
-merge PR ─────────────────────▶ candidate-server.yml fires on push:main → real binaries
-                                + per-artifact SHA256SUMS (workflow_dispatch stays
-                                available to re-test any SHA)
+merge PR ─────────────────────▶ nothing builds automatically — dispatch by hand:
+                                npm run uat -- stt-server   (from voice-typer/ root)
+                                → real binaries + per-artifact SHA256SUMS
 human acceptance ─────────────▶ download the run's artifacts, verify against SHA256SUMS,
                                 install and smoke-test on a real machine
 tag the tested SHA ───────────▶ release.yml fetches that run's artifacts, re-verifies

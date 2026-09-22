@@ -3,18 +3,17 @@ name: Server Candidate
 # Builds the same artifacts release.yml later promotes (stt control plane,
 # faster-whisper sidecar, sherpad) and uploads them as Actions artifacts for
 # manual download/install — the candidate build is what a human
-# acceptance-tests before tagging. Fires on merge to main (the "I'm ready"
-# signal) and on workflow_dispatch for re-testing any SHA. Each artifact
-# carries a SHA256SUMS.txt that release.yml's promote step verifies before
-# publishing. Does NOT create a GitHub Release and has no `contents: write`
-# permission — structurally incapable of publishing. The 617MB faster-whisper
-# GPU variant builds only behind the `gpu` input (push-triggered runs skip it).
+# acceptance-tests before tagging. workflow_dispatch-only, deliberately —
+# matches stt-sdk and whisper-vibes: merging never auto-builds anywhere in
+# this workspace, on any repo, public/free or not. Local build/test happens
+# first; this is the on-demand cloud-environment check, run with
+# `npm run uat -- stt-server` from voice-typer/ root when you choose to run
+# it. Each artifact carries a SHA256SUMS.txt that release.yml's promote step
+# verifies before publishing. Does NOT create a GitHub Release and has no
+# `contents: write` permission — structurally incapable of publishing. The
+# 617MB faster-whisper GPU variant builds only behind the `gpu` input.
 
 on:
-  # Merging the integration PR to main is the "I'm ready" signal — it fires
-  # this build. workflow_dispatch stays for re-testing any SHA by hand.
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       ref:
