@@ -7,7 +7,7 @@ name: Release
 # the fetched files don't match the candidate's SHA256SUMS manifests. The
 # version in the artifacts is whatever was committed on the ref at candidate
 # time — version bumps land on the branch before the final candidate run
-# (RELEASE_PROCESS.md gate 3).
+# (candidate-server.yml's version-guard enforces this).
 
 on:
   push:
