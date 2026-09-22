@@ -1,33 +1,54 @@
 # AGENTS.md — STT Server
 
-Repository instructions for agents working in this checkout of `stt-server`. This repo exists
-on disk both as a standalone clone and as a git worktree nested under `voice-typer/` — if you
-arrived here via `voice-typer/stt-server`, read the workspace root's `AGENTS.md` first (its
-"Which checkout to use" and "Development workflow" sections) before doing anything cross-repo;
-it governs whether you should be touching this checkout at all versus the sibling one.
+This repo owns the local control plane (`stt` binary): hardware/runtime detection, provider
+and model lifecycle, runtime supervision, and connection descriptors — plus the managed
+runtimes it ships (`runtimes/<engine>/`).
+
+## Which checkout am I in?
+
+This repo exists TWICE on disk, as two git worktrees sharing one object database:
+
+```
+Projects/stt-server              standalone clone      branch: main
+Projects/voice-typer/stt-server  linked worktree       branch: voice-typer-windows   ← dev happens here
+```
+
+`voice-typer-windows` is the integration branch in ALL THREE repos — same name in
+stt-sdk, stt-server and whisper-vibes. There is no per-repo variant such as
+"stt-server-windows"; if you are looking for one, it does not exist.
+
+Decide from your working path, never from which branch looks newer or has more commits:
+  path contains /voice-typer/  → use this worktree, on the branch already checked out
+  path does NOT                → use this clone's own `main`
+
+The two are normally on DIFFERENT commits. Committing to the wrong one makes the work
+invisible to the other and is expensive to reconcile — see the 2026-08-30 incident in
+this repo's history.
+
+Ignore these stale local branches, they are not part of the flow:
+`backup/python-cli-main`
+Confirm state before any cross-repo work: `../scripts/check-worktrees.sh`
 
 ## Read Order
 
-Before planning or changing files, read:
+1. This repository's `VISION.md` and `CONVENTIONS.md`
+2. `AGENTS.md` (this file)
+3. Relevant `.projectflows/goals/<status>/<goal-slug>/GOAL.md`
+4. Relevant source files
 
-1. Workspace `../AGENTS.md` (only if this checkout is nested under `voice-typer/` — see note above), then `../VISION.md` and `../CONVENTIONS.md`
-2. This repository's `VISION.md` and `CONVENTIONS.md`
-3. `AGENTS.md` (this file)
-4. Relevant `.projectflows/goals/<status>/<goal-slug>/GOAL.md`
-5. Relevant source files
+The workspace root's `../AGENTS.md` matters only when a change spans repos (e.g. a gitlink
+bump or the cross-repo train) — everything below is self-contained for this repo.
 
-## Architecture Boundary
+## Boundaries
 
-- This repository is the local control plane: hardware/driver/runtime detection, provider
-  catalog and compatibility, provider/model install-update-removal, runtime lifecycle,
-  recommendations, health, and runtime connection descriptors.
-- It does not proxy, inspect, buffer, or execute normal transcription traffic — audio never
-  crosses the control plane (CI enforces this with a WebSocket regression guard).
-- Managed provider runtimes live inside this tree at `runtimes/<engine>/`
-  (`runtimes/faster-whisper/`, `runtimes/sherpa-onnx/`), each as its own independent build —
-  never a member of the root cargo workspace.
-- It may consume the published `@open-vibe-ai/stt-sdk` as a versioned library for shared
-  provider contracts — never SDK source by repository-relative path.
+| Owns | Must not own |
+|---|---|
+| Hardware/driver/runtime detection, provider catalog and compatibility, provider/model install-update-removal, runtime lifecycle, recommendations, health, runtime connection descriptors, managed runtime packaging (`runtimes/`) | Transcription proxying or inference on the data path — audio never crosses the control plane (CI enforces this with a WebSocket regression guard); app UX |
+
+- Managed provider runtimes live at `runtimes/<engine>/` (`faster-whisper/`,
+  `sherpa-onnx/`), each an independent build — never a member of the root cargo workspace.
+- This repo may consume the published `@open-vibe-ai/stt-sdk` as a versioned library for
+  shared provider contracts — never SDK source by repository-relative path.
 
 ## Workspace Layout
 
@@ -52,15 +73,44 @@ cargo test --workspace        # faster-whisper integration tests need runtimes/f
 `scripts/verify-release-artifact.sh dist` audits staged release binaries — CI runs it on
 every built artifact.
 
-## Releasing
+## Build, test, release
 
-- Releases are tag-push only: `git tag vX.Y.Z <tested-sha>` → `git push origin vX.Y.Z`
-  on an explicit release instruction only. The tag marks the commit whose
-  `candidate-server.yml` artifacts passed verification — the release workflow fetches
-  and checksum-verifies those artifacts instead of rebuilding.
-- Version bumps (`[workspace.package] version` in the root `Cargo.toml`) are ordinary
-  commits on the integration branch before the final candidate run — see the workspace
-  `RELEASE_PROCESS.md` for the full PR + candidate → tag-tested-SHA → promote flow.
+```
+push to voice-typer-windows ──▶ ci.yml runs on every push (fmt/clippy/build/test/sherpad);
+                                a draft PR titled "vX.Y.Z" stays open (ensure-pr.yml
+                                opens one if none exists)
+merge PR ─────────────────────▶ candidate-server.yml fires on push:main → real binaries
+                                + per-artifact SHA256SUMS (workflow_dispatch stays
+                                available to re-test any SHA)
+human acceptance ─────────────▶ download the run's artifacts, verify against SHA256SUMS,
+                                install and smoke-test on a real machine
+tag the tested SHA ───────────▶ release.yml fetches that run's artifacts, re-verifies
+                                checksums, and publishes those exact files — never rebuilds
+```
+
+The candidate produces: `stt-linux-x86_64`, `stt-windows-x86_64.exe`,
+`sherpad-linux-cpu`, `sherpad-windows-cpu`, `faster-whisper-runtime-linux-cpu`,
+`faster-whisper-runtime-windows-cpu`, and — only when its opt-in dispatch input is set —
+`faster-whisper-runtime-windows-gpu` (617MB, off by default).
+
+- Version bumps are ordinary commits on the branch before the final candidate run:
+  `[workspace.package] version` in the root `Cargo.toml`. The candidate workflow's version
+  guard fails the build if the manifest version isn't ahead of the latest release tag.
+- Release (explicit instruction only): `git tag vX.Y.Z <tested-sha>` →
+  `git push origin vX.Y.Z`. The tag need not sit on `main`. `release.yml` hard-fails when
+  no successful candidate run exists for that SHA — re-dispatch `candidate-server.yml` on
+  the SHA first if the artifacts expired.
+- **Rollback is free**: re-tag an older already-tested SHA and let promote republish it —
+  seconds, no rebuild, no new test cycle.
+
+### CI housekeeping rules
+
+- **GitHub Releases assets do not count against the Actions artifact-storage quota** —
+  promoting is how bits get off the meter permanently, which is why candidate artifact
+  retention is deliberately short (7 days).
+- **Renaming a job or artifact orphans the old artifact's name** — nothing prunes it.
+  When an artifact name changes, purge the old name (`gh api -X DELETE
+  repos/<owner>/<repo>/actions/artifacts/<id>`); `cleanup-artifacts.yml` does this weekly.
 
 ## Documentation Rule
 
