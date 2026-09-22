@@ -76,9 +76,10 @@ every built artifact.
 ## Build, test, release
 
 ```
-push to voice-typer-windows ──▶ ci.yml runs on every push (fmt/clippy/build/test/sherpad);
-                                a draft PR titled "vX.Y.Z" stays open (ensure-pr.yml
-                                opens one if none exists)
+push to voice-typer-windows ──▶ a draft PR titled "vX.Y.Z" stays open (ensure-pr.yml
+                                opens one if none exists) — build/test happens locally
+                                first (Verify Commands below); ci.yml is dispatch-only,
+                                not an automatic push guard
 merge PR ─────────────────────▶ candidate-server.yml fires on push:main → real binaries
                                 + per-artifact SHA256SUMS (workflow_dispatch stays
                                 available to re-test any SHA)
