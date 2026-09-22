@@ -1,0 +1,75 @@
+name: _build-stt-binaries
+
+# Reusable workflow — the single definition of the `stt` control-plane binary
+# build for both supported OSes. candidate-server.yml calls it with
+# upload: true (release-asset production); callers wanting only a verified
+# build use upload: false.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "SHA/branch to check out"
+        required: false
+        type: string
+      upload:
+        description: "Upload the built binary as a workflow artifact"
+        required: false
+        type: boolean
+        default: false
+      retention-days:
+        required: false
+        type: number
+        default: 7
+      upload-checksums:
+        description: "Also generate SHA256SUMS.txt + manifest.json in dist/"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: stt-linux-x86_64
+          - os: windows-latest
+            asset: stt-windows-x86_64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --bin stt
+      - name: Stage release asset
+        if: ${{ inputs.upload }}
+        shell: bash
+        env:
+          CHECKSUMS: ${{ inputs.upload-checksums }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp target/release/stt.exe "dist/${{ matrix.asset }}"
+          else
+            cp target/release/stt "dist/${{ matrix.asset }}"
+          fi
+          bash scripts/verify-release-artifact.sh dist
+          if [ "${CHECKSUMS}" = "true" ]; then
+            (cd dist && sha256sum "${{ matrix.asset }}" > SHA256SUMS.txt && cat SHA256SUMS.txt)
+            printf '{"commit":"%s","run_id":"%s","run_url":"%s","builder":"%s","built_at":"%s"}\n' \
+              "$(git rev-parse HEAD)" "${{ github.run_id }}" "${RUN_URL}" \
+              "${{ github.workflow }}/${{ github.job }}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              > dist/manifest.json
+            cat dist/manifest.json
+          fi
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.upload }}
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/
+          retention-days: ${{ inputs.retention-days }}

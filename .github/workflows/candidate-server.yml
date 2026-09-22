@@ -55,206 +55,41 @@ jobs:
             fi
           fi
 
+  # The three build legs are reusable-workflow calls — _build-*.yml holds the
+  # single definition of each build (shared with any future caller), so the
+  # release-asset shape can't drift. upload+checksums are on here because
+  # release.yml promotes these artifacts; each artifact also carries a
+  # manifest.json with {commit, run_id, run_url, builder, built_at} so the
+  # provenance of every promoted binary is recorded next to its checksums.
   build-binaries:
     needs: version-guard
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            asset: stt-linux-x86_64
-          - os: windows-latest
-            asset: stt-windows-x86_64.exe
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.ref }}
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --bin stt
-      - shell: bash
-        run: |
-          mkdir -p dist
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            cp target/release/stt.exe "dist/${{ matrix.asset }}"
-          else
-            cp target/release/stt "dist/${{ matrix.asset }}"
-          fi
-      - name: Audit release artifact
-        shell: bash
-        run: bash scripts/verify-release-artifact.sh dist
-      - name: Generate SHA256SUMS manifest
-        shell: bash
-        run: |
-          cd dist
-          sha256sum "${{ matrix.asset }}" > SHA256SUMS.txt
-          cat SHA256SUMS.txt
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.asset }}
-          path: |
-            dist/${{ matrix.asset }}
-            dist/SHA256SUMS.txt
-          retention-days: 7
-
-  build-faster-whisper-sidecar:
-    needs: version-guard
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            os_slug: linux
-            variant: cpu
-            ext: ""
-          - os: windows-latest
-            os_slug: windows
-            variant: cpu
-            ext: ".exe"
-    runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        working-directory: runtimes/faster-whisper
-    env:
-      VOICE_TYPER_BUILD_VARIANT: ${{ matrix.variant }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.ref }}
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - shell: bash
-        run: |
-          python -m venv venv
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            venv/Scripts/pip install -r requirements.txt pyinstaller
-            venv/Scripts/pyinstaller --clean --noconfirm voice-typer-backend.spec
-          else
-            venv/bin/pip install -r requirements.txt pyinstaller
-            venv/bin/pyinstaller --clean --noconfirm voice-typer-backend.spec
-          fi
-      - name: Rename to the faster-whisper-runtime-{os}-{variant} release-asset convention
-        shell: bash
-        run: |
-          mv "dist/voice-typer-backend${{ matrix.ext }}" \
-             "dist/faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}${{ matrix.ext }}"
-      - name: Audit release artifact
-        shell: bash
-        run: bash ../../scripts/verify-release-artifact.sh dist
-      - name: Generate SHA256SUMS manifest
-        shell: bash
-        run: |
-          cd dist
-          sha256sum "faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}${{ matrix.ext }}" > SHA256SUMS.txt
-          cat SHA256SUMS.txt
-      - uses: actions/upload-artifact@v4
-        with:
-          name: faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}
-          path: |
-            runtimes/faster-whisper/dist/faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}${{ matrix.ext }}
-            runtimes/faster-whisper/dist/SHA256SUMS.txt
-          retention-days: 7
+    uses: ./.github/workflows/_build-stt-binaries.yml
+    with:
+      ref: ${{ inputs.ref || github.ref }}
+      upload: true
+      upload-checksums: true
+      retention-days: 7
 
   # The GPU variant is opt-in (workflow_dispatch -f gpu=true): at ~617MB it is
   # the single largest artifact and rarely the thing under test. A release
   # still requires it — release.yml hard-fails on a candidate run missing
   # faster-whisper-runtime-windows-gpu, so dispatch this once with gpu=true on
   # the tested SHA before tagging.
-  build-faster-whisper-gpu:
+  build-faster-whisper:
     needs: version-guard
-    if: ${{ inputs.gpu == true }}
-    runs-on: windows-latest
-    defaults:
-      run:
-        working-directory: runtimes/faster-whisper
-    env:
-      VOICE_TYPER_BUILD_VARIANT: gpu
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.ref }}
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - shell: bash
-        run: |
-          python -m venv venv
-          venv/Scripts/pip install -r requirements.txt pyinstaller
-          venv/Scripts/pyinstaller --clean --noconfirm voice-typer-backend.spec
-      - name: Rename to the faster-whisper-runtime-windows-gpu release-asset convention
-        shell: bash
-        run: |
-          mv "dist/voice-typer-backend.exe" \
-             "dist/faster-whisper-runtime-windows-gpu.exe"
-      - name: Audit release artifact
-        shell: bash
-        run: bash ../../scripts/verify-release-artifact.sh dist
-      - name: Generate SHA256SUMS manifest
-        shell: bash
-        run: |
-          cd dist
-          sha256sum "faster-whisper-runtime-windows-gpu.exe" > SHA256SUMS.txt
-          cat SHA256SUMS.txt
-      - uses: actions/upload-artifact@v4
-        with:
-          name: faster-whisper-runtime-windows-gpu
-          path: |
-            runtimes/faster-whisper/dist/faster-whisper-runtime-windows-gpu.exe
-            runtimes/faster-whisper/dist/SHA256SUMS.txt
-          retention-days: 7
+    uses: ./.github/workflows/_build-faster-whisper.yml
+    with:
+      ref: ${{ inputs.ref || github.ref }}
+      upload: true
+      upload-checksums: true
+      retention-days: 7
+      include-gpu: ${{ inputs.gpu == true }}
 
   build-sherpad:
     needs: version-guard
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            os_slug: linux
-            ext: ""
-          - os: windows-latest
-            os_slug: windows
-            ext: ".exe"
-    runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        working-directory: runtimes/sherpa-onnx
-    env:
-      # Same as ci.yml/release.yml: audiopus_sys's vendored libopus CMakeLists
-      # predates CMake 3.5, which current runner CMake refuses to configure.
-      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.ref }}
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: runtimes/sherpa-onnx
-          # sherpa-onnx-sys downloads its prebuilt libs into target/sherpa-onnx-prebuilt,
-          # which rust-cache would otherwise prune while keeping the build-script
-          # output -- a cache hit then skips the download and fails to link
-          # `sherpa-onnx-c-api`. The key suffix retires caches saved without it.
-          key: sherpa-prebuilt-v1
-          cache-directories: runtimes/sherpa-onnx/target/sherpa-onnx-prebuilt
-      - run: cargo build --release --bin sherpad
-      - name: Rename to the sherpad-{os}-cpu release-asset convention
-        shell: bash
-        run: |
-          mkdir -p dist
-          cp "target/release/sherpad${{ matrix.ext }}" "dist/sherpad-${{ matrix.os_slug }}-cpu${{ matrix.ext }}"
-      - name: Audit release artifact
-        shell: bash
-        run: bash ../../scripts/verify-release-artifact.sh dist
-      - name: Generate SHA256SUMS manifest
-        shell: bash
-        run: |
-          cd dist
-          sha256sum "sherpad-${{ matrix.os_slug }}-cpu${{ matrix.ext }}" > SHA256SUMS.txt
-          cat SHA256SUMS.txt
-      - uses: actions/upload-artifact@v4
-        with:
-          name: sherpad-${{ matrix.os_slug }}-cpu
-          path: |
-            runtimes/sherpa-onnx/dist/sherpad-${{ matrix.os_slug }}-cpu${{ matrix.ext }}
-            runtimes/sherpa-onnx/dist/SHA256SUMS.txt
-          retention-days: 7
+    uses: ./.github/workflows/_build-sherpad.yml
+    with:
+      ref: ${{ inputs.ref || github.ref }}
+      upload: true
+      upload-checksums: true
+      retention-days: 7

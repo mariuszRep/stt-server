@@ -1,0 +1,97 @@
+name: _build-sherpad
+
+# Reusable workflow — the single definition of the sherpa-onnx managed-runtime
+# build. candidate-server.yml calls it with upload: true (release-asset
+# production: artifact + SHA256SUMS + manifest.json); any caller that only
+# wants a verified build calls it with upload: false. One definition, so the
+# asset-producing and verification paths can never drift apart.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "SHA/branch to check out"
+        required: false
+        type: string
+      upload:
+        description: "Upload the built binary as a workflow artifact"
+        required: false
+        type: boolean
+        default: false
+      retention-days:
+        required: false
+        type: number
+        default: 7
+      upload-checksums:
+        description: "Also generate SHA256SUMS.txt + manifest.json in dist/"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            os_slug: linux
+            ext: ""
+          - os: windows-latest
+            os_slug: windows
+            ext: ".exe"
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: runtimes/sherpa-onnx
+    env:
+      # audiopus_sys vendors and cmake-builds libopus from source (its
+      # "static" feature -- see Cargo.toml). Its bundled libopus CMakeLists
+      # still declares `cmake_minimum_required(VERSION 2.8)`; a current
+      # CMake (verified: 4.x, which GitHub-hosted runners ship) refuses to
+      # configure projects requiring < 3.5 at all, not just with a warning.
+      # This is CMake's own documented escape hatch for exactly that case.
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: runtimes/sherpa-onnx
+          # sherpa-onnx-sys downloads its prebuilt libs into target/sherpa-onnx-prebuilt,
+          # which rust-cache would otherwise prune while keeping the build-script
+          # output -- a cache hit then skips the download and fails to link
+          # `sherpa-onnx-c-api`. The key suffix retires caches saved without it.
+          key: sherpa-prebuilt-v1
+          cache-directories: runtimes/sherpa-onnx/target/sherpa-onnx-prebuilt
+      - run: cargo fmt --check
+      - run: cargo clippy --release --all-targets -- -D warnings
+      - run: cargo build --release --bin sherpad
+      - name: Stage release asset
+        if: ${{ inputs.upload }}
+        shell: bash
+        env:
+          CHECKSUMS: ${{ inputs.upload-checksums }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/release/sherpad${{ matrix.ext }}" "dist/sherpad-${{ matrix.os_slug }}-cpu${{ matrix.ext }}"
+          bash ../../scripts/verify-release-artifact.sh dist
+          if [ "${CHECKSUMS}" = "true" ]; then
+            (cd dist && sha256sum "sherpad-${{ matrix.os_slug }}-cpu${{ matrix.ext }}" > SHA256SUMS.txt && cat SHA256SUMS.txt)
+            printf '{"commit":"%s","run_id":"%s","run_url":"%s","builder":"%s","built_at":"%s"}\n' \
+              "$(git rev-parse HEAD)" "${{ github.run_id }}" "${RUN_URL}" \
+              "${{ github.workflow }}/${{ github.job }}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              > dist/manifest.json
+            cat dist/manifest.json
+          fi
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.upload }}
+        with:
+          name: sherpad-${{ matrix.os_slug }}-cpu
+          path: runtimes/sherpa-onnx/dist/
+          retention-days: ${{ inputs.retention-days }}
