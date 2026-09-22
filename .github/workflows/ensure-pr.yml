@@ -1,9 +1,10 @@
 name: Ensure Integration PR
 
 # Keeps exactly one draft PR open from the integration branch to main, titled
-# for the next release version. This is what makes CI useful from commit #1:
-# the PR gives every push a check context and a running "next release" view.
-# Merging it is the release-readiness signal — see AGENTS.md.
+# for the next release version — a running "next release" view. CI no longer
+# runs automatically on push (see ci.yml); this PR's job is just tracking
+# what's about to ship. Merging it is the release-readiness signal — see
+# AGENTS.md.
 # No-ops when a PR from this branch is already open (e.g. one opened by hand).
 
 on:
