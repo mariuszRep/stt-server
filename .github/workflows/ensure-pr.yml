@@ -37,5 +37,5 @@ jobs:
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           gh pr create --draft --base main --head "${{ github.ref_name }}" \
             --title "v${version}" \
-            --body "Placeholder PR for the next release (${version}). ci.yml runs on every push to this branch. Merging to main fires a candidate-server.yml build — see AGENTS.md's build/test/release section."
+            --body "Placeholder PR for the next release (${version}). Build locally with npm run vt -- server dev; UAT is dispatch-only via npm run vt -- server uat. Merging does not build or publish anything."
           echo "Opened draft PR v${version}."

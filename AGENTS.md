@@ -81,7 +81,7 @@ push to voice-typer-windows ──▶ a draft PR titled "vX.Y.Z" stays open (ens
                                 first (Verify Commands below); ci.yml is dispatch-only,
                                 not an automatic push guard
 merge PR ─────────────────────▶ nothing builds automatically — dispatch by hand:
-                                npm run uat -- stt-server   (from voice-typer/ root)
+                                npm run vt -- server uat   (from voice-typer/ root)
                                 → real binaries + per-artifact SHA256SUMS
 human acceptance ─────────────▶ download the run's artifacts, verify against SHA256SUMS,
                                 install and smoke-test on a real machine
@@ -91,8 +91,9 @@ tag the tested SHA ───────────▶ release.yml fetches that
 
 The candidate produces: `stt-linux-x86_64`, `stt-windows-x86_64.exe`,
 `sherpad-linux-cpu`, `sherpad-windows-cpu`, `faster-whisper-runtime-linux-cpu`,
-`faster-whisper-runtime-windows-cpu`, and — only when its opt-in dispatch input is set —
-`faster-whisper-runtime-windows-gpu` (617MB, off by default).
+`faster-whisper-runtime-windows-cpu`, and `faster-whisper-runtime-windows-gpu`. The raw
+workflow input remains opt-in, but `npm run vt -- server uat` always enables it because
+production requires the complete artifact set.
 
 - Candidates build the current commit as-is — no version-ahead check blocks them, so it's
   fine to build/test the same version repeatedly (most merges have nothing to bump anyway).

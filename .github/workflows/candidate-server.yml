@@ -7,7 +7,7 @@ name: Server Candidate
 # matches stt-sdk and whisper-vibes: merging never auto-builds anywhere in
 # this workspace, on any repo, public/free or not. Local build/test happens
 # first; this is the on-demand cloud-environment check, run with
-# `npm run uat -- stt-server` from voice-typer/ root when you choose to run
+# `npm run vt -- server uat` from voice-typer/ root when you choose to run
 # it. Each artifact carries a SHA256SUMS.txt that release.yml's promote step
 # verifies before publishing. Does NOT create a GitHub Release and has no
 # `contents: write` permission — structurally incapable of publishing. The

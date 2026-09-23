@@ -1,7 +1,7 @@
 name: CI
 
 # workflow_dispatch-only, deliberately — build/test already happens locally
-# before a push, and candidate-server.yml (npm run uat -- stt-server) is the
+# before a push, and candidate-server.yml (npm run vt -- server uat) is the
 # real on-demand cloud-environment check. Not wired to push/PR: an automatic
 # pass on every commit duplicates local testing without adding a check that
 # isn't already happening somewhere more deliberate. Still runnable by hand
@@ -128,4 +128,3 @@ jobs:
             echo "::error::found a WebSocket extractor reference in the control plane — audio must never cross stt-server"
             exit 1
           fi
-
