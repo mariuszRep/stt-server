@@ -1,20 +1,19 @@
 name: Server Candidate
 
 # Builds the same artifacts release.yml later promotes (stt control plane,
-# faster-whisper sidecar, sherpad) and uploads them as Actions artifacts for
+# faster-whisper sidecar, sherpad) and uploads them to a private draft Release for
 # manual download/install — the candidate build is what a human
-# acceptance-tests before tagging. Fires on merge to main (the "I'm ready"
-# signal) and on workflow_dispatch for re-testing any SHA. Each artifact
-# carries a SHA256SUMS.txt that release.yml's promote step verifies before
-# publishing. Does NOT create a GitHub Release and has no `contents: write`
-# permission — structurally incapable of publishing. The 617MB faster-whisper
-# GPU variant builds only behind the `gpu` input (push-triggered runs skip it).
+# acceptance-tests before tagging. workflow_dispatch-only, deliberately —
+# matches stt-sdk and whisper-vibes: merging never auto-builds anywhere in
+# this workspace, on any repo, public/free or not. Local build/test happens
+# first; this is the on-demand cloud-environment check, run with
+# `npm run vt -- server uat` from voice-typer/ root when you choose to run
+# it. Each artifact carries a SHA256SUMS.txt that release.yml's promote step
+# verifies before publishing. Draft candidates are not public and avoid the
+# 500 MB Actions artifact quota. The
+# 617MB faster-whisper GPU variant builds only behind the `gpu` input.
 
 on:
-  # Merging the integration PR to main is the "I'm ready" signal — it fires
-  # this build. workflow_dispatch stays for re-testing any SHA by hand.
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       ref:
@@ -28,32 +27,29 @@ on:
         default: false
 
 jobs:
-  # Fail fast, before burning build minutes: a candidate must be built on a
-  # manifest version ahead of the latest published release, or the binaries
-  # come out mislabeled (this is what "forgot to bump" looks like today).
-  version-guard:
+  prepare-candidate:
     runs-on: ubuntu-latest
-    env:
-      GH_REPO: ${{ github.repository }}
-      GH_TOKEN: ${{ github.token }}
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.candidate.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
-      - name: Assert version is ahead of the latest release tag
+      - id: candidate
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          src=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          latest=$(gh release view --json tagName --jq '.tagName' 2>/dev/null | sed 's/^v//' || true)
-          echo "manifest: ${src}   latest release: ${latest:-none}"
-          if [ -n "${latest}" ]; then
-            top=$(printf '%s\n%s\n' "${latest}" "${src}" | sort -V | tail -1)
-            if [ "${src}" = "${latest}" ] || [ "${top}" = "${latest}" ]; then
-              echo "::error::Cargo.toml version ${src} is not ahead of latest release v${latest} — bump [workspace.package] version on the branch first"
-              exit 1
-            fi
-          fi
+          sha=$(git rev-parse HEAD)
+          tag="candidate-${sha}"
+          gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$tag" --draft --target "$sha" \
+            --title "UAT candidate ${sha}" \
+            --notes "Private server UAT candidate from ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
   # The three build legs are reusable-workflow calls — _build-*.yml holds the
   # single definition of each build (shared with any future caller), so the
@@ -61,14 +57,25 @@ jobs:
   # release.yml promotes these artifacts; each artifact also carries a
   # manifest.json with {commit, run_id, run_url, builder, built_at} so the
   # provenance of every promoted binary is recorded next to its checksums.
+  #
+  # No version-ahead-of-latest-release check here on purpose: a candidate is
+  # just "build + test the current commit," and most merges (CI/docs-only
+  # changes) have nothing to bump. It's fine to build the same version
+  # repeatedly — the version only has to be new at the moment you actually
+  # TAG a release, which is where that check belongs (still enforced there:
+  # release.yml refuses to run without a matching successful candidate, and
+  # `git tag` itself refuses to create a tag name that already exists).
   build-binaries:
-    needs: version-guard
+    needs: prepare-candidate
+    permissions:
+      contents: write
     uses: ./.github/workflows/_build-stt-binaries.yml
     with:
       ref: ${{ inputs.ref || github.ref }}
       upload: true
       upload-checksums: true
       retention-days: 7
+      candidate-tag: ${{ needs.prepare-candidate.outputs.tag }}
 
   # The GPU variant is opt-in (workflow_dispatch -f gpu=true): at ~617MB it is
   # the single largest artifact and rarely the thing under test. A release
@@ -76,7 +83,9 @@ jobs:
   # faster-whisper-runtime-windows-gpu, so dispatch this once with gpu=true on
   # the tested SHA before tagging.
   build-faster-whisper:
-    needs: version-guard
+    needs: prepare-candidate
+    permissions:
+      contents: write
     uses: ./.github/workflows/_build-faster-whisper.yml
     with:
       ref: ${{ inputs.ref || github.ref }}
@@ -84,12 +93,16 @@ jobs:
       upload-checksums: true
       retention-days: 7
       include-gpu: ${{ inputs.gpu == true }}
+      candidate-tag: ${{ needs.prepare-candidate.outputs.tag }}
 
   build-sherpad:
-    needs: version-guard
+    needs: prepare-candidate
+    permissions:
+      contents: write
     uses: ./.github/workflows/_build-sherpad.yml
     with:
       ref: ${{ inputs.ref || github.ref }}
       upload: true
       upload-checksums: true
       retention-days: 7
+      candidate-tag: ${{ needs.prepare-candidate.outputs.tag }}

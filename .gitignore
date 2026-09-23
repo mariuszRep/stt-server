@@ -45,3 +45,7 @@ runtimes/*/venv/
 runtimes/*/*.egg-info/
 runtimes/*/build/
 runtimes/*/dist/
+
+# Root mini CLI (scripts/uat.mjs) — local candidate downloads + state
+candidate-download/
+.last-candidate.json

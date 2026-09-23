@@ -31,6 +31,10 @@ on:
         required: false
         type: boolean
         default: false
+      candidate-tag:
+        description: "Draft release tag that receives candidate files"
+        required: false
+        type: string
 
 jobs:
   build:
@@ -86,19 +90,20 @@ jobs:
              "dist/faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}${{ matrix.ext }}"
           bash ../../scripts/verify-release-artifact.sh dist
           if [ "${CHECKSUMS}" = "true" ]; then
-            (cd dist && sha256sum "faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}${{ matrix.ext }}" > SHA256SUMS.txt && cat SHA256SUMS.txt)
+            asset="faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}${{ matrix.ext }}"
+            (cd dist && sha256sum "$asset" > "$asset.SHA256SUMS.txt" && cat "$asset.SHA256SUMS.txt")
             printf '{"commit":"%s","run_id":"%s","run_url":"%s","builder":"%s","built_at":"%s"}\n' \
               "$(git rev-parse HEAD)" "${{ github.run_id }}" "${RUN_URL}" \
               "${{ github.workflow }}/${{ github.job }}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-              > dist/manifest.json
-            cat dist/manifest.json
+              > "dist/$asset.manifest.json"
+            cat "dist/$asset.manifest.json"
           fi
-      - uses: actions/upload-artifact@v4
+      - name: Upload candidate files to draft release
         if: ${{ inputs.upload }}
-        with:
-          name: faster-whisper-runtime-${{ matrix.os_slug }}-${{ matrix.variant }}
-          path: runtimes/faster-whisper/dist/
-          retention-days: ${{ inputs.retention-days }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ inputs.candidate-tag }}" dist/* --clobber
 
   build-gpu:
     if: ${{ inputs.include-gpu }}
@@ -134,16 +139,17 @@ jobs:
              "dist/faster-whisper-runtime-windows-gpu.exe"
           bash ../../scripts/verify-release-artifact.sh dist
           if [ "${CHECKSUMS}" = "true" ]; then
-            (cd dist && sha256sum "faster-whisper-runtime-windows-gpu.exe" > SHA256SUMS.txt && cat SHA256SUMS.txt)
+            asset="faster-whisper-runtime-windows-gpu.exe"
+            (cd dist && sha256sum "$asset" > "$asset.SHA256SUMS.txt" && cat "$asset.SHA256SUMS.txt")
             printf '{"commit":"%s","run_id":"%s","run_url":"%s","builder":"%s","built_at":"%s"}\n' \
               "$(git rev-parse HEAD)" "${{ github.run_id }}" "${RUN_URL}" \
               "${{ github.workflow }}/${{ github.job }}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-              > dist/manifest.json
-            cat dist/manifest.json
+              > "dist/$asset.manifest.json"
+            cat "dist/$asset.manifest.json"
           fi
-      - uses: actions/upload-artifact@v4
+      - name: Upload candidate files to draft release
         if: ${{ inputs.upload }}
-        with:
-          name: faster-whisper-runtime-windows-gpu
-          path: runtimes/faster-whisper/dist/
-          retention-days: ${{ inputs.retention-days }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ inputs.candidate-tag }}" dist/* --clobber

@@ -76,12 +76,13 @@ every built artifact.
 ## Build, test, release
 
 ```
-push to voice-typer-windows ──▶ ci.yml runs on every push (fmt/clippy/build/test/sherpad);
-                                a draft PR titled "vX.Y.Z" stays open (ensure-pr.yml
-                                opens one if none exists)
-merge PR ─────────────────────▶ candidate-server.yml fires on push:main → real binaries
-                                + per-artifact SHA256SUMS (workflow_dispatch stays
-                                available to re-test any SHA)
+push to voice-typer-windows ──▶ a draft PR titled "vX.Y.Z" stays open (ensure-pr.yml
+                                opens one if none exists) — build/test happens locally
+                                first (Verify Commands below); ci.yml is dispatch-only,
+                                not an automatic push guard
+merge PR ─────────────────────▶ nothing builds automatically — dispatch by hand:
+                                npm run vt -- server uat   (from voice-typer/ root)
+                                → private draft candidate with real binaries + checksums
 human acceptance ─────────────▶ download the run's artifacts, verify against SHA256SUMS,
                                 install and smoke-test on a real machine
 tag the tested SHA ───────────▶ release.yml fetches that run's artifacts, re-verifies
@@ -90,24 +91,27 @@ tag the tested SHA ───────────▶ release.yml fetches that
 
 The candidate produces: `stt-linux-x86_64`, `stt-windows-x86_64.exe`,
 `sherpad-linux-cpu`, `sherpad-windows-cpu`, `faster-whisper-runtime-linux-cpu`,
-`faster-whisper-runtime-windows-cpu`, and — only when its opt-in dispatch input is set —
-`faster-whisper-runtime-windows-gpu` (617MB, off by default).
+`faster-whisper-runtime-windows-cpu`, and `faster-whisper-runtime-windows-gpu`. The raw
+workflow input remains opt-in, but `npm run vt -- server uat` always enables it because
+production requires the complete artifact set.
 
-- Version bumps are ordinary commits on the branch before the final candidate run:
-  `[workspace.package] version` in the root `Cargo.toml`. The candidate workflow's version
-  guard fails the build if the manifest version isn't ahead of the latest release tag.
+- Candidates build the current commit as-is — no version-ahead check blocks them, so it's
+  fine to build/test the same version repeatedly (most merges have nothing to bump anyway).
+  `[workspace.package] version` in the root `Cargo.toml` only needs to be new at the moment
+  you actually tag a release.
 - Release (explicit instruction only): `git tag vX.Y.Z <tested-sha>` →
   `git push origin vX.Y.Z`. The tag need not sit on `main`. `release.yml` hard-fails when
   no successful candidate run exists for that SHA — re-dispatch `candidate-server.yml` on
-  the SHA first if the artifacts expired.
+  the SHA first if the artifacts expired. Right after a successful release, it auto-bumps
+  the next patch version back onto `voice-typer-windows` — rarely something to do by hand.
 - **Rollback is free**: re-tag an older already-tested SHA and let promote republish it —
   seconds, no rebuild, no new test cycle.
 
 ### CI housekeeping rules
 
 - **GitHub Releases assets do not count against the Actions artifact-storage quota** —
-  promoting is how bits get off the meter permanently, which is why candidate artifact
-  retention is deliberately short (7 days).
+  candidates live in private draft Releases because the GPU runtime alone is larger than
+  GitHub Free's Actions artifact allowance. Production promotes and removes the draft.
 - **Renaming a job or artifact orphans the old artifact's name** — nothing prunes it.
   When an artifact name changes, purge the old name (`gh api -X DELETE
   repos/<owner>/<repo>/actions/artifacts/<id>`); `cleanup-artifacts.yml` does this weekly.
