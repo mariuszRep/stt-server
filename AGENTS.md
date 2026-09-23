@@ -82,7 +82,7 @@ push to voice-typer-windows ──▶ a draft PR titled "vX.Y.Z" stays open (ens
                                 not an automatic push guard
 merge PR ─────────────────────▶ nothing builds automatically — dispatch by hand:
                                 npm run vt -- server uat   (from voice-typer/ root)
-                                → real binaries + per-artifact SHA256SUMS
+                                → private draft candidate with real binaries + checksums
 human acceptance ─────────────▶ download the run's artifacts, verify against SHA256SUMS,
                                 install and smoke-test on a real machine
 tag the tested SHA ───────────▶ release.yml fetches that run's artifacts, re-verifies
@@ -110,8 +110,8 @@ production requires the complete artifact set.
 ### CI housekeeping rules
 
 - **GitHub Releases assets do not count against the Actions artifact-storage quota** —
-  promoting is how bits get off the meter permanently, which is why candidate artifact
-  retention is deliberately short (7 days).
+  candidates live in private draft Releases because the GPU runtime alone is larger than
+  GitHub Free's Actions artifact allowance. Production promotes and removes the draft.
 - **Renaming a job or artifact orphans the old artifact's name** — nothing prunes it.
   When an artifact name changes, purge the old name (`gh api -X DELETE
   repos/<owner>/<repo>/actions/artifacts/<id>`); `cleanup-artifacts.yml` does this weekly.

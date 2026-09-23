@@ -1,7 +1,7 @@
 name: Server Candidate
 
 # Builds the same artifacts release.yml later promotes (stt control plane,
-# faster-whisper sidecar, sherpad) and uploads them as Actions artifacts for
+# faster-whisper sidecar, sherpad) and uploads them to a private draft Release for
 # manual download/install — the candidate build is what a human
 # acceptance-tests before tagging. workflow_dispatch-only, deliberately —
 # matches stt-sdk and whisper-vibes: merging never auto-builds anywhere in
@@ -9,8 +9,8 @@ name: Server Candidate
 # first; this is the on-demand cloud-environment check, run with
 # `npm run vt -- server uat` from voice-typer/ root when you choose to run
 # it. Each artifact carries a SHA256SUMS.txt that release.yml's promote step
-# verifies before publishing. Does NOT create a GitHub Release and has no
-# `contents: write` permission — structurally incapable of publishing. The
+# verifies before publishing. Draft candidates are not public and avoid the
+# 500 MB Actions artifact quota. The
 # 617MB faster-whisper GPU variant builds only behind the `gpu` input.
 
 on:
@@ -27,6 +27,30 @@ on:
         default: false
 
 jobs:
+  prepare-candidate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.candidate.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - id: candidate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          tag="candidate-${sha}"
+          gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$tag" --draft --target "$sha" \
+            --title "UAT candidate ${sha}" \
+            --notes "Private server UAT candidate from ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
   # The three build legs are reusable-workflow calls — _build-*.yml holds the
   # single definition of each build (shared with any future caller), so the
   # release-asset shape can't drift. upload+checksums are on here because
@@ -42,12 +66,16 @@ jobs:
   # release.yml refuses to run without a matching successful candidate, and
   # `git tag` itself refuses to create a tag name that already exists).
   build-binaries:
+    needs: prepare-candidate
+    permissions:
+      contents: write
     uses: ./.github/workflows/_build-stt-binaries.yml
     with:
       ref: ${{ inputs.ref || github.ref }}
       upload: true
       upload-checksums: true
       retention-days: 7
+      candidate-tag: ${{ needs.prepare-candidate.outputs.tag }}
 
   # The GPU variant is opt-in (workflow_dispatch -f gpu=true): at ~617MB it is
   # the single largest artifact and rarely the thing under test. A release
@@ -55,6 +83,9 @@ jobs:
   # faster-whisper-runtime-windows-gpu, so dispatch this once with gpu=true on
   # the tested SHA before tagging.
   build-faster-whisper:
+    needs: prepare-candidate
+    permissions:
+      contents: write
     uses: ./.github/workflows/_build-faster-whisper.yml
     with:
       ref: ${{ inputs.ref || github.ref }}
@@ -62,11 +93,16 @@ jobs:
       upload-checksums: true
       retention-days: 7
       include-gpu: ${{ inputs.gpu == true }}
+      candidate-tag: ${{ needs.prepare-candidate.outputs.tag }}
 
   build-sherpad:
+    needs: prepare-candidate
+    permissions:
+      contents: write
     uses: ./.github/workflows/_build-sherpad.yml
     with:
       ref: ${{ inputs.ref || github.ref }}
       upload: true
       upload-checksums: true
       retention-days: 7
+      candidate-tag: ${{ needs.prepare-candidate.outputs.tag }}
