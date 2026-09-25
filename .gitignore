@@ -1,0 +1,15 @@
+/target/
+/t/
+/t-static/
+/s/
+static-build.log
+static-build-2.log
+static-smoke.out
+static-smoke.err
+/test-data*/
+/.last-candidate.json
+*.gguf
+*.wav
+*.db
+*.db-shm
+*.db-wal

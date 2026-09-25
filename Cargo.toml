@@ -1,0 +1,33 @@
+[package]
+name = "stt-server-next"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+transcribe-cpp = { version = "=0.2.3", default-features = false, features = ["vulkan"] }
+hound = "=3.5.1"
+axum = { version = "=0.8.9", features = ["multipart"] }
+tokio = { version = "=1.53.1", features = ["full"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+rusqlite = { version = "=0.37.0", features = ["bundled"] }
+sha2 = "=0.10.9"
+reqwest = { version = "=0.12.28", features = ["stream", "rustls-tls"], default-features = false }
+futures-util = "0.3"
+uuid = { version = "=1.26.1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "=0.8.1"
+
+[[bin]]
+name = "stt-proof"
+path = "src/main.rs"
+
+[[bin]]
+name = "stt-server-next"
+path = "src/bin/server.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
