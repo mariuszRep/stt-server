@@ -58,3 +58,53 @@ queued/running returned HTTP 409 `operation_conflict`. No bugs were found in the
 `cargo test --release --offline --bin stt-server-next` (6 tests) all passed. Rebuilt release
 executable: 65,178,624 bytes, SHA-256
 `283163FA48FF1C02D1BE54143FBF0680528FD8CD0CB564C55DE802590ADB9C2E`.
+
+## Every catalog model installable, versioned migration — 2026-09-25 (update)
+
+Removed the hard-coded `parakeet-unified-en-0.6b` admission check from install and import; every
+catalog entry is now `installable: true`. `POST /v1/local/models/{id}/install` takes an optional
+JSON body `{"quant":"..."}` (validated by a pure `catalog::resolve_quant`, 400 `invalid_quant` on
+an unknown value); import accepts an optional multipart `quant` field to preselect the expected
+file, otherwise matches the uploaded size+SHA-256 against any of the model's files. State moved
+to a versioned SQLite schema keyed on `PRAGMA user_version`: v1 is the original unversioned
+schema, v2 adds `installed.quant/filename/size_bytes` (backfilled by SHA-256 match against the
+catalog) and `operations.created_at/updated_at/finished_at` (unix ms). A non-empty older DB is
+checkpointed and copied to `state.db.bak-v1` before migrating, all in one transaction. Verify,
+restart reconciliation, and model views now use the recorded installed quant/size/sha instead of
+the catalog's `default_quant`. `capability_matrix` was rewritten to derive every field from
+catalog metadata (`model_claim` plus a `not_implemented`/`model_lacks` reason) instead of a
+slug-keyed hard-code; `streaming` stays always-unsupported.
+
+Gates: `cargo fmt --check`, `cargo clippy --release --all-targets --offline -- -D warnings`, and
+`cargo test --release --offline` (14 tests, all lib-crate) all passed. `tower 0.5.3` (pinned to
+match the version axum 0.8.9 already resolves) was added as the only new dependency, as a
+dev-dependency only, via one online `cargo update -p tower --precise 0.5.3`. Release build via
+`scripts/build-local.ps1 -Offline`: **65,394,688 bytes**, SHA-256
+`6B5F7FE3B02C42DD7E1047B5BD577FE0B94875901C7A8AF95BE6F97B31F8E73E`.
+
+Real E2E on a fresh `STT_NEXT_DATA_DIR`:
+1. Imported the Parakeet fixture (multipart `model`/`file`) — HTTP 201. `/v1/local/models` showed
+   `installed_quant: "Q8_0"`. Selected (Vulkan0) and transcribed `stereo48.wav` with
+   `model=default` — HTTP 200, text starting "Well, I don't wish to see it any more, observed
+   Phoebe, ...", matching the known fixture transcript.
+2. Installed `whisper-tiny.en` at the non-default quant `Q4_K_M` (43,545,248 bytes) over the
+   network: `POST .../install {"quant":"Q4_K_M"}` returned HTTP 202; polling
+   `GET /v1/local/operations/{id}` showed `state` progressing `running` → `completed` with
+   populated `created_at`/`updated_at`/`finished_at`. Selected it (backend `Vulkan0`, no
+   fallback) and transcribed the same WAV: HTTP 200, text "Well, I don't wish to see it anymore,
+   observe Phoebe, turning away her eyes. It is certainly very like the old portrait." — a
+   plausible small-Whisper transcript of the same English clip, no load or inference errors.
+   `/v1/local/models` confirmed `installed_quant: "Q4_K_M"` against `default_quant: "Q8_0"`.
+3. Migration on a real old DB: built a throwaway helper binary (not committed) that wrote a
+   `state.db` with the original unversioned `CREATE TABLE` statements (no `quant`/`filename`/
+   `size_bytes`/timestamp columns) plus one `installed` row pointing at a copy of the Parakeet
+   fixture and a `selected_model` setting, in a fresh data dir. Starting the new
+   `stt-server-next.exe` against that dir produced `state.db.bak-v1` (pre-migration backup),
+   backfilled the installed row to `installed_quant: "Q8_0"` (matched by SHA-256), and reloaded
+   the previously selected model on `Vulkan0` — `GET /v1/local/models` and
+   `GET /v1/local/models/selected` both confirmed it stayed installed and loaded after restart.
+
+No bugs were found in the install/import/verify/migration paths exercised. Deviations: none from
+the task scope; download hardening, queue, CORS, and language/prompt controls were intentionally
+left out as separate later tasks. All temp data directories created for this run were deleted
+after the checks above.

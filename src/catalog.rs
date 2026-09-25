@@ -38,6 +38,10 @@ pub struct CatalogModel {
     pub default_quant: String,
     pub recommended: bool,
     pub recommended_rank: Option<u32>,
+    /// Mirror information is not implemented yet; kept deserializable so the
+    /// embedded catalog stays byte-identical to upstream and forward-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirrors: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -52,26 +56,65 @@ pub fn catalog_model<'a>(app: &'a App, id: &str) -> ApiResult<&'a CatalogModel> 
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "model_not_found", "Unknown model ID"))
 }
 
+/// Pure validation: resolve the requested quant (or the model's default when
+/// absent/empty) to a catalog file. Returns 400 invalid_quant when unknown.
+pub fn resolve_quant<'a>(
+    model: &'a CatalogModel,
+    requested: Option<&str>,
+) -> ApiResult<&'a CatalogFile> {
+    let quant = match requested {
+        Some(value) if !value.is_empty() => value,
+        _ => model.default_quant.as_str(),
+    };
+    model
+        .files
+        .iter()
+        .find(|file| file.quant == quant)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_quant",
+                format!("Unknown quant '{quant}' for model {}", model.slug),
+            )
+        })
+}
+
 pub fn capability_matrix(model: &CatalogModel) -> Value {
-    let english_fixed = model.slug == "parakeet-unified-en-0.6b";
+    let multi_language = model.languages.len() > 1;
+    let has_timestamps = model.capabilities.timestamps != "none";
+    let unimplemented = |model_claim: Value, lacks: bool| {
+        json!({
+            "status": "unsupported",
+            "reason": if lacks { "model_lacks" } else { "not_implemented" },
+            "model_claim": model_claim,
+        })
+    };
     json!({
-        "prompt": {"status": if english_fixed { "unsupported" } else { "unknown" }, "mechanism": null},
-        "vocabulary": {"status": if english_fixed { "unsupported" } else { "unknown" }, "mechanism": null},
-        "language_hint": {"status": if english_fixed { "unsupported" } else { "unknown" }, "scope": "request"},
-        "language_detect": {"status": "unsupported", "model_claim": model.capabilities.lang_detect},
-        "translation": {"status": "unsupported", "model_claim": model.capabilities.translate},
-        "temperature": {"status": "unsupported"},
+        "prompt": unimplemented(Value::Null, false),
+        "vocabulary": unimplemented(Value::Null, false),
+        "temperature": unimplemented(Value::Null, false),
+        "language_hint": unimplemented(json!(model.languages), !multi_language),
+        "language_detect": unimplemented(json!(model.capabilities.lang_detect), !model.capabilities.lang_detect),
+        "translation": unimplemented(json!(model.capabilities.translate), !model.capabilities.translate),
+        "timestamp_granularity": unimplemented(json!(model.capabilities.timestamps), !has_timestamps),
+        "streaming": {"status": "unsupported", "model_claim": model.capabilities.streaming},
         "response_formats": {"json": "supported", "text": "unsupported", "verbose_json": "unsupported"},
-        "timestamp_granularity": {"status": "unknown", "model_claim": model.capabilities.timestamps},
-        "streaming": {"status": "unsupported", "model_claim": model.capabilities.streaming}
     })
 }
 
-pub fn model_view(model: &CatalogModel, installed: bool) -> Value {
-    let file = model
+pub fn model_view(model: &CatalogModel, installed_quant: Option<&str>) -> Value {
+    let files: Vec<Value> = model
         .files
         .iter()
-        .find(|file| file.quant == model.default_quant);
+        .map(|file| {
+            json!({
+                "filename": file.filename,
+                "quant": file.quant,
+                "size_bytes": file.size_bytes,
+                "sha256": file.sha256,
+            })
+        })
+        .collect();
     json!({
         "id": model.slug,
         "name": model.name,
@@ -84,13 +127,14 @@ pub fn model_view(model: &CatalogModel, installed: bool) -> Value {
         "model_capabilities": model.capabilities,
         "effective_capabilities": capability_matrix(model),
         "default_quant": model.default_quant,
-        "size_bytes": file.map(|f| f.size_bytes),
+        "files": files,
         "speed_score": model.speed_score,
         "accuracy_score": model.accuracy_score,
         "benchmark_source": "Handy catalog generated 2026-08-17; scores are derived display values, not local measurements",
         "recommended_rank": model.recommended_rank,
-        "installed": installed,
-        "installable": model.slug == "parakeet-unified-en-0.6b" && file.is_some(),
+        "installed": installed_quant.is_some(),
+        "installed_quant": installed_quant,
+        "installable": true,
     })
 }
 
@@ -130,5 +174,74 @@ mod tests {
             capability_matrix(nemotron)["language_detect"]["status"],
             "unsupported"
         );
+    }
+
+    #[test]
+    fn capability_matrix_for_a_whisper_model_reports_model_lacks_where_claims_are_absent() {
+        let catalog: Catalog =
+            serde_json::from_str(include_str!("../catalog/handy-2026-08-17.json")).unwrap();
+        let whisper = catalog
+            .models
+            .iter()
+            .find(|model| model.slug.starts_with("whisper-") && model.languages.len() > 1)
+            .expect("expected a multilingual whisper model in the catalog");
+        let matrix = capability_matrix(whisper);
+        assert_eq!(matrix["prompt"]["status"], "unsupported");
+        assert_eq!(matrix["prompt"]["reason"], "not_implemented");
+        assert_eq!(matrix["language_hint"]["status"], "unsupported");
+        assert_eq!(matrix["language_hint"]["reason"], "not_implemented");
+        assert_eq!(matrix["streaming"]["status"], "unsupported");
+        assert_eq!(
+            matrix["streaming"]["model_claim"],
+            whisper.capabilities.streaming
+        );
+    }
+
+    #[test]
+    fn capability_matrix_for_a_single_language_model_marks_language_hint_as_model_lacks() {
+        let catalog: Catalog =
+            serde_json::from_str(include_str!("../catalog/handy-2026-08-17.json")).unwrap();
+        let single_language = catalog
+            .models
+            .iter()
+            .find(|model| model.languages.len() == 1)
+            .expect("expected a single-language model in the catalog");
+        let matrix = capability_matrix(single_language);
+        assert_eq!(matrix["language_hint"]["status"], "unsupported");
+        assert_eq!(matrix["language_hint"]["reason"], "model_lacks");
+        if !single_language.capabilities.translate {
+            assert_eq!(matrix["translation"]["reason"], "model_lacks");
+        }
+        if !single_language.capabilities.lang_detect {
+            assert_eq!(matrix["language_detect"]["reason"], "model_lacks");
+        }
+    }
+
+    #[test]
+    fn resolve_quant_validates_default_explicit_and_invalid() {
+        let catalog: Catalog =
+            serde_json::from_str(include_str!("../catalog/handy-2026-08-17.json")).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.slug == "parakeet-unified-en-0.6b")
+            .unwrap();
+        let default = resolve_quant(model, None).unwrap();
+        assert_eq!(default.quant, model.default_quant);
+        let explicit = resolve_quant(model, Some(&model.files[0].quant)).unwrap();
+        assert_eq!(explicit.quant, model.files[0].quant);
+        assert!(resolve_quant(model, Some("not-a-real-quant")).is_err());
+    }
+
+    #[test]
+    fn every_catalog_model_is_installable_in_its_view() {
+        let catalog: Catalog =
+            serde_json::from_str(include_str!("../catalog/handy-2026-08-17.json")).unwrap();
+        for model in &catalog.models {
+            let view = model_view(model, None);
+            assert_eq!(view["installable"], true, "{}", model.slug);
+            assert_eq!(view["installed"], false);
+            assert!(!view["files"].as_array().unwrap().is_empty());
+        }
     }
 }

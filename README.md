@@ -18,8 +18,23 @@ mono/stereo WAV from 8–192 kHz (16/24-bit PCM or 32-bit float). Audio is conve
 mono before inference. The `/v1/local/*` routes expose fixed recommendations, per-model capability
 matrices, installed models, explicit install/import/verification, selection/load/removal, operation progress
 and cancellation, and CPU/Vulkan preference. Unsupported optional transcription fields return
-`unsupported_capability`. Only the SHA-256 pinned Parakeet Q8 catalog model is currently admitted
-for installation; other catalog entries remain visible with `installable=false` until tested.
+`unsupported_capability`. Every catalog model is installable (`installable: true`); admission is
+catalog membership plus a resolvable quant/hash, not a hard-coded model ID.
+
+`POST /v1/local/models/{id}/install` takes an optional JSON body `{"quant":"Q8_0"}`; an absent or
+empty body installs the model's `default_quant`. An unknown quant returns 400 `invalid_quant`;
+an already-installed model returns 409 `already_installed`. `POST /v1/local/models/import`
+accepts an optional multipart `quant` field before `file` to preselect the expected catalog file;
+without it, the uploaded file's size and SHA-256 are matched against any of the model's files.
+`GET /v1/local/models` and `GET /v1/local/recommendations` list every catalog file
+(`quant`, `size_bytes`, `sha256`) plus `installed_quant` (the recorded quant, or `null`).
+`GET /v1/local/operations/{id}` also reports `created_at`, `updated_at`, and `finished_at`
+(unix milliseconds). Verify, restart reconciliation, select, and remove all operate on the quant
+actually installed, not the catalog's current default.
+
+State is stored in a versioned SQLite schema (`PRAGMA user_version`). Opening an older,
+unversioned database migrates it to the current schema in one transaction, backing up the file
+to `state.db.bak-v<old>` first when it already had data.
 
 ## Local build
 

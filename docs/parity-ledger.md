@@ -8,7 +8,7 @@ required behavior and current evidence; it does not imply a replacement verdict.
 |---|---|---|
 | Provider/model discovery and progress | Fixed recommendations; offline, model-free first start; durable install progress | Failure and retry contract tests |
 | Runtime connection descriptor | Stable loopback URL, protected token, LocalSystem service tested | Clean-machine client handoff |
-| Download, verify, selection, load, removal | Pinned Parakeet download/import, hash, selection, restart reload, deselection, removal tested; durable `verify` operation end-to-end on the installed copy, including restart reconciliation and live corruption quarantine | Interrupted resume, disk-full and upgrade tests |
+| Download, verify, selection, load, removal | Every catalog model/quant is installable via download or import (versioned SQLite migration records the installed quant/filename/size); hash, selection, restart reload, deselection, removal tested; durable `verify` operation end-to-end on the installed copy at its recorded (possibly non-default) quant, including restart reconciliation and live corruption quarantine | Interrupted resume, disk-full and upgrade tests; download hardening, queue, CORS, and language/prompt controls (separate tasks) |
 | Batch audio | OpenAI-style multipart, same-file transcript, and tested stereo 48 kHz downmix/resample | Other containers and dictation corpus |
 | Prompt and vocabulary | Parakeet matrix says unsupported; prompt rejected with `unsupported_capability` | Admit and test a model with supported decode hints |
 | Language and translation | Unsupported Parakeet controls rejected | Model-specific multilingual tests |
