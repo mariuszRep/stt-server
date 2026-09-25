@@ -15,10 +15,10 @@ use uuid::Uuid;
 
 use crate::app::App;
 use crate::auth::authorized;
-use crate::catalog::catalog_model;
+use crate::catalog::CatalogFile;
 use crate::errors::{internal, ApiError, ApiResult};
 use crate::operations::{operation_state, update_operation};
-use crate::store::installed_path;
+use crate::store::installed_file;
 
 pub fn sha256_file(path: &Path) -> std::io::Result<String> {
     let mut file = fs::File::open(path)?;
@@ -40,20 +40,24 @@ pub async fn verify_model(
     headers: HeaderMap,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     authorized(&headers, &app)?;
-    let model = catalog_model(&app, &id)?;
-    let file = model
-        .files
-        .iter()
-        .find(|file| file.quant == model.default_quant)
-        .cloned()
-        .ok_or_else(|| internal("Default quantization missing"))?;
-    let path = installed_path(&app, &id)?.ok_or_else(|| {
+    let installed = installed_file(&app, &id)?.ok_or_else(|| {
         ApiError::new(
             StatusCode::NOT_FOUND,
             "model_not_installed",
             "Model is not installed",
         )
     })?;
+    let path = installed.path.clone();
+    // Use the recorded quant/size/sha (from install/import time), not the
+    // catalog's current default_quant, so a non-default install still verifies.
+    let file = CatalogFile {
+        filename: installed.filename.clone().unwrap_or_default(),
+        quant: installed.quant.clone().unwrap_or_default(),
+        size_bytes: installed.size_bytes.ok_or_else(|| {
+            internal("Installed model is missing recorded size; run reconciliation")
+        })?,
+        sha256: installed.sha256.clone(),
+    };
     let op = Uuid::new_v4().to_string();
     {
         let db = app.db.lock().map_err(internal)?;
@@ -71,9 +75,10 @@ pub async fn verify_model(
                 "An operation for this model is already active",
             ));
         }
+        let now = crate::store::now_ms();
         db.execute(
-            "INSERT INTO operations(id,model_id,kind,state,error,progress_bytes,total_bytes) VALUES(?1,?2,'verify','queued',NULL,0,?3)",
-            params![op, id, file.size_bytes],
+            "INSERT INTO operations(id,model_id,kind,state,error,progress_bytes,total_bytes,created_at,updated_at) VALUES(?1,?2,'verify','queued',NULL,0,?3,?4,?4)",
+            params![op, id, file.size_bytes, now],
         )
         .map_err(internal)?;
     }

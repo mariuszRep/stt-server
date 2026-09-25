@@ -27,7 +27,7 @@ use crate::engine::{load_engine, CancelWhenDropped, LoadedModel};
 use crate::errors::{internal, ApiError, ApiResult};
 use crate::import::import_model;
 use crate::operations::{cancel_operation, operation};
-use crate::store::{backend_preference, installed_path, selected_id};
+use crate::store::{backend_preference, installed_file, installed_path, selected_id};
 use crate::verify::verify_model;
 
 pub async fn get_config(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult<Json<Value>> {
@@ -106,8 +106,11 @@ pub async fn recommendations(
     let data = models
         .into_iter()
         .map(|model| {
-            let installed = installed_path(&app, &model.slug)?.is_some();
-            Ok(model_view(model, installed))
+            let installed = installed_file(&app, &model.slug)?;
+            Ok(model_view(
+                model,
+                installed.and_then(|file| file.quant).as_deref(),
+            ))
         })
         .collect::<ApiResult<Vec<_>>>()?;
     Ok(Json(json!({"object":"list", "data":data})))
@@ -122,8 +125,11 @@ pub async fn local_models(
         .catalog
         .iter()
         .map(|model| {
-            let installed = installed_path(&app, &model.slug)?.is_some();
-            Ok(model_view(model, installed))
+            let installed = installed_file(&app, &model.slug)?;
+            Ok(model_view(
+                model,
+                installed.and_then(|file| file.quant).as_deref(),
+            ))
         })
         .collect::<ApiResult<Vec<_>>>()?;
     Ok(Json(json!({"object":"list", "data":data})))
@@ -453,4 +459,35 @@ pub async fn run_http(
         .with_graceful_shutdown(shutdown)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+    use crate::app::open_app_at;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn install_with_invalid_quant_returns_400() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let router = router(app.clone());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/local/models/parakeet-unified-en-0.6b/install")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"quant":"not-a-real-quant"}"#))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        drop(app);
+        let resolved = path.canonicalize().unwrap();
+        std::fs::remove_dir_all(resolved).unwrap();
+    }
 }

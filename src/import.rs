@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::app::App;
 use crate::auth::authorized;
-use crate::catalog::catalog_model;
+use crate::catalog::{catalog_model, CatalogFile};
 use crate::errors::{internal, ApiError, ApiResult};
 use crate::operations::update_operation;
 use crate::store::{installed_path, promote_verified_model};
@@ -57,6 +57,7 @@ pub async fn import_model(
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     authorized(&headers, &app)?;
     let mut model_id: Option<String> = None;
+    let mut requested_quant: Option<String> = None;
     let mut imported = false;
     let mut operation_id: Option<String> = None;
     while let Some(mut field) = multipart.next_field().await.map_err(|error| {
@@ -74,6 +75,12 @@ pub async fn import_model(
                 catalog_model(&app, &id)?;
                 model_id = Some(id);
             }
+            "quant" if model_id.is_some() && requested_quant.is_none() && !imported => {
+                let quant = field.text().await.map_err(|error| {
+                    ApiError::new(StatusCode::BAD_REQUEST, "invalid_quant", error.to_string())
+                })?;
+                requested_quant = Some(quant);
+            }
             "file" if !imported => {
                 let id = model_id.as_deref().ok_or_else(|| {
                     ApiError::new(
@@ -90,18 +97,35 @@ pub async fn import_model(
                     ));
                 }
                 let model = catalog_model(&app, id)?.clone();
-                if model.slug != "parakeet-unified-en-0.6b" {
-                    return Err(ApiError::new(
-                        StatusCode::CONFLICT,
-                        "model_not_admitted",
-                        "This model has not passed admission",
-                    ));
-                }
-                let expected = model
-                    .files
-                    .iter()
-                    .find(|file| file.quant == model.default_quant)
-                    .ok_or_else(|| internal("Default quantization missing"))?;
+                // Preselect the expected file when a quant was given; otherwise
+                // any of the model's files is a candidate match and the size
+                // cap during streaming is the largest candidate.
+                let preselected: Option<CatalogFile> = match &requested_quant {
+                    Some(quant) => Some(
+                        model
+                            .files
+                            .iter()
+                            .find(|file| &file.quant == quant)
+                            .cloned()
+                            .ok_or_else(|| {
+                                ApiError::new(
+                                    StatusCode::BAD_REQUEST,
+                                    "invalid_quant",
+                                    format!("Unknown quant '{quant}' for model {}", model.slug),
+                                )
+                            })?,
+                    ),
+                    None => None,
+                };
+                let cap = match &preselected {
+                    Some(file) => file.size_bytes,
+                    None => model
+                        .files
+                        .iter()
+                        .map(|file| file.size_bytes)
+                        .max()
+                        .ok_or_else(|| internal("Model has no catalog files"))?,
+                };
                 let op = Uuid::new_v4().to_string();
                 let stage = app.data_dir.join("staging").join(format!("{op}.part"));
                 {
@@ -120,9 +144,10 @@ pub async fn import_model(
                             "An operation for this model is already active",
                         ));
                     }
+                    let now = crate::store::now_ms();
                     db.execute(
-                        "INSERT INTO operations(id,model_id,kind,state,error,progress_bytes,total_bytes) VALUES(?1,?2,'import','running',NULL,0,?3)",
-                        params![op, id, expected.size_bytes],
+                        "INSERT INTO operations(id,model_id,kind,state,error,progress_bytes,total_bytes,created_at,updated_at) VALUES(?1,?2,'import','running',NULL,0,?3,?4,?4)",
+                        params![op, id, cap, now],
                     )
                     .map_err(internal)?;
                 }
@@ -144,7 +169,7 @@ pub async fn import_model(
                     )
                 })? {
                     size += chunk.len() as u64;
-                    if size > expected.size_bytes {
+                    if size > cap {
                         update_operation(
                             &app,
                             &op,
@@ -165,7 +190,23 @@ pub async fn import_model(
                 output.sync_all().await.map_err(internal)?;
                 drop(output);
                 let actual = format!("{:x}", digest.finalize());
-                if size != expected.size_bytes || !actual.eq_ignore_ascii_case(&expected.sha256) {
+                let matched = match &preselected {
+                    Some(file) => {
+                        if size == file.size_bytes && actual.eq_ignore_ascii_case(&file.sha256) {
+                            Some(file.clone())
+                        } else {
+                            None
+                        }
+                    }
+                    None => model
+                        .files
+                        .iter()
+                        .find(|file| {
+                            file.size_bytes == size && file.sha256.eq_ignore_ascii_case(&actual)
+                        })
+                        .cloned(),
+                };
+                let Some(matched_file) = matched else {
                     let quarantine = app.data_dir.join("quarantine");
                     tokio::fs::create_dir_all(&quarantine)
                         .await
@@ -185,8 +226,8 @@ pub async fn import_model(
                         "hash_mismatch",
                         "Catalog size or SHA-256 mismatch",
                     ));
-                }
-                promote_verified_model(&app, &op, id, &expected.sha256, &stage, size)
+                };
+                promote_verified_model(&app, &op, id, &matched_file, &stage, size)
                     .map_err(internal)?;
                 guard.complete = true;
                 imported = true;

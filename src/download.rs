@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::{
+    body::Bytes,
     extract::{Path as UrlPath, State},
     http::{HeaderMap, StatusCode},
     Json,
@@ -12,7 +13,7 @@ use uuid::Uuid;
 
 use crate::app::App;
 use crate::auth::authorized;
-use crate::catalog::{catalog_model, CatalogFile, CatalogModel};
+use crate::catalog::{catalog_model, resolve_quant, CatalogFile, CatalogModel};
 use crate::errors::{internal, ApiError, ApiResult};
 use crate::operations::{operation_state, update_operation};
 use crate::store::{installed_path, promote_verified_model};
@@ -22,16 +23,21 @@ pub async fn install_model(
     State(app): State<Arc<App>>,
     UrlPath(id): UrlPath<String>,
     headers: HeaderMap,
+    body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     authorized(&headers, &app)?;
+    let requested_quant: Option<String> = if body.is_empty() {
+        None
+    } else {
+        let value: Value = serde_json::from_slice(&body).map_err(|error| {
+            ApiError::new(StatusCode::BAD_REQUEST, "invalid_body", error.to_string())
+        })?;
+        value
+            .get("quant")
+            .and_then(|quant| quant.as_str())
+            .map(str::to_owned)
+    };
     let model = catalog_model(&app, &id)?.clone();
-    if model.slug != "parakeet-unified-en-0.6b" {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "model_not_admitted",
-            "This model has not passed admission",
-        ));
-    }
     if installed_path(&app, &id)?.is_some() {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -39,12 +45,7 @@ pub async fn install_model(
             "Model is already installed",
         ));
     }
-    let file = model
-        .files
-        .iter()
-        .find(|file| file.quant == model.default_quant)
-        .cloned()
-        .ok_or_else(|| internal("Default quantization missing"))?;
+    let file = resolve_quant(&model, requested_quant.as_deref())?.clone();
     let op = Uuid::new_v4().to_string();
     {
         let db = app.db.lock().map_err(internal)?;
@@ -62,9 +63,10 @@ pub async fn install_model(
                 "An operation for this model is already active",
             ));
         }
+        let now = crate::store::now_ms();
         db.execute(
-            "INSERT INTO operations(id,model_id,kind,state,error,progress_bytes,total_bytes) VALUES(?1,?2,'install','queued',NULL,0,?3)",
-            params![op, id, file.size_bytes],
+            "INSERT INTO operations(id,model_id,kind,state,error,progress_bytes,total_bytes,created_at,updated_at) VALUES(?1,?2,'install','queued',NULL,0,?3,?4,?4)",
+            params![op, id, file.size_bytes, now],
         )
         .map_err(internal)?;
     }
@@ -193,6 +195,6 @@ pub async fn download_model(
             .map_err(|error| error.to_string())?;
         return Err("Catalog SHA-256 mismatch".to_owned());
     }
-    promote_verified_model(&app, op, &model.slug, &file.sha256, &stage, received)?;
+    promote_verified_model(&app, op, &model.slug, &file, &stage, received)?;
     Ok(())
 }
