@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
+[lib]
+name = "stt_server_next"
+path = "src/lib.rs"
+
 [dependencies]
 transcribe-cpp = { version = "=0.2.3", default-features = false, features = ["vulkan"] }
 hound = "=3.5.1"
