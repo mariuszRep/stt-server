@@ -3,10 +3,15 @@
 //! an `ApiError`. No model access — everything here is unit-testable.
 //!
 //! Language-matching helpers (`base_language`, `canonical_language_code`,
-//! `normalize_cjk_language`) are ported from Handy (MIT), commit `8f9cf53`,
-//! `src-tauri/src/managers/model.rs:95-109` and
+//! `normalize_cjk_language`) and the unmatched-hint fallback (`fallback_language`,
+//! porting Handy's `effective_language`) are ported from Handy (MIT), commit
+//! `8f9cf53`, `src-tauri/src/managers/model.rs:95-109,275-318` and
 //! `src-tauri/src/managers/transcription.rs:1652`. See
 //! `THIRD_PARTY_NOTICES.md` for Handy's MIT notice.
+//!
+//! The prompt is opaque to this module (CORRECTED by user 2026-09-25): the
+//! caller builds it (including any vocabulary/prior-chunk context) and it is
+//! passed to the engine verbatim, with no composition or trimming here.
 
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -59,8 +64,9 @@ impl ResponseFormat {
 #[derive(Debug, Clone, Default)]
 pub struct ParsedRequest {
     pub language: Option<String>,
+    /// Opaque, verbatim prompt text. No vocabulary field, no composition: the
+    /// client is responsible for building this string.
     pub prompt: Option<String>,
-    pub vocabulary: Vec<String>,
     pub temperature: Option<f32>,
     pub response_format: Option<String>,
     pub timestamp_granularities: Vec<String>,
@@ -69,6 +75,8 @@ pub struct ParsedRequest {
 /// The finished, engine-ready plan.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Plan {
+    /// The language code to send as `RunOptions.language`, or `None` to
+    /// autodetect.
     pub language: Option<String>,
     pub task: PlannedTask,
     pub target_language: Option<String>,
@@ -76,7 +84,16 @@ pub struct Plan {
     pub temperature: Option<f32>,
     pub timestamps: TimestampGranularity,
     pub response_format: ResponseFormat,
-    pub prompt_truncated: bool,
+    /// Whether a user-supplied language hint matched the model exactly
+    /// (`true`), or the language was decided by the Handy fallback / no hint
+    /// was given at all (`false`).
+    pub language_hint_applied: bool,
+    /// The language this plan will actually use, for diagnostics: `None`
+    /// means autodetect (no hint given and the model does language
+    /// detection). Always `Some` when `language` is `Some`, and also `Some`
+    /// when a hint was given but unmatched and the fallback picked a
+    /// concrete language.
+    pub applied_language: Option<String>,
     pub language_evidence_hint: Option<String>,
 }
 
@@ -151,19 +168,11 @@ fn canonical_language_code(language: &str) -> &str {
     }
 }
 
-/// Resolve a requested language hint against the loaded model's supported
-/// languages. Returns the model's own code on a match, `None` for
-/// absent/empty/"auto", or an `ApiError` (422 `unsupported_language`) when the
-/// hint cannot be matched to anything the model supports.
-fn resolve_language_hint(
-    requested: &str,
-    supported: &[String],
-) -> Result<Option<String>, ApiError> {
-    let trimmed = requested.trim();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
-        return Ok(None);
-    }
-    let normalized = normalize_cjk_language(&trimmed.to_lowercase()).to_string();
+/// Try to match a requested language hint against the loaded model's
+/// supported languages. Returns the model's own code on a match. Does not
+/// itself decide what to do on a miss — see [`fallback_language`].
+fn match_language_hint(requested: &str, supported: &[String]) -> Option<String> {
+    let normalized = normalize_cjk_language(&requested.to_lowercase()).to_string();
 
     // Prefer an exact base-language match before considering an alias, so an
     // explicit `nb` selects `nb` even if the model also advertises `no`.
@@ -175,190 +184,77 @@ fn resolve_language_hint(
             .iter()
             .find(|lang| canonical_language_code(lang) == canonical_language_code(&normalized))
     };
-
-    if let Some(code) = exact.or_else(alias) {
-        return Ok(Some(code.clone()));
-    }
-
-    Err(ApiError::new(
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "unsupported_language",
-        format!("Language '{requested}' is not supported by this model"),
-    )
-    .with_details(json!({
-        "requested": requested,
-        "supported": supported,
-    })))
+    exact.or_else(alias).cloned()
 }
 
-// ---------------------------------------------------------------------------
-// Prompt / vocabulary budget.
-// ---------------------------------------------------------------------------
-
-const MAX_VOCABULARY_ITEMS: usize = 100;
-const MAX_VOCABULARY_TERM_LEN: usize = 64;
-const PROMPT_TOKEN_BUDGET: usize = 223;
-const PROMPT_FALLBACK_CHAR_BUDGET: usize = 900;
-
-fn validate_vocabulary(vocabulary: &[String]) -> Result<Vec<String>, ApiError> {
-    if vocabulary.len() > MAX_VOCABULARY_ITEMS {
-        return Err(invalid_vocabulary(format!(
-            "at most {MAX_VOCABULARY_ITEMS} vocabulary terms are allowed, got {}",
-            vocabulary.len()
-        )));
+/// The Handy fallback for an unresolvable (or absent) language intent: auto-
+/// detect if the model supports language detection, else English if the
+/// model supports English, else the model's first supported language. Ported
+/// from Handy (MIT), commit 8f9cf53,
+/// `src-tauri/src/managers/model.rs:275-318` (`effective_language`), adapted
+/// to this module's plan shape (returns `None` for "autodetect" rather than
+/// the string `"auto"`).
+fn fallback_language(supported: &[String], supports_language_detection: bool) -> Option<String> {
+    if supported.is_empty() {
+        return None;
     }
-    let mut cleaned = Vec::with_capacity(vocabulary.len());
-    for term in vocabulary {
-        let trimmed = term.trim();
-        if trimmed.is_empty() {
-            return Err(invalid_vocabulary("vocabulary terms must not be empty"));
-        }
-        if trimmed.chars().count() > MAX_VOCABULARY_TERM_LEN {
-            return Err(invalid_vocabulary(format!(
-                "vocabulary term '{trimmed}' exceeds {MAX_VOCABULARY_TERM_LEN} characters"
-            )));
-        }
-        if trimmed.chars().any(|c| c.is_control()) {
-            return Err(invalid_vocabulary(
-                "vocabulary terms must not contain control characters",
-            ));
-        }
-        cleaned.push(trimmed.to_string());
+    if supports_language_detection {
+        return None;
     }
-    Ok(cleaned)
+    if let Some(en) = supported
+        .iter()
+        .find(|language| base_language(language) == "en")
+    {
+        return Some(en.clone());
+    }
+    Some(supported[0].clone())
 }
 
-fn invalid_vocabulary(message: impl Into<String>) -> ApiError {
-    ApiError::new(
-        StatusCode::BAD_REQUEST,
-        "invalid_vocabulary",
-        message.into(),
-    )
-}
+/// Resolve the request's language hint into `(language_for_run,
+/// hint_applied, applied_language, evidence)`.
+///
+/// - Absent/empty/`auto`: no hint. `language_for_run` is `None` (autodetect
+///   when the model supports it) unless the model can't detect language, in
+///   which case the Handy fallback still picks a concrete default so the
+///   engine is never handed nothing to work with on a non-detecting model.
+/// - Present and matches (base language or alias) a model-supported
+///   language: use the model's own code, `hint_applied = true`.
+/// - Present but unmatched: NOT an error (CORRECTED by user 2026-09-25) —
+///   fall back the same way as "absent", but `hint_applied` stays `false` so
+///   the caller can record that the hint was not honored.
+fn resolve_language(
+    requested: Option<&str>,
+    caps: &EffectiveCaps,
+) -> (Option<String>, bool, Option<String>, Option<String>) {
+    let supported = &caps.loaded.languages;
+    let has_hint = requested
+        .map(|raw| {
+            let trimmed = raw.trim();
+            !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("auto")
+        })
+        .unwrap_or(false);
 
-/// Join vocabulary terms and an optional prompt into the whisper initial
-/// prompt string: `vocab, terms, here` then, if a prompt is also present,
-/// `. <prompt>` appended.
-fn join_prompt(vocabulary: &[String], prompt: Option<&str>) -> Option<String> {
-    let vocab_part = if vocabulary.is_empty() {
-        None
-    } else {
-        Some(vocabulary.join(", "))
-    };
-    match (vocab_part, prompt) {
-        (Some(vocab), Some(p)) if !p.is_empty() => Some(format!("{vocab}. {p}")),
-        (Some(vocab), _) => Some(vocab),
-        (None, Some(p)) if !p.is_empty() => Some(p.to_string()),
-        (None, _) => None,
-    }
-}
-
-/// Count "tokens" via the supplied tokenizer closure when it succeeds,
-/// otherwise fall back to a character-budget proxy (900 chars ~ 223 tokens).
-fn fits_budget(text: &str, tokenize: Option<&Tokenizer>) -> bool {
-    if let Some(tokenize) = tokenize {
-        if let Some(count) = tokenize(text) {
-            return count <= PROMPT_TOKEN_BUDGET;
-        }
-    }
-    text.chars().count() <= PROMPT_FALLBACK_CHAR_BUDGET
-}
-
-fn token_count_or_chars(text: &str, tokenize: Option<&Tokenizer>) -> usize {
-    if let Some(tokenize) = tokenize {
-        if let Some(count) = tokenize(text) {
-            return count;
-        }
-    }
-    text.chars().count()
-}
-
-fn budget_limit(tokenize: Option<&Tokenizer>, text_has_tokenizer_result: bool) -> usize {
-    // Only used to decide which limit governs left-trimming; kept for clarity.
-    let _ = text_has_tokenizer_result;
-    if tokenize.is_some() {
-        PROMPT_TOKEN_BUDGET
-    } else {
-        PROMPT_FALLBACK_CHAR_BUDGET
-    }
-}
-
-/// Build the final initial-prompt string within budget, left-trimming the
-/// oldest part of `prompt` (never the vocabulary) at a word boundary until it
-/// fits. Returns `(final_prompt, truncated)`.
-fn build_initial_prompt(
-    vocabulary: &[String],
-    prompt: Option<&str>,
-    tokenize: Option<&Tokenizer>,
-) -> Result<(Option<String>, bool), ApiError> {
-    let vocab_joined = if vocabulary.is_empty() {
-        None
-    } else {
-        Some(vocabulary.join(", "))
-    };
-
-    let combined = join_prompt(vocabulary, prompt);
-    let combined = match combined {
-        None => return Ok((None, false)),
-        Some(c) => c,
-    };
-
-    if fits_budget(&combined, tokenize) {
-        return Ok((Some(combined), false));
-    }
-
-    // Vocabulary alone (with no prompt to trim) over budget -> 422.
-    if prompt.map(str::is_empty).unwrap_or(true) {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "prompt_too_long",
-            "Vocabulary alone exceeds the prompt budget",
-        ));
-    }
-    if let Some(vocab) = &vocab_joined {
-        if !fits_budget(vocab, tokenize) {
-            return Err(ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "prompt_too_long",
-                "Vocabulary alone exceeds the prompt budget",
-            ));
+    if has_hint {
+        let raw = requested.unwrap().trim();
+        if let Some(matched) = match_language_hint(raw, supported) {
+            return (
+                Some(matched.clone()),
+                true,
+                Some(matched),
+                Some("user_selected".to_string()),
+            );
         }
     }
 
-    // Left-trim the oldest part of `prompt` at a word boundary until the
-    // combined string fits.
-    let prompt_text = prompt.unwrap_or_default();
-    let prefix = vocab_joined
-        .as_ref()
-        .map(|v| format!("{v}. "))
-        .unwrap_or_default();
-    let limit = budget_limit(tokenize, false);
-    let prefix_cost = token_count_or_chars(&prefix, tokenize);
-    if prefix_cost >= limit {
-        // Even the vocabulary+separator alone doesn't fit with any prompt
-        // headroom; treat as vocabulary-alone-too-long.
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "prompt_too_long",
-            "Vocabulary alone exceeds the prompt budget",
-        ));
-    }
-
-    let words: Vec<&str> = prompt_text.split_whitespace().collect();
-    let mut start = 0usize;
-    loop {
-        let candidate_words = &words[start..];
-        let candidate_prompt = candidate_words.join(" ");
-        let candidate = format!("{prefix}{candidate_prompt}");
-        if fits_budget(&candidate, tokenize) || candidate_words.is_empty() {
-            let final_text = if candidate_words.is_empty() {
-                prefix.trim_end_matches(". ").to_string()
-            } else {
-                candidate
-            };
-            return Ok((Some(final_text), true));
-        }
-        start += 1;
+    // No hint, or a hint that didn't match anything the model supports.
+    match fallback_language(supported, caps.loaded.supports_language_detect) {
+        None => (None, false, None, None),
+        Some(lang) => (
+            Some(lang.clone()),
+            false,
+            Some(lang),
+            Some("model_constrained".to_string()),
+        ),
     }
 }
 
@@ -373,46 +269,46 @@ pub fn plan(
     tokenize: Option<&Tokenizer>,
 ) -> Result<Plan, ApiError> {
     // --- language -----------------------------------------------------
-    let mut language_evidence_hint: Option<String> = None;
-    let language_hint = match &request.language {
-        Some(raw) if !raw.trim().is_empty() => {
-            let resolved = resolve_language_hint(raw, &caps.loaded.languages)?;
-            if resolved.is_some() {
-                language_evidence_hint = Some("user_selected".to_string());
-            }
-            resolved
-        }
-        _ => None,
-    };
+    let (language_hint, language_hint_applied, applied_language, mut language_evidence_hint) =
+        resolve_language(request.language.as_deref(), caps);
 
-    // --- prompt / vocabulary -------------------------------------------
-    let vocabulary = validate_vocabulary(&request.vocabulary)?;
-    let has_prompt_input = request
+    // --- prompt ---------------------------------------------------------
+    let has_prompt = request
         .prompt
         .as_deref()
         .map(|p| !p.is_empty())
-        .unwrap_or(false)
-        || !vocabulary.is_empty();
-    if has_prompt_input && !caps.is_whisper() {
+        .unwrap_or(false);
+    if has_prompt && !caps.is_whisper() {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "unsupported_capability",
-            if request
-                .prompt
-                .as_deref()
-                .map(|p| !p.is_empty())
-                .unwrap_or(false)
-            {
-                "This model does not support 'prompt'"
-            } else {
-                "This model does not support 'vocabulary'"
-            },
+            "This model does not support 'prompt'",
         ));
     }
-    let (initial_prompt, prompt_truncated) = if has_prompt_input {
-        build_initial_prompt(&vocabulary, request.prompt.as_deref(), tokenize)?
+    let initial_prompt = if has_prompt {
+        let prompt = request.prompt.as_deref().unwrap();
+        if let Some(limit) = caps.loaded.prompt_max_tokens {
+            if let Some(tokenize) = tokenize {
+                if let Some(actual) = tokenize(prompt) {
+                    if actual > limit {
+                        return Err(ApiError::new(
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            "prompt_too_long",
+                            "The prompt exceeds this model's prompt token limit",
+                        )
+                        .with_details(json!({
+                            "limit": limit,
+                            "actual": actual,
+                            "unit": "tokens",
+                        })));
+                    }
+                }
+            }
+        }
+        // Passed verbatim: no composition, no trimming.
+        Some(prompt.to_string())
     } else {
-        (None, false)
+        None
     };
 
     // --- temperature -----------------------------------------------------
@@ -480,7 +376,7 @@ pub fn plan(
                     "This model does not support translation",
                 ));
             }
-            let source_is_english = language_hint.as_deref() == Some("en")
+            let source_is_english = applied_language.as_deref() == Some("en")
                 || (caps.loaded.languages.len() == 1 && caps.loaded.languages[0] == "en");
             if source_is_english {
                 language_evidence_hint = Some("translated_to_english".to_string());
@@ -499,7 +395,8 @@ pub fn plan(
         temperature,
         timestamps,
         response_format,
-        prompt_truncated,
+        language_hint_applied,
+        applied_language,
         language_evidence_hint,
     })
 }
@@ -519,6 +416,7 @@ mod tests {
             max_timestamp_kind: TimestampGranularity::Word,
             feature_initial_prompt_flag: true,
             whisper_ext_accepted: Some(true),
+            prompt_max_tokens: None,
         })
     }
 
@@ -532,6 +430,7 @@ mod tests {
             max_timestamp_kind: TimestampGranularity::Segment,
             feature_initial_prompt_flag: false,
             whisper_ext_accepted: None,
+            prompt_max_tokens: None,
         })
     }
 
@@ -545,6 +444,7 @@ mod tests {
             max_timestamp_kind: TimestampGranularity::Segment,
             feature_initial_prompt_flag: false,
             whisper_ext_accepted: None,
+            prompt_max_tokens: None,
         })
     }
 
@@ -560,6 +460,8 @@ mod tests {
         r.language = Some("en-US".to_string());
         let p = plan(&r, &whisper_caps(), Endpoint::Transcriptions, None).unwrap();
         assert_eq!(p.language, Some("en".to_string()));
+        assert!(p.language_hint_applied);
+        assert_eq!(p.applied_language, Some("en".to_string()));
     }
 
     #[test]
@@ -568,6 +470,7 @@ mod tests {
         r.language = Some("nb".to_string());
         let p = plan(&r, &whisper_caps(), Endpoint::Transcriptions, None).unwrap();
         assert_eq!(p.language, Some("no".to_string()));
+        assert!(p.language_hint_applied);
     }
 
     #[test]
@@ -591,14 +494,41 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_language_is_422_with_details() {
+    fn unmatched_language_falls_back_to_autodetect_when_supported() {
         let mut r = req();
         r.language = Some("xx".to_string());
-        let err = plan(&r, &whisper_caps(), Endpoint::Transcriptions, None).unwrap_err();
-        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(err.code, "unsupported_language");
-        let details = err.details.unwrap();
-        assert_eq!(details["requested"], "xx");
+        let p = plan(&r, &whisper_caps(), Endpoint::Transcriptions, None).unwrap();
+        // whisper_caps() supports language detection -> fallback is autodetect.
+        assert_eq!(p.language, None);
+        assert!(!p.language_hint_applied);
+        assert_eq!(p.applied_language, None);
+    }
+
+    #[test]
+    fn unmatched_language_falls_back_to_english_when_no_detection() {
+        let mut caps = non_whisper_caps();
+        caps.loaded.languages = vec!["en".to_string(), "es".to_string()];
+        let mut r = req();
+        r.language = Some("xx".to_string());
+        let p = plan(&r, &caps, Endpoint::Transcriptions, None).unwrap();
+        assert_eq!(p.language, Some("en".to_string()));
+        assert!(!p.language_hint_applied);
+        assert_eq!(p.applied_language, Some("en".to_string()));
+        assert_eq!(
+            p.language_evidence_hint.as_deref(),
+            Some("model_constrained")
+        );
+    }
+
+    #[test]
+    fn unmatched_language_falls_back_to_first_language_when_no_english() {
+        let mut caps = non_whisper_caps();
+        caps.loaded.languages = vec!["es".to_string(), "fr".to_string()];
+        let mut r = req();
+        r.language = Some("xx".to_string());
+        let p = plan(&r, &caps, Endpoint::Transcriptions, None).unwrap();
+        assert_eq!(p.language, Some("es".to_string()));
+        assert!(!p.language_hint_applied);
     }
 
     #[test]
@@ -607,6 +537,7 @@ mod tests {
         r.language = Some("auto".to_string());
         let p = plan(&r, &whisper_caps(), Endpoint::Transcriptions, None).unwrap();
         assert_eq!(p.language, None);
+        assert!(!p.language_hint_applied);
 
         let mut r2 = req();
         r2.language = Some("".to_string());
@@ -620,16 +551,29 @@ mod tests {
         r.language = Some("en".to_string());
         let p = plan(&r, &single_lang_en_caps(), Endpoint::Transcriptions, None).unwrap();
         assert_eq!(p.language, Some("en".to_string()));
+        assert!(p.language_hint_applied);
     }
 
-    // --- prompt / vocabulary -----------------------------------------------
+    #[test]
+    fn single_language_model_unrelated_hint_falls_back_to_the_model_language() {
+        let mut r = req();
+        r.language = Some("fr".to_string());
+        let p = plan(&r, &single_lang_en_caps(), Endpoint::Transcriptions, None).unwrap();
+        assert_eq!(p.language, Some("en".to_string()));
+        assert!(!p.language_hint_applied);
+    }
+
+    // --- prompt -----------------------------------------------------------
 
     #[test]
-    fn prompt_supported_on_whisper() {
+    fn prompt_supported_on_whisper_passed_verbatim() {
         let mut r = req();
-        r.prompt = Some("hello world".to_string());
+        r.prompt = Some("hello   world  with  odd   spacing".to_string());
         let p = plan(&r, &whisper_caps(), Endpoint::Transcriptions, None).unwrap();
-        assert_eq!(p.initial_prompt.as_deref(), Some("hello world"));
+        assert_eq!(
+            p.initial_prompt.as_deref(),
+            Some("hello   world  with  odd   spacing")
+        );
     }
 
     #[test]
@@ -645,54 +589,13 @@ mod tests {
     }
 
     #[test]
-    fn vocabulary_over_101_items_is_400() {
-        let mut r = req();
-        r.vocabulary = (0..101).map(|i| format!("term{i}")).collect();
-        let err = plan(&r, &whisper_caps(), Endpoint::Transcriptions, None).unwrap_err();
-        assert_eq!(err.status, StatusCode::BAD_REQUEST);
-        assert_eq!(err.code, "invalid_vocabulary");
-    }
-
-    #[test]
-    fn vocabulary_term_65_chars_is_400() {
-        let mut r = req();
-        r.vocabulary = vec!["a".repeat(65)];
-        let err = plan(&r, &whisper_caps(), Endpoint::Transcriptions, None).unwrap_err();
-        assert_eq!(err.code, "invalid_vocabulary");
-    }
-
-    #[test]
-    fn vocabulary_empty_term_is_400() {
-        let mut r = req();
-        r.vocabulary = vec!["   ".to_string()];
-        let err = plan(&r, &whisper_caps(), Endpoint::Transcriptions, None).unwrap_err();
-        assert_eq!(err.code, "invalid_vocabulary");
-    }
-
-    #[test]
-    fn vocabulary_control_char_is_400() {
-        let mut r = req();
-        r.vocabulary = vec!["bad\u{0007}word".to_string()];
-        let err = plan(&r, &whisper_caps(), Endpoint::Transcriptions, None).unwrap_err();
-        assert_eq!(err.code, "invalid_vocabulary");
-    }
-
-    #[test]
-    fn vocabulary_and_prompt_join_format() {
-        let mut r = req();
-        r.vocabulary = vec!["Alice".to_string(), "Bob".to_string()];
-        r.prompt = Some("They spoke.".to_string());
-        let p = plan(&r, &whisper_caps(), Endpoint::Transcriptions, None).unwrap();
-        assert_eq!(p.initial_prompt.as_deref(), Some("Alice, Bob. They spoke."));
-    }
-
-    #[test]
-    fn budget_left_trim_with_fake_tokenizer() {
-        // Fake tokenizer: 1 token per word.
+    fn prompt_limit_enforced_only_when_known() {
+        // No limit published (0.2.3 default) -> never rejected regardless of
+        // length, even with a tokenizer available.
         let tokenize = |s: &str| Some(s.split_whitespace().count());
         let mut r = req();
         r.prompt = Some(
-            (0..300)
+            (0..500)
                 .map(|i| format!("w{i}"))
                 .collect::<Vec<_>>()
                 .join(" "),
@@ -704,32 +607,37 @@ mod tests {
             Some(&tokenize as &Tokenizer),
         )
         .unwrap();
-        assert!(p.prompt_truncated);
-        let final_prompt = p.initial_prompt.unwrap();
-        assert!(final_prompt.split_whitespace().count() <= PROMPT_TOKEN_BUDGET);
-        // Left-trim means the OLDEST part (the start) is dropped, so the tail
-        // word should survive.
-        assert!(final_prompt.contains("w299"));
-    }
+        assert!(p.initial_prompt.unwrap().split_whitespace().count() == 500);
 
-    #[test]
-    fn budget_left_trim_with_900_char_fallback() {
-        let mut r = req();
-        r.prompt = Some("word ".repeat(400));
-        let p = plan(&r, &whisper_caps(), Endpoint::Transcriptions, None).unwrap();
-        assert!(p.prompt_truncated);
-        assert!(p.initial_prompt.unwrap().chars().count() <= PROMPT_FALLBACK_CHAR_BUDGET);
-    }
-
-    #[test]
-    fn vocabulary_alone_over_budget_is_422_prompt_too_long() {
-        let mut r = req();
-        r.vocabulary = (0..100)
-            .map(|i| format!("term-number-{i}-{}", "x".repeat(30)))
-            .collect();
-        let err = plan(&r, &whisper_caps(), Endpoint::Transcriptions, None).unwrap_err();
+        // With a published limit, an over-limit prompt is rejected using the
+        // tokenizer closure.
+        let mut caps = whisper_caps();
+        caps.loaded.prompt_max_tokens = Some(10);
+        let err = plan(
+            &r,
+            &caps,
+            Endpoint::Transcriptions,
+            Some(&tokenize as &Tokenizer),
+        )
+        .unwrap_err();
         assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(err.code, "prompt_too_long");
+        let details = err.details.unwrap();
+        assert_eq!(details["limit"], 10);
+        assert_eq!(details["actual"], 500);
+        assert_eq!(details["unit"], "tokens");
+
+        // Under the limit is fine.
+        let mut r2 = req();
+        r2.prompt = Some("short prompt".to_string());
+        let p2 = plan(
+            &r2,
+            &caps,
+            Endpoint::Transcriptions,
+            Some(&tokenize as &Tokenizer),
+        )
+        .unwrap();
+        assert_eq!(p2.initial_prompt.as_deref(), Some("short prompt"));
     }
 
     // --- temperature --------------------------------------------------------

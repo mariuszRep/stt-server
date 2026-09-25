@@ -52,6 +52,19 @@ pub struct LoadedCaps {
     /// when a public whisper run-extension kind constant exists. `None` when
     /// no such probe was available at build time.
     pub whisper_ext_accepted: Option<bool>,
+    /// A known upper bound on `initial_prompt` length, in tokens, when the
+    /// engine exposes one. Investigated against transcribe-cpp 0.2.3:
+    /// `Model::capabilities()` (`Capabilities`) has no prompt-length field,
+    /// `Session::limits()` (`SessionLimits`) exposes only `effective_n_ctx`
+    /// (the whole decoder context budget, shared with generated output, not
+    /// a documented prompt-specific cap) and `effective_max_audio_ms` /
+    /// `max_kv_bytes`, and `WhisperRunOptions` only *sets*
+    /// `max_prev_context_tokens` (a run input, not a queryable limit) — no
+    /// public constant or accessor publishes a prompt-token ceiling. So this
+    /// is always `None` in 0.2.3; kept as a field (rather than hard-coded
+    /// `null`) so a future engine version that does expose one only needs a
+    /// change in `from_model`, not in the plan/enforcement logic below.
+    pub prompt_max_tokens: Option<usize>,
 }
 
 impl LoadedCaps {
@@ -81,6 +94,8 @@ impl LoadedCaps {
                 ExtSlot::Run,
                 transcribe_cpp::sys::TRANSCRIBE_EXT_KIND_WHISPER_RUN,
             )),
+            // See the field doc: no engine API in 0.2.3 publishes this.
+            prompt_max_tokens: None,
         }
     }
 }
@@ -218,7 +233,7 @@ impl EffectiveCaps {
             evidence: "loaded_model",
             mechanism: Some("whisper_initial_prompt"),
             scope: None,
-            extra: json!({}),
+            extra: json!({ "max_tokens": self.loaded.prompt_max_tokens }),
         };
         let temperature = ControlCapability {
             status: if whisper_ok {
@@ -305,7 +320,6 @@ impl EffectiveCaps {
 
         json!({
             "prompt": prompt_vocab.to_json(),
-            "vocabulary": prompt_vocab.to_json(),
             "temperature": temperature.to_json(),
             "language_hint": language_hint.to_json(),
             "language_detect": language_detect.to_json(),
@@ -330,7 +344,6 @@ pub fn catalog_mismatch(catalog: &CatalogModel, effective: &EffectiveCaps) -> Ve
 
     let controls = [
         "prompt",
-        "vocabulary",
         "temperature",
         "language_hint",
         "language_detect",
@@ -376,6 +389,7 @@ mod tests {
             max_timestamp_kind: TimestampGranularity::Word,
             feature_initial_prompt_flag: true,
             whisper_ext_accepted: Some(true),
+            prompt_max_tokens: None,
         }
     }
 
@@ -389,6 +403,7 @@ mod tests {
             max_timestamp_kind: TimestampGranularity::Segment,
             feature_initial_prompt_flag: false,
             whisper_ext_accepted: None,
+            prompt_max_tokens: None,
         }
     }
 
@@ -398,7 +413,7 @@ mod tests {
         assert!(caps.is_whisper());
         let json = caps.to_json();
         assert_eq!(json["prompt"]["status"], "supported");
-        assert_eq!(json["vocabulary"]["status"], "supported");
+        assert_eq!(json["prompt"]["max_tokens"], Value::Null);
         assert_eq!(json["temperature"]["status"], "supported");
     }
 
