@@ -14,8 +14,9 @@ model, and diagnostics report the backend actually used and any CPU fallback rea
 
 `GET /health` is unauthenticated. Other routes require a bearer token. The server implements
 `GET /readiness`, `GET /v1/models`, and OpenAI-style `POST /v1/audio/transcriptions` for
-16 kHz mono WAV. The `/v1/local/*` routes expose fixed recommendations, per-model capability
-matrices, installed models, explicit install/import, selection/load/removal, operation progress
+mono/stereo WAV from 8–192 kHz (16/24-bit PCM or 32-bit float). Audio is converted to 16 kHz
+mono before inference. The `/v1/local/*` routes expose fixed recommendations, per-model capability
+matrices, installed models, explicit install/import/verification, selection/load/removal, operation progress
 and cancellation, and CPU/Vulkan preference. Unsupported optional transcription fields return
 `unsupported_capability`. Only the SHA-256 pinned Parakeet Q8 catalog model is currently admitted
 for installation; other catalog entries remain visible with `installable=false` until tested.
@@ -49,7 +50,7 @@ import `MSVCP140.dll` or `VCRUNTIME140.dll`.
 
 Local tests have covered first start without a download, explicit verified download/import,
 CPU and Vulkan transcription, forced fallback, authentication, service restart, and uninstall.
-Broader audio formats, model families, fault injection, fresh-machine portability, upgrade and
+Other audio containers, model families, fault injection, fresh-machine portability, upgrade and
 rollback, full dictation parity, and the candidate/release rehearsal remain open. See
 `docs/parity-ledger.md` and `docs/service-recovery-result.json`. No replacement verdict has
 been made.

@@ -40,3 +40,21 @@ Handy already uses `transcribe-cpp` 0.2.3: its x64 Windows configuration enables
 configuration links the CPU backend statically. This server uses the same inference crate
 with Vulkan and no `dynamic-backends`, then aligns Rust and CMake on the static CRT to
 meet its stricter one-executable packaging requirement.
+
+## Verify-endpoint E2E and stereo transcription — 2026-09-25 (update)
+
+`POST /v1/local/models/{id}/verify` was exercised end to end for the first time, on a fresh
+`STT_NEXT_DATA_DIR`, against the Parakeet Q8 fixture: import (HTTP 201, operation completed),
+verify on an intact install (HTTP 202, operation `completed`), select (Vulkan0), and transcription
+of `test-data/stereo48.wav` (HTTP 200, non-empty transcript matching the known fixture text) all
+passed. Failure paths: deselecting then corrupting one byte of the installed copy and restarting
+caused restart reconciliation to remove it and quarantine it as `<uuid>-invalid.gguf`; re-importing
+and corrupting one byte while the server was running, then calling verify, produced operation state
+`failed` with error "Installed model size or SHA-256 mismatch", removed the model from `installed`,
+and moved the file to `quarantine/<op>-verify-failed.gguf`. `verify` on a non-installed model
+returned HTTP 404 `model_not_installed`; a second concurrent `verify` call while one was
+queued/running returned HTTP 409 `operation_conflict`. No bugs were found in the verify path;
+`cargo fmt --check`, `cargo clippy --release --all-targets --offline -- -D warnings`, and
+`cargo test --release --offline --bin stt-server-next` (6 tests) all passed. Rebuilt release
+executable: 65,178,624 bytes, SHA-256
+`283163FA48FF1C02D1BE54143FBF0680528FD8CD0CB564C55DE802590ADB9C2E`.

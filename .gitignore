@@ -6,6 +6,8 @@ static-build.log
 static-build-2.log
 static-smoke.out
 static-smoke.err
+stereo-smoke.out
+stereo-smoke.err
 /test-data*/
 /.last-candidate.json
 *.gguf

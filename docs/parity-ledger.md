@@ -8,8 +8,8 @@ required behavior and current evidence; it does not imply a replacement verdict.
 |---|---|---|
 | Provider/model discovery and progress | Fixed recommendations; offline, model-free first start; durable install progress | Failure and retry contract tests |
 | Runtime connection descriptor | Stable loopback URL, protected token, LocalSystem service tested | Clean-machine client handoff |
-| Download, verify, selection, load, removal | Pinned Parakeet download/import, hash, selection, restart reload, deselection, removal tested | Interrupted resume, corruption, disk-full and upgrade tests |
-| Batch audio | OpenAI-style multipart 16 kHz mono WAV and same-file transcript tested | Other containers, sample rates and dictation corpus |
+| Download, verify, selection, load, removal | Pinned Parakeet download/import, hash, selection, restart reload, deselection, removal tested; durable `verify` operation end-to-end on the installed copy, including restart reconciliation and live corruption quarantine | Interrupted resume, disk-full and upgrade tests |
+| Batch audio | OpenAI-style multipart, same-file transcript, and tested stereo 48 kHz downmix/resample | Other containers and dictation corpus |
 | Prompt and vocabulary | Parakeet matrix says unsupported; prompt rejected with `unsupported_capability` | Admit and test a model with supported decode hints |
 | Language and translation | Unsupported Parakeet controls rejected | Model-specific multilingual tests |
 | Streaming | Native catalog metadata is distinct from server batch support | API contract test |

@@ -7,6 +7,7 @@ license = "MIT"
 [dependencies]
 transcribe-cpp = { version = "=0.2.3", default-features = false, features = ["vulkan"] }
 hound = "=3.5.1"
+rubato = "=0.16.2"
 axum = { version = "=0.8.9", features = ["multipart"] }
 tokio = { version = "=1.53.1", features = ["full"] }
 serde = { version = "=1.0.229", features = ["derive"] }
