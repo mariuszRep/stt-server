@@ -2,6 +2,7 @@ pub mod api;
 pub mod app;
 pub mod audio;
 pub mod auth;
+pub mod capabilities;
 pub mod catalog;
 pub mod download;
 pub mod engine;
@@ -9,6 +10,7 @@ pub mod errors;
 pub mod import;
 pub mod operations;
 pub mod queue;
+pub mod run_plan;
 #[cfg(windows)]
 pub mod service;
 pub mod store;
