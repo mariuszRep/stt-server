@@ -18,7 +18,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use transcribe_cpp::CancelToken;
 use uuid::Uuid;
 
-use crate::app::{open_app, App};
+use crate::app::App;
 use crate::audio::decode_wav;
 use crate::auth::authorized;
 use crate::capabilities::catalog_mismatch;
@@ -38,13 +38,29 @@ use crate::verify::verify_model;
 
 pub async fn get_config(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     authorized(&headers, &app)?;
+    let limits = crate::store::runtime_limits(&app)?;
     Ok(Json(json!({
         "bind":"127.0.0.1:54321",
         "preferred_backend":backend_preference(&app)?,
         "max_audio_bytes":40 * 1024 * 1024,
         "streaming":false,
-        "cors_allowed_origins":cors_allowed_origins(&app)?
+        "cors_allowed_origins":cors_allowed_origins(&app)?,
+        "queue_max_waiting": limits.queue_max_waiting,
+        "queue_wait_timeout_ms": limits.queue_wait_timeout_ms,
+        "inference_timeout_ms": limits.inference_timeout_ms,
     })))
+}
+
+/// Deserializes a present JSON field (including an explicit `null`) as
+/// `Some(inner)`, leaving an absent field as the outer `None` from
+/// `#[serde(default)]`. This is what lets `ConfigPatch`'s optional-limit
+/// fields distinguish "not sent" (leave unchanged) from `null` (clear).
+fn deserialize_some<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -52,6 +68,14 @@ pub async fn get_config(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiR
 pub struct ConfigPatch {
     preferred_backend: Option<String>,
     cors_allowed_origins: Option<Vec<String>>,
+    /// `None` (field absent): leave unchanged. `Some(None)` (`null`): clear
+    /// to unbounded/no-timeout. `Some(Some(n))`: set to `n`.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    queue_max_waiting: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "deserialize_some")]
+    queue_wait_timeout_ms: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "deserialize_some")]
+    inference_timeout_ms: Option<Option<i64>>,
 }
 
 pub async fn patch_config(
@@ -89,6 +113,44 @@ pub async fn patch_config(
             }
         }
     }
+    // Validate the three optional limits up front so a bad value in one
+    // field rejects the whole patch before anything is written.
+    let queue_max_waiting = match patch.queue_max_waiting {
+        Some(inner) => Some(
+            crate::store::validate_positive_limit(inner).map_err(|message| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_queue_max_waiting",
+                    message,
+                )
+            })?,
+        ),
+        None => None,
+    };
+    let queue_wait_timeout_ms = match patch.queue_wait_timeout_ms {
+        Some(inner) => Some(
+            crate::store::validate_positive_limit(inner).map_err(|message| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_queue_wait_timeout_ms",
+                    message,
+                )
+            })?,
+        ),
+        None => None,
+    };
+    let inference_timeout_ms = match patch.inference_timeout_ms {
+        Some(inner) => Some(
+            crate::store::validate_positive_limit(inner).map_err(|message| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_inference_timeout_ms",
+                    message,
+                )
+            })?,
+        ),
+        None => None,
+    };
     {
         let db = app.db.lock().map_err(internal)?;
         if let Some(backend) = &patch.preferred_backend {
@@ -109,6 +171,56 @@ pub async fn patch_config(
             .map_err(internal)?;
             response.insert("cors_allowed_origins".to_owned(), json!(origins));
             restart_required = true;
+        }
+        for (key, value, response_key) in [
+            (
+                crate::store::SETTING_QUEUE_MAX_WAITING,
+                queue_max_waiting,
+                "queue_max_waiting",
+            ),
+            (
+                crate::store::SETTING_QUEUE_WAIT_TIMEOUT_MS,
+                queue_wait_timeout_ms,
+                "queue_wait_timeout_ms",
+            ),
+            (
+                crate::store::SETTING_INFERENCE_TIMEOUT_MS,
+                inference_timeout_ms,
+                "inference_timeout_ms",
+            ),
+        ] {
+            let Some(value) = value else { continue };
+            match value {
+                Some(number) => {
+                    db.execute(
+                        "INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        params![key, number.to_string()],
+                    )
+                    .map_err(internal)?;
+                }
+                None => {
+                    db.execute("DELETE FROM settings WHERE key=?1", params![key])
+                        .map_err(internal)?;
+                }
+            }
+            response.insert(response_key.to_owned(), json!(value));
+        }
+    }
+    // Applied live (no restart needed): the queue and inference timeout read
+    // `app.limits` at request time.
+    if patch.queue_max_waiting.is_some()
+        || patch.queue_wait_timeout_ms.is_some()
+        || patch.inference_timeout_ms.is_some()
+    {
+        let mut limits = app.limits.write().map_err(internal)?;
+        if let Some(value) = queue_max_waiting {
+            limits.queue_max_waiting = value.map(|v| v as usize);
+        }
+        if let Some(value) = queue_wait_timeout_ms {
+            limits.queue_wait_timeout_ms = value;
+        }
+        if let Some(value) = inference_timeout_ms {
+            limits.inference_timeout_ms = value;
         }
     }
     response.insert("restart_required".to_owned(), json!(restart_required));
@@ -613,18 +725,27 @@ async fn transcribe_or_translate(
     };
     let plan = build_plan(&parsed, &caps, endpoint, Some(&tokenize))?;
 
-    let (permit, queue_wait_ms) = app.inference.acquire().await.map_err(|error| match error {
-        crate::queue::QueueError::Full => ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "queue_full",
-            "Too many transcriptions are already waiting",
-        ),
-        crate::queue::QueueError::Timeout => ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "queue_timeout",
-            "Timed out waiting for a turn in the inference queue",
-        ),
-    })?;
+    // Read live: a value set (or cleared) via `PATCH /v1/local/config`, or a
+    // CLI override supplied at process start, applies to this request
+    // without a restart. Defaults are unbounded/no-timeout.
+    let limits = *app.limits.read().map_err(internal)?;
+    let wait_timeout = limits.queue_wait_timeout_ms.map(Duration::from_millis);
+    let (permit, queue_wait_ms) = app
+        .inference
+        .acquire(limits.queue_max_waiting, wait_timeout)
+        .await
+        .map_err(|error| match error {
+            crate::queue::QueueError::Full => ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "queue_full",
+                "Too many transcriptions are already waiting",
+            ),
+            crate::queue::QueueError::Timeout => ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "queue_timeout",
+                "Timed out waiting for a turn in the inference queue",
+            ),
+        })?;
     let cancellation = CancelToken::new();
     let _cancel_on_disconnect = CancelWhenDropped(cancellation.clone());
     let run_options = plan.to_run_options();
@@ -637,16 +758,19 @@ async fn transcribe_or_translate(
             session.run(&pcm, &run_options)
         },
     );
-    let run_result = tokio::time::timeout(Duration::from_secs(180), worker)
-        .await
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::GATEWAY_TIMEOUT,
-                "inference_timeout",
-                "Inference exceeded the 180-second limit",
-            )
-        })?
-        .map_err(internal)?;
+    let run_result = match limits.inference_timeout_ms {
+        Some(timeout_ms) => tokio::time::timeout(Duration::from_millis(timeout_ms), worker)
+            .await
+            .map_err(|_| {
+                ApiError::new(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "inference_timeout",
+                    format!("Inference exceeded the {timeout_ms}ms limit"),
+                )
+            })?
+            .map_err(internal)?,
+        None => worker.await.map_err(internal)?,
+    };
     let inference_ms = inference_started.elapsed().as_millis() as u64;
 
     let (transcript, truncated) = match classify_run_result(run_result) {
@@ -737,7 +861,17 @@ pub fn router(app: Arc<App>) -> Router {
 pub async fn run_http(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn Error>> {
-    let app = open_app()?;
+    run_http_with_overrides(crate::app::RuntimeLimits::default(), shutdown).await
+}
+
+/// Same as [`run_http`], but `cli_overrides` (from the binary's optional
+/// queue/inference flags) takes precedence over the persisted settings for
+/// this process; see `app::open_app_at_with_overrides`.
+pub async fn run_http_with_overrides(
+    cli_overrides: crate::app::RuntimeLimits,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), Box<dyn Error>> {
+    let app = crate::app::open_app_at_with_overrides(crate::app::data_dir(), cli_overrides)?;
     let router = router(app.clone());
     let address: SocketAddr = "127.0.0.1:54321".parse()?;
     let listener = tokio::net::TcpListener::bind(address).await?;
@@ -844,6 +978,142 @@ mod router_tests {
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["restart_required"], true);
         assert_eq!(body["cors_allowed_origins"][0], "http://tauri.localhost");
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_config_defaults_to_unbounded_limits() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let router = router(app.clone());
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/local/config")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body["queue_max_waiting"].is_null());
+        assert!(body["queue_wait_timeout_ms"].is_null());
+        assert!(body["inference_timeout_ms"].is_null());
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn patch_config_sets_and_clears_limits_live_and_round_trips_via_get() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let router = router(app.clone());
+
+        let set_request = Request::builder()
+            .method("PATCH")
+            .uri("/v1/local/config")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"queue_max_waiting":5,"queue_wait_timeout_ms":2000,"inference_timeout_ms":30000}"#,
+            ))
+            .unwrap();
+        let response = router.clone().oneshot(set_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        // No restart needed: these are applied live via app.limits.
+        assert_eq!(body["restart_required"], false);
+        assert_eq!(body["queue_max_waiting"], 5);
+        assert_eq!(body["queue_wait_timeout_ms"], 2000);
+        assert_eq!(body["inference_timeout_ms"], 30000);
+        {
+            let limits = *app.limits.read().unwrap();
+            assert_eq!(limits.queue_max_waiting, Some(5));
+            assert_eq!(limits.queue_wait_timeout_ms, Some(2000));
+            assert_eq!(limits.inference_timeout_ms, Some(30000));
+        }
+
+        let get_request = Request::builder()
+            .method("GET")
+            .uri("/v1/local/config")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(get_request).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["queue_max_waiting"], 5);
+        assert_eq!(body["queue_wait_timeout_ms"], 2000);
+        assert_eq!(body["inference_timeout_ms"], 30000);
+
+        let clear_request = Request::builder()
+            .method("PATCH")
+            .uri("/v1/local/config")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"queue_max_waiting":null}"#))
+            .unwrap();
+        let response = router.clone().oneshot(clear_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body["queue_max_waiting"].is_null());
+        assert_eq!(
+            app.limits.read().unwrap().queue_max_waiting,
+            None,
+            "null should clear the setting"
+        );
+        // The other two limits are untouched by a patch that omits them.
+        assert_eq!(app.limits.read().unwrap().queue_wait_timeout_ms, Some(2000));
+
+        // The router holds its own clone of `Arc<App>` (hence its own handle
+        // on the SQLite connection); drop it before `app` so the last handle
+        // is actually released before removing the directory (Windows will
+        // not delete a file still open by another handle).
+        drop(router);
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn patch_config_rejects_zero_and_negative_limits() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let router = router(app.clone());
+        for body in [
+            r#"{"queue_max_waiting":0}"#,
+            r#"{"queue_wait_timeout_ms":-1}"#,
+            r#"{"inference_timeout_ms":0}"#,
+        ] {
+            let request = Request::builder()
+                .method("PATCH")
+                .uri("/v1/local/config")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "body: {body}");
+        }
+        // See the comment in the previous test: drop the router's own
+        // `Arc<App>` clone before removing the directory on Windows.
+        drop(router);
         drop(app);
         std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
     }

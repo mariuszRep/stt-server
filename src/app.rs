@@ -16,17 +16,30 @@ use crate::queue::InferenceQueue;
 
 pub struct App {
     pub catalog: Vec<CatalogModel>,
-    /// Fallback download hosts from the catalog, tried in order after
-    /// HuggingFace (see `download::candidate_urls`).
-    pub mirrors: Vec<String>,
     pub db: Mutex<Connection>,
     pub loaded: Mutex<Option<LoadedModel>>,
     pub data_dir: PathBuf,
     pub token: String,
-    /// Bounded FIFO queue for the single inference slot; see `crate::queue`.
+    /// FIFO queue for the single inference slot; see `crate::queue`. Its
+    /// waiting-list bound and wait deadline are read live from `limits`.
     pub inference: InferenceQueue,
+    /// Queue/inference limits: settable via `PATCH /v1/local/config` and
+    /// overridable per-process by CLI flags (`--queue-max-waiting`,
+    /// `--queue-wait-timeout-ms`, `--inference-timeout-ms`). Read at request
+    /// time so a setting change (or process launched with flags) applies
+    /// live, without a restart.
+    pub limits: std::sync::RwLock<RuntimeLimits>,
     pub selection: tokio::sync::Mutex<()>,
     pub http: reqwest::Client,
+}
+
+/// Optional operational limits; `None` means unbounded/no-timeout, matching
+/// the current shipping server's default behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuntimeLimits {
+    pub queue_max_waiting: Option<usize>,
+    pub queue_wait_timeout_ms: Option<u64>,
+    pub inference_timeout_ms: Option<u64>,
 }
 
 pub fn data_dir() -> PathBuf {
@@ -154,6 +167,17 @@ pub fn open_app() -> Result<Arc<App>, Box<dyn Error>> {
 }
 
 pub fn open_app_at(data_dir: PathBuf) -> Result<Arc<App>, Box<dyn Error>> {
+    open_app_at_with_overrides(data_dir, RuntimeLimits::default())
+}
+
+/// Same as [`open_app_at`], but `cli_overrides` (from the binary's optional
+/// `--queue-max-waiting`/`--queue-wait-timeout-ms`/`--inference-timeout-ms`
+/// flags) takes precedence, field by field, over the persisted settings for
+/// this process only; the persisted settings are left untouched.
+pub fn open_app_at_with_overrides(
+    data_dir: PathBuf,
+    cli_overrides: RuntimeLimits,
+) -> Result<Arc<App>, Box<dyn Error>> {
     let catalog: Catalog = serde_json::from_str(include_str!("../catalog/handy-2026-08-17.json"))?;
     fs::create_dir_all(data_dir.join("models"))?;
     fs::create_dir_all(data_dir.join("staging"))?;
@@ -204,14 +228,26 @@ pub fn open_app_at(data_dir: PathBuf) -> Result<Arc<App>, Box<dyn Error>> {
             }
         }
     });
+    let stored_limits = crate::store::read_runtime_limits(&db)?;
+    let limits = RuntimeLimits {
+        queue_max_waiting: cli_overrides
+            .queue_max_waiting
+            .or(stored_limits.queue_max_waiting),
+        queue_wait_timeout_ms: cli_overrides
+            .queue_wait_timeout_ms
+            .or(stored_limits.queue_wait_timeout_ms),
+        inference_timeout_ms: cli_overrides
+            .inference_timeout_ms
+            .or(stored_limits.inference_timeout_ms),
+    };
     Ok(Arc::new(App {
         catalog: catalog.models,
-        mirrors: catalog.mirrors,
         db: Mutex::new(db),
         loaded: Mutex::new(loaded),
         data_dir,
         token,
         inference: InferenceQueue::new(),
+        limits: std::sync::RwLock::new(limits),
         selection: tokio::sync::Mutex::new(()),
         // No blanket total-request timeout: a 48 GB model download must not
         // be killed just because it is still progressing. Staleness is

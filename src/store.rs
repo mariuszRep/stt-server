@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::app::App;
+use crate::app::{App, RuntimeLimits};
 use crate::catalog::{CatalogFile, CatalogModel};
 use crate::errors::{internal, ApiResult};
 
@@ -106,6 +106,51 @@ pub fn cors_allowed_origins(app: &App) -> ApiResult<Vec<String>> {
     match raw {
         Some(value) => serde_json::from_str(&value).map_err(internal),
         None => Ok(default_cors_origins()),
+    }
+}
+
+/// Settings keys for the optional queue/inference limits (see
+/// `app::RuntimeLimits`). Stored as decimal-string values; absent means
+/// unset (unbounded/no-timeout).
+pub const SETTING_QUEUE_MAX_WAITING: &str = "queue_max_waiting";
+pub const SETTING_QUEUE_WAIT_TIMEOUT_MS: &str = "queue_wait_timeout_ms";
+pub const SETTING_INFERENCE_TIMEOUT_MS: &str = "inference_timeout_ms";
+
+fn read_setting_u64(db: &Connection, key: &str) -> rusqlite::Result<Option<u64>> {
+    let raw: Option<String> = db
+        .query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(raw.and_then(|value| value.parse::<u64>().ok()))
+}
+
+/// Read the persisted queue/inference limits. Any field with no stored
+/// setting (or an unparseable one) comes back `None` (unbounded/no-timeout).
+pub fn read_runtime_limits(db: &Connection) -> rusqlite::Result<RuntimeLimits> {
+    Ok(RuntimeLimits {
+        queue_max_waiting: read_setting_u64(db, SETTING_QUEUE_MAX_WAITING)?
+            .map(|value| value as usize),
+        queue_wait_timeout_ms: read_setting_u64(db, SETTING_QUEUE_WAIT_TIMEOUT_MS)?,
+        inference_timeout_ms: read_setting_u64(db, SETTING_INFERENCE_TIMEOUT_MS)?,
+    })
+}
+
+/// Current in-memory limits (live view, reflecting any CLI override and any
+/// `PATCH /v1/local/config` applied since process start).
+pub fn runtime_limits(app: &App) -> ApiResult<RuntimeLimits> {
+    app.limits.read().map(|limits| *limits).map_err(internal)
+}
+
+/// Pure validation for a settable positive-integer limit: `None` clears it,
+/// `Some(0)` is invalid (limits are positive), anything else passes through.
+pub fn validate_positive_limit(value: Option<i64>) -> Result<Option<u64>, &'static str> {
+    match value {
+        None => Ok(None),
+        Some(v) if v > 0 => Ok(Some(v as u64)),
+        Some(_) => Err("must be a positive integer or null"),
     }
 }
 
