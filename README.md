@@ -52,24 +52,43 @@ Downloads are hardened: a 60s stall timeout applies to connect and every chunk (
 transfer, so a 48 GB file is never killed just for taking a long time); a `.part` already at the
 expected size skips the network and goes straight to hash verification; HTTP 416 discards the
 partial and restarts once; each source gets up to 3 attempts with 2s/5s/15s backoff before moving
-to the next; the catalog's `mirrors` (currently just `blob.handy.computer`) are tried after
-HuggingFace, in catalog order, with URL shape `{mirror}/{id}/{revision}/{filename}`, the same
-shape Handy uses (`src-tauri/src/catalog/mod.rs:29-30`, commit `8f9cf53`); a disk-space preflight
-refuses to
-start when free space is under `(remaining bytes) * 1.05 + 64 MiB`, failing the operation with
-`insufficient_disk_space`; progress is written to SQLite at most every 250 ms or 4 MiB.
+to the next; a disk-space preflight refuses to start when free space is under
+`(remaining bytes) * 1.05 + 64 MiB`, failing the operation with `insufficient_disk_space`;
+progress is written to SQLite at most every 250 ms or 4 MiB. **HuggingFace is the only download
+source.** We do not use Handy's `blob.handy.computer` mirror without that project's permission, so
+there is no mirror fallback: when HuggingFace fails after the retry schedule above, the operation
+fails with `error_code: "source_unavailable"` and a message noting the operation can be retried.
+The catalog's `mirrors` field is still deserialized (so the embedded catalog JSON stays
+byte-identical to upstream) but is otherwise unused.
 
 ## Inference queue and model switching
 
 Exactly one transcription runs at a time, matching the single resident model. A request that
-arrives while another is running joins a bounded FIFO queue (`src/queue.rs`, 8 waiters by
-default) instead of failing immediately; a 9th concurrent waiter gets 429 `queue_full`, and a
-waiter that sits longer than 60s gets 503 `queue_timeout`. Multipart parsing, validation, and
-`decode_wav` all happen before a request joins the queue. If the client disconnects while queued
-or running, the handler future is dropped and the queue slot / cancellation token are released via
-RAII. A successful transcription's JSON response gets an additive `x_diagnostics` object:
-`queue_wait_ms`, `inference_ms`, `audio_ms` (post-resample duration at 16 kHz), `model`, `backend`,
-and `fallback_reason`.
+arrives while another is running joins a FIFO queue (`src/queue.rs`). By default the queue is
+unbounded and a waiter never times out, matching the current shipping server. Three settings make
+these optional and bounded:
+
+- `queue_max_waiting` (positive integer or `null`): once this many requests are already waiting,
+  the next one gets 429 `queue_full` immediately instead of joining the queue.
+- `queue_wait_timeout_ms` (positive integer or `null`): a waiter that sits this long without a
+  turn gets 503 `queue_timeout`.
+- `inference_timeout_ms` (positive integer or `null`): a run that exceeds this many milliseconds
+  is cancelled (its cancel token fires) and the request gets 504 `inference_timeout`.
+
+All three are visible on `GET /v1/local/config` and settable via `PATCH /v1/local/config`
+(`null` clears a setting back to unbounded/no-timeout; a non-positive value is rejected with 400).
+They apply **live**: the server keeps an in-memory copy (`App::limits`, a `std::sync::RwLock`,
+read at request time), so a `PATCH` takes effect on the very next request with no restart. The
+default binary (`stt-server-next.exe`, not the `service`/`install`/`uninstall` subcommands) also
+accepts `--queue-max-waiting <n>`, `--queue-wait-timeout-ms <n>`, and `--inference-timeout-ms <n>`
+flags, which override the stored settings for that process only; an unrecognized flag or a
+non-positive value prints an error to stderr and exits with code 2.
+
+Multipart parsing, validation, and `decode_wav` all happen before a request joins the queue. If
+the client disconnects while queued or running, the handler future is dropped and the queue slot
+/ cancellation token are released via RAII. A successful transcription's JSON response gets an
+additive `x_diagnostics` object: `queue_wait_ms`, `inference_ms`, `audio_ms` (post-resample
+duration at 16 kHz), `model`, `backend`, and `fallback_reason`.
 
 `POST /v1/local/models/{id}/select` (and its `/load` alias) no longer holds the inference slot
 while the new model loads: the old model keeps serving in-flight and newly queued transcriptions

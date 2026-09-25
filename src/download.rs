@@ -62,31 +62,15 @@ impl DownloadFailure {
     }
 }
 
-/// Build the ordered list of source URLs to try: HuggingFace first, then
-/// each catalog mirror in order. Bytes from any source are only accepted
-/// once their SHA-256 matches the catalog (enforced by the caller after
-/// download, not by this function). Pure and independent of I/O so it can be
-/// unit tested without a network.
-///
-/// Mirror URL shape: the catalog only publishes mirror *hosts* (e.g.
-/// `https://blob.handy.computer`), not a path template, so this mirrors the
-/// HuggingFace resolve path onto each mirror host
-/// (`{mirror}/{id}/{revision}/{filename}`). This shape is confirmed by Handy
-/// (`src-tauri/src/catalog/mod.rs:29-30`, commit `8f9cf53`), which builds
-/// mirror URLs the same way.
-pub fn candidate_urls(model: &CatalogModel, file: &CatalogFile, mirrors: &[String]) -> Vec<String> {
-    let mut urls = vec![format!(
+/// Build the single source URL to try: HuggingFace only. We do not use
+/// Handy's `blob.handy.computer` mirror without that project's permission
+/// (user decision), so no mirror fallback is attempted. Pure and independent
+/// of I/O so it can be unit tested without a network.
+pub fn candidate_urls(model: &CatalogModel, file: &CatalogFile) -> Vec<String> {
+    vec![format!(
         "https://huggingface.co/{}/resolve/{}/{}",
         model.id, model.revision, file.filename
-    )];
-    for mirror in mirrors {
-        let base = mirror.trim_end_matches('/');
-        urls.push(format!(
-            "{base}/{}/{}/{}",
-            model.id, model.revision, file.filename
-        ));
-    }
-    urls
+    )]
 }
 
 /// What to do with an on-disk `.part` file before issuing any HTTP request.
@@ -504,15 +488,17 @@ pub async fn download_model_with_timeout(
         ));
     }
 
-    let urls = candidate_urls(&model, &file, &app.mirrors);
+    let urls = candidate_urls(&model, &file);
     download_with_sources(app, &urls, &model, file, op, stall_timeout, stage).await
 }
 
-/// The retry/mirror-fallback/verify/promote core, taking an explicit source
-/// URL list rather than deriving it from the catalog, so tests can point it
-/// at a local fake server instead of huggingface.co. The disk preflight is
-/// done by the caller ([`download_model_with_timeout`]) since it needs the
-/// (pre-download-attempt) partial size.
+/// The retry/verify/promote core, taking an explicit source URL list rather
+/// than deriving it from the catalog, so tests can point it at a local fake
+/// server instead of huggingface.co. There is no mirror fallback: HuggingFace
+/// is the only source (user decision — we do not use Handy's mirror without
+/// that project's permission). The disk preflight is done by the caller
+/// ([`download_model_with_timeout`]) since it needs the (pre-download-attempt)
+/// partial size.
 async fn download_with_sources(
     app: Arc<App>,
     urls: &[String],
@@ -638,28 +624,11 @@ mod pure_tests {
     }
 
     #[test]
-    fn candidate_urls_hf_only_without_mirrors() {
-        let urls = candidate_urls(&model(), &file(), &[]);
+    fn candidate_urls_is_huggingface_only() {
+        let urls = candidate_urls(&model(), &file());
         assert_eq!(
             urls,
             vec!["https://huggingface.co/org/model/resolve/abc123/model.gguf"]
-        );
-    }
-
-    #[test]
-    fn candidate_urls_appends_mirrors_in_catalog_order() {
-        let mirrors = vec![
-            "https://blob.handy.computer".to_owned(),
-            "https://mirror2.example/".to_owned(),
-        ];
-        let urls = candidate_urls(&model(), &file(), &mirrors);
-        assert_eq!(
-            urls,
-            vec![
-                "https://huggingface.co/org/model/resolve/abc123/model.gguf".to_owned(),
-                "https://blob.handy.computer/org/model/abc123/model.gguf".to_owned(),
-                "https://mirror2.example/org/model/abc123/model.gguf".to_owned(),
-            ]
         );
     }
 
@@ -1028,10 +997,35 @@ mod http_tests {
         cleanup(path);
     }
 
+    /// A server that always answers `/file` with a non-success status, to
+    /// exercise the "source responded but refused" path (fast, deterministic)
+    /// rather than an unreachable port (whose failure mode -- refused vs.
+    /// black-holed -- is platform/timing dependent and can look like a stall).
+    async fn serve_always_failing() -> String {
+        use axum::response::IntoResponse;
+        use axum::routing::get;
+
+        async fn handler() -> impl IntoResponse {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+
+        let router = axum::Router::new().route("/file", get(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
     #[tokio::test]
-    async fn first_source_failing_falls_back_to_mirror() {
-        static BODY: &[u8] = b"mirror-fallback-payload-bytes-here";
-        let good_base = serve_bytes(BODY).await;
+    async fn only_one_source_is_tried_and_failure_is_retryable() {
+        // The source responds but refuses every request the same way, and
+        // there is no mirror to fall back to (HuggingFace only, per user
+        // decision), so the single URL is retried up to RETRY_BACKOFFS.len()
+        // times and then fails with the retryable source_unavailable code.
+        static BODY: &[u8] = b"always-failing-source-payload-bytes";
+        let base = serve_always_failing().await;
         let file = fake_file(BODY);
         let model = fake_model();
         let (app, path) = new_app().await;
@@ -1040,9 +1034,9 @@ mod http_tests {
             .data_dir
             .join("staging")
             .join(format!("{}.part", file.sha256));
-        // First "source" is a port nothing listens on; connection should fail fast.
-        let urls = vec!["http://127.0.0.1:1".to_owned(), format!("{good_base}/file")];
-        download_with_sources(
+        let urls = vec![format!("{base}/file")];
+        let start = Instant::now();
+        let result = download_with_sources(
             app.clone(),
             &urls,
             &model,
@@ -1051,12 +1045,17 @@ mod http_tests {
             STALL_TIMEOUT,
             stage,
         )
-        .await
-        .unwrap();
-        assert_eq!(
-            operation_state(&app, &op).unwrap().as_deref(),
-            Some("completed")
+        .await;
+        let failure = result.unwrap_err();
+        assert_eq!(failure.code, ERROR_CODE_SOURCE_UNAVAILABLE);
+        assert!(
+            failure.message.contains(&base),
+            "message should mention the only source tried: {}",
+            failure.message
         );
+        assert!(!failure.message.contains("huggingface.co/"));
+        // Bounded by 3 retries with short backoffs; well under the 60s stall timeout.
+        assert!(start.elapsed() < Duration::from_secs(10));
         cleanup(path);
     }
 
