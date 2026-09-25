@@ -69,29 +69,30 @@ fn reconcile_installed(
     catalog: &[CatalogModel],
     data_dir: &Path,
 ) -> Result<(), Box<dyn Error>> {
-    let mut query = db.prepare("SELECT id,path,sha256 FROM installed")?;
+    let mut query = db.prepare("SELECT id,path,sha256,quant FROM installed")?;
     let installed = query
         .query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     drop(query);
     let model_dir = fs::canonicalize(data_dir.join("models"))?;
-    for (id, path, recorded_hash) in installed {
+    for (id, path, recorded_hash, recorded_quant) in installed {
         let artifact = PathBuf::from(&path);
-        let expected = catalog
-            .iter()
-            .find(|model| model.slug == id)
-            .and_then(|model| {
-                model
-                    .files
-                    .iter()
-                    .find(|file| file.quant == model.default_quant)
-            });
+        // Use the recorded quant (not the model's current default_quant) so a
+        // model installed at a non-default quant reconciles against the file
+        // it actually has on disk.
+        let expected = recorded_quant.as_deref().and_then(|quant| {
+            catalog
+                .iter()
+                .find(|model| model.slug == id)
+                .and_then(|model| model.files.iter().find(|file| file.quant == quant))
+        });
         let owned_path = fs::canonicalize(&artifact)
             .ok()
             .is_some_and(|resolved| resolved.starts_with(&model_dir));
@@ -153,31 +154,11 @@ pub fn open_app_at(data_dir: PathBuf) -> Result<Arc<App>, Box<dyn Error>> {
     fs::create_dir_all(data_dir.join("models"))?;
     fs::create_dir_all(data_dir.join("staging"))?;
     let token = token_file(&data_dir)?;
-    let db = Connection::open(data_dir.join("state.db"))?;
-    db.execute_batch(
-        "PRAGMA journal_mode=WAL;
-         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-         CREATE TABLE IF NOT EXISTS installed(id TEXT PRIMARY KEY, path TEXT NOT NULL, sha256 TEXT NOT NULL);
-         CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY, model_id TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL, error TEXT, progress_bytes INTEGER NOT NULL DEFAULT 0, total_bytes INTEGER NOT NULL DEFAULT 0);",
-    )?;
-    let mut columns = db.prepare("PRAGMA table_info(operations)")?;
-    let names = columns
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(columns);
-    if !names.iter().any(|name| name == "progress_bytes") {
-        db.execute(
-            "ALTER TABLE operations ADD COLUMN progress_bytes INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-    }
-    if !names.iter().any(|name| name == "total_bytes") {
-        db.execute(
-            "ALTER TABLE operations ADD COLUMN total_bytes INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-    }
-    db.execute("UPDATE operations SET state='failed', error='Interrupted by service restart' WHERE state IN ('queued','running')", [])?;
+    let mut db = Connection::open(data_dir.join("state.db"))?;
+    db.execute_batch("PRAGMA journal_mode=WAL;")?;
+    crate::store::migrate(&mut db, &catalog.models, &data_dir)?;
+    let now = crate::store::now_ms();
+    db.execute("UPDATE operations SET state='failed', error='Interrupted by service restart', updated_at=?1, finished_at=?1 WHERE state IN ('queued','running')", params![now])?;
     reconcile_interrupted_imports(&db, &data_dir)?;
     reconcile_installed(&db, &catalog.models, &data_dir)?;
     let selected: Option<(String, String)> = db

@@ -25,6 +25,9 @@ uuid = { version = "=1.26.1", features = ["v4"] }
 [target.'cfg(windows)'.dependencies]
 windows-service = "=0.8.1"
 
+[dev-dependencies]
+tower = { version = "=0.5.3", features = ["util"] }
+
 [[bin]]
 name = "stt-proof"
 path = "src/main.rs"

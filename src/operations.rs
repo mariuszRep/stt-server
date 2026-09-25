@@ -11,6 +11,9 @@ use serde_json::{json, Value};
 use crate::app::App;
 use crate::auth::authorized;
 use crate::errors::{internal, ApiError, ApiResult};
+use crate::store::now_ms;
+
+const TERMINAL_STATES: [&str; 3] = ["completed", "failed", "cancelled"];
 
 pub fn update_operation(
     app: &App,
@@ -20,11 +23,20 @@ pub fn update_operation(
     bytes: u64,
 ) -> ApiResult<()> {
     let db = app.db.lock().map_err(internal)?;
-    db.execute(
-        "UPDATE operations SET state=?2, error=?3, progress_bytes=?4 WHERE id=?1 AND state <> 'cancelled'",
-        params![id, state, error, bytes],
-    )
-    .map_err(internal)?;
+    let now = now_ms();
+    if TERMINAL_STATES.contains(&state) {
+        db.execute(
+            "UPDATE operations SET state=?2, error=?3, progress_bytes=?4, updated_at=?5, finished_at=?5 WHERE id=?1 AND state <> 'cancelled'",
+            params![id, state, error, bytes, now],
+        )
+        .map_err(internal)?;
+    } else {
+        db.execute(
+            "UPDATE operations SET state=?2, error=?3, progress_bytes=?4, updated_at=?5 WHERE id=?1 AND state <> 'cancelled'",
+            params![id, state, error, bytes, now],
+        )
+        .map_err(internal)?;
+    }
     Ok(())
 }
 
@@ -48,7 +60,7 @@ pub async fn operation(
     let db = app.db.lock().map_err(internal)?;
     let record = db
         .query_row(
-            "SELECT model_id, kind, state, error, progress_bytes, total_bytes FROM operations WHERE id=?1",
+            "SELECT model_id, kind, state, error, progress_bytes, total_bytes, created_at, updated_at, finished_at FROM operations WHERE id=?1",
             params![id],
             |row| {
                 Ok(json!({
@@ -58,7 +70,10 @@ pub async fn operation(
                     "state":row.get::<_, String>(2)?,
                     "error":row.get::<_, Option<String>>(3)?,
                     "progress_bytes":row.get::<_, u64>(4)?,
-                    "total_bytes":row.get::<_, u64>(5)?
+                    "total_bytes":row.get::<_, u64>(5)?,
+                    "created_at":row.get::<_, Option<i64>>(6)?,
+                    "updated_at":row.get::<_, Option<i64>>(7)?,
+                    "finished_at":row.get::<_, Option<i64>>(8)?
                 }))
             },
         )
