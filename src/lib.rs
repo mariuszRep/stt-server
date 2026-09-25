@@ -7,6 +7,7 @@ pub mod catalog;
 pub mod download;
 pub mod engine;
 pub mod errors;
+pub mod format;
 pub mod import;
 pub mod operations;
 pub mod queue;

@@ -13,13 +13,22 @@ model, and diagnostics report the backend actually used and any CPU fallback rea
 ## Current API
 
 `GET /health` is unauthenticated. Other routes require a bearer token. The server implements
-`GET /readiness`, `GET /v1/models`, and OpenAI-style `POST /v1/audio/transcriptions` for
-mono/stereo WAV from 8–192 kHz (16/24-bit PCM or 32-bit float). Audio is converted to 16 kHz
-mono before inference. The `/v1/local/*` routes expose fixed recommendations, per-model capability
-matrices, installed models, explicit install/import/verification, selection/load/removal, operation progress
-and cancellation, and CPU/Vulkan preference. Unsupported optional transcription fields return
-`unsupported_capability`. Every catalog model is installable (`installable: true`); admission is
-catalog membership plus a resolvable quant/hash, not a hard-coded model ID.
+`GET /readiness`, `GET /v1/models`, and OpenAI-style `POST /v1/audio/transcriptions` and
+`POST /v1/audio/translations` for mono/stereo WAV from 8–192 kHz (16/24-bit PCM or 32-bit float),
+both sharing one pipeline (parse → decode → plan → queue → run → format) and a 40 MiB body limit.
+Audio is converted to 16 kHz mono before inference. Accepted multipart fields are `file`, `model`,
+`language`, `prompt`, `temperature`, `response_format` (`json`/`text`/`verbose_json`), and repeatable
+`timestamp_granularities`/`timestamp_granularities[]`; `prompt` is passed to the engine verbatim
+(no server-side composition or trimming) and is only accepted on whisper-family models. An
+unresolvable `language` hint is never an error: the server falls back to auto-detection, then
+English, then the model's first language (matching Handy), and reports whether the hint was
+actually applied via `x_diagnostics.language_hint_applied`/`applied_language`/`language_evidence`.
+The `/v1/local/*` routes expose fixed recommendations, per-model capability matrices (a `catalog`
+view when unloaded, an `effective` view computed from the live model plus `catalog_mismatch` once
+loaded), installed models, explicit install/import/verification, selection/load/removal, operation
+progress and cancellation, and CPU/Vulkan preference. Unsupported optional transcription fields
+return `unsupported_capability`. Every catalog model is installable (`installable: true`); admission
+is catalog membership plus a resolvable quant/hash, not a hard-coded model ID.
 
 `POST /v1/local/models/{id}/install` takes an optional JSON body `{"quant":"Q8_0"}`; an absent or
 empty body installs the model's `default_quant`. An unknown quant returns 400 `invalid_quant`;

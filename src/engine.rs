@@ -3,6 +3,8 @@ use std::path::Path;
 use serde::Serialize;
 use transcribe_cpp::{backend_available, Backend, CancelToken, Model, ModelOptions};
 
+use crate::capabilities::{EffectiveCaps, LoadedCaps};
+
 #[derive(Clone, Serialize)]
 pub struct BackendDiagnostic {
     pub observed_backend: String,
@@ -13,6 +15,22 @@ pub struct LoadedModel {
     pub id: String,
     pub model: Model,
     pub diagnostic: BackendDiagnostic,
+    /// Computed once at load time from the live `Model` (see
+    /// `capabilities.rs`). Reused for every request against this model
+    /// instead of recomputing per-request.
+    pub caps: EffectiveCaps,
+}
+
+impl LoadedModel {
+    pub fn new(id: String, model: Model, diagnostic: BackendDiagnostic) -> Self {
+        let caps = EffectiveCaps::new(LoadedCaps::from_model(&model));
+        LoadedModel {
+            id,
+            model,
+            diagnostic,
+            caps,
+        }
+    }
 }
 
 pub struct CancelWhenDropped(pub CancelToken);

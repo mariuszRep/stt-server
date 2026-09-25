@@ -193,11 +193,7 @@ pub fn open_app_at(data_dir: PathBuf) -> Result<Arc<App>, Box<dyn Error>> {
                 .join()
                 .map_err(|_| std::io::Error::other("model reload thread panicked"))
         }) {
-            Ok(Ok((model, diagnostic))) => Some(LoadedModel {
-                id,
-                model,
-                diagnostic,
-            }),
+            Ok(Ok((model, diagnostic))) => Some(LoadedModel::new(id, model, diagnostic)),
             Ok(Err(error)) => {
                 eprintln!("selected model could not reload: {error}");
                 None

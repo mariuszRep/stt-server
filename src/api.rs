@@ -1,14 +1,13 @@
-use std::collections::HashMap;
 use std::error::Error;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path as UrlPath, State},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -16,18 +15,21 @@ use rusqlite::params;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use transcribe_cpp::{CancelToken, RunOptions};
+use transcribe_cpp::CancelToken;
 use uuid::Uuid;
 
 use crate::app::{open_app, App};
 use crate::audio::decode_wav;
 use crate::auth::authorized;
+use crate::capabilities::catalog_mismatch;
 use crate::catalog::{capability_matrix, catalog_model, model_view};
 use crate::download::install_model;
 use crate::engine::{load_engine, CancelWhenDropped, LoadedModel};
-use crate::errors::{internal, ApiError, ApiResult};
+use crate::errors::{classify_run_result, internal, ApiError, ApiResult, RunOutcome};
+use crate::format::{format_response, DiagnosticsExtra, Formatted, LanguageEvidence};
 use crate::import::import_model;
 use crate::operations::{cancel_operation, operation};
+use crate::run_plan::{plan as build_plan, Endpoint, ParsedRequest};
 use crate::store::{
     backend_preference, cors_allowed_origins, installed_file, installed_path, is_valid_cors_origin,
     selected_id,
@@ -181,6 +183,24 @@ pub async fn recommendations(
     Ok(Json(json!({"object":"list", "data":data})))
 }
 
+/// The effective capability view (plus `catalog_mismatch`) for the currently
+/// loaded model, if `id` names it; `None` otherwise (unloaded, or a different
+/// model is loaded), letting the caller fall back to the catalog view.
+fn effective_view_if_loaded(app: &App, id: &str) -> ApiResult<Option<Value>> {
+    let loaded = app.loaded.lock().map_err(internal)?;
+    Ok(loaded
+        .as_ref()
+        .filter(|active| active.id == id)
+        .map(|active| {
+            let mut view = active.caps.to_json();
+            let model = app.catalog.iter().find(|model| model.slug == id);
+            if let Some(model) = model {
+                view["catalog_mismatch"] = json!(catalog_mismatch(model, &active.caps));
+            }
+            view
+        }))
+}
+
 pub async fn local_models(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -191,10 +211,11 @@ pub async fn local_models(
         .iter()
         .map(|model| {
             let installed = installed_file(&app, &model.slug)?;
-            Ok(model_view(
-                model,
-                installed.and_then(|file| file.quant).as_deref(),
-            ))
+            let mut view = model_view(model, installed.and_then(|file| file.quant).as_deref());
+            if let Some(effective) = effective_view_if_loaded(&app, &model.slug)? {
+                view["effective_capabilities"] = effective;
+            }
+            Ok(view)
         })
         .collect::<ApiResult<Vec<_>>>()?;
     Ok(Json(json!({"object":"list", "data":data})))
@@ -223,14 +244,20 @@ pub async fn selected_model(
         return Ok(Json(json!({"model":null, "effective_capabilities":null})));
     };
     let model = catalog_model(&app, &id)?;
-    let loaded = app.loaded.lock().map_err(internal)?;
-    let diagnostic = loaded
-        .as_ref()
-        .filter(|active| active.id == id)
-        .map(|active| active.diagnostic.clone());
+    let diagnostic = {
+        let loaded = app.loaded.lock().map_err(internal)?;
+        loaded
+            .as_ref()
+            .filter(|active| active.id == id)
+            .map(|active| active.diagnostic.clone())
+    };
+    let effective_capabilities = match effective_view_if_loaded(&app, &id)? {
+        Some(effective) => effective,
+        None => capability_matrix(model),
+    };
     Ok(Json(json!({
         "model":id,
-        "effective_capabilities":capability_matrix(model),
+        "effective_capabilities":effective_capabilities,
         "backend":diagnostic
     })))
 }
@@ -309,11 +336,8 @@ pub async fn select_model(
         )
         .map_err(internal)?;
     }
-    *app.loaded.lock().map_err(internal)? = Some(LoadedModel {
-        id: loader_id,
-        model,
-        diagnostic: diagnostic.clone(),
-    });
+    *app.loaded.lock().map_err(internal)? =
+        Some(LoadedModel::new(loader_id, model, diagnostic.clone()));
     Ok(Json(json!({"model":id,"backend":diagnostic})))
 }
 
@@ -384,71 +408,168 @@ pub async fn remove_model(
     Ok(Json(json!({"model":id,"removed":true})))
 }
 
-pub async fn transcriptions(
-    State(app): State<Arc<App>>,
-    headers: HeaderMap,
-    mut multipart: Multipart,
-) -> ApiResult<Json<Value>> {
-    authorized(&headers, &app)?;
-    let mut fields: HashMap<String, Vec<u8>> = HashMap::new();
-    while let Some(field) = multipart.next_field().await.map_err(|error| {
-        ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "invalid_multipart",
-            error.to_string(),
-        )
-    })? {
+/// The multipart fields both `/v1/audio/transcriptions` and
+/// `/v1/audio/translations` accept, already validated for shape (duplicates,
+/// unknown fields) but not yet planned against a model's capabilities.
+struct TranscriptionFields {
+    file: Vec<u8>,
+    model: String,
+    language: Option<String>,
+    prompt: Option<String>,
+    temperature: Option<f32>,
+    response_format: Option<String>,
+    timestamp_granularities: Vec<String>,
+}
+
+fn invalid_multipart(error: impl std::fmt::Display) -> ApiError {
+    ApiError::new(
+        StatusCode::BAD_REQUEST,
+        "invalid_multipart",
+        error.to_string(),
+    )
+}
+
+fn duplicate_field(name: &str) -> ApiError {
+    ApiError::new(StatusCode::BAD_REQUEST, "duplicate_field", name.to_string())
+}
+
+/// Parse and validate the shared multipart shape. Field-order rule: unknown
+/// fields are rejected as they're seen (422 `unsupported_capability`) before
+/// any capability-aware planning happens; a duplicate of a non-repeatable
+/// field is rejected immediately as 400 `duplicate_field`.
+/// `timestamp_granularities` / `timestamp_granularities[]` are the one
+/// repeatable field.
+async fn parse_transcription_multipart(mut multipart: Multipart) -> ApiResult<TranscriptionFields> {
+    let mut file: Option<Vec<u8>> = None;
+    let mut model: Option<String> = None;
+    let mut language: Option<String> = None;
+    let mut prompt: Option<String> = None;
+    let mut temperature_raw: Option<String> = None;
+    let mut response_format: Option<String> = None;
+    let mut timestamp_granularities: Vec<String> = Vec::new();
+
+    while let Some(field) = multipart.next_field().await.map_err(invalid_multipart)? {
         let name = field.name().unwrap_or("").to_owned();
-        if fields.contains_key(&name) {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "duplicate_field",
-                name,
-            ));
+        match name.as_str() {
+            "file" => {
+                if file.is_some() {
+                    return Err(duplicate_field("file"));
+                }
+                file = Some(field.bytes().await.map_err(invalid_multipart)?.to_vec());
+            }
+            "model" => {
+                if model.is_some() {
+                    return Err(duplicate_field("model"));
+                }
+                model = Some(field.text().await.map_err(invalid_multipart)?);
+            }
+            "language" => {
+                if language.is_some() {
+                    return Err(duplicate_field("language"));
+                }
+                language = Some(field.text().await.map_err(invalid_multipart)?);
+            }
+            "prompt" => {
+                if prompt.is_some() {
+                    return Err(duplicate_field("prompt"));
+                }
+                prompt = Some(field.text().await.map_err(invalid_multipart)?);
+            }
+            "temperature" => {
+                if temperature_raw.is_some() {
+                    return Err(duplicate_field("temperature"));
+                }
+                temperature_raw = Some(field.text().await.map_err(invalid_multipart)?);
+            }
+            "response_format" => {
+                if response_format.is_some() {
+                    return Err(duplicate_field("response_format"));
+                }
+                response_format = Some(field.text().await.map_err(invalid_multipart)?);
+            }
+            "timestamp_granularities" | "timestamp_granularities[]" => {
+                timestamp_granularities.push(field.text().await.map_err(invalid_multipart)?);
+            }
+            other => {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "unsupported_capability",
+                    format!("Field {other} is not supported"),
+                ));
+            }
         }
-        let bytes = field.bytes().await.map_err(|error| {
-            ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "invalid_multipart",
-                error.to_string(),
-            )
-        })?;
-        fields.insert(name, bytes.to_vec());
     }
-    for name in fields.keys() {
-        if !matches!(name.as_str(), "file" | "model" | "response_format") {
-            return Err(ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "unsupported_capability",
-                format!("Field {name} is not supported by the selected model"),
-            ));
-        }
-    }
-    let model_id = std::str::from_utf8(fields.get("model").ok_or_else(|| {
+
+    let file = file.ok_or_else(|| {
+        ApiError::new(StatusCode::BAD_REQUEST, "missing_file", "file is required")
+    })?;
+    let model = model.ok_or_else(|| {
         ApiError::new(
             StatusCode::BAD_REQUEST,
             "missing_model",
             "model is required",
         )
-    })?)
-    .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid_model", "Invalid model ID"))?;
-    if let Some(format) = fields.get("response_format") {
-        if format != b"json" {
-            return Err(ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "unsupported_capability",
-                "Only response_format=json is supported",
-            ));
-        }
-    }
-    let file = fields.get("file").ok_or_else(|| {
-        ApiError::new(StatusCode::BAD_REQUEST, "missing_file", "file is required")
     })?;
-    // Decode/validate happens before joining the queue (above); only the
-    // actual inference run below waits for a turn.
-    let pcm = decode_wav(file)?;
+    let temperature = match temperature_raw {
+        Some(raw) => Some(raw.parse::<f32>().map_err(|_| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_temperature",
+                "temperature must be a number",
+            )
+        })?),
+        None => None,
+    };
+
+    Ok(TranscriptionFields {
+        file,
+        model,
+        language,
+        prompt,
+        temperature,
+        response_format,
+        timestamp_granularities,
+    })
+}
+
+fn formatted_into_response(formatted: Formatted) -> Response {
+    match formatted {
+        Formatted::Json(value) => Json(value).into_response(),
+        Formatted::PlainText(text) => (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
+            text,
+        )
+            .into_response(),
+    }
+}
+
+/// The shared pipeline behind `/v1/audio/transcriptions` and
+/// `/v1/audio/translations`: parse -> decode -> grab the loaded model +
+/// effective capabilities -> plan -> queue -> run -> format. See
+/// `parity-design.md` "Handler".
+async fn transcribe_or_translate(
+    app: Arc<App>,
+    headers: HeaderMap,
+    multipart: Multipart,
+    endpoint: Endpoint,
+) -> ApiResult<Response> {
+    authorized(&headers, &app)?;
+    let fields = parse_transcription_multipart(multipart).await?;
+
+    // Decode/validate happens before joining the queue; only the actual
+    // inference run below waits for a turn.
+    let pcm = decode_wav(&fields.file)?;
+    let samples = pcm.len();
     let audio_ms = (pcm.len() as u64 * 1000) / 16_000;
-    let (model, active_id, backend) = {
+
+    // The model binds when the request is admitted: clone the handle (and
+    // its effective capabilities) before queueing, so the model can be
+    // swapped underneath without affecting an in-flight or already-queued
+    // request.
+    let (model, active_id, backend, caps) = {
         let active = app.loaded.lock().map_err(internal)?;
         let loaded = active.as_ref().ok_or_else(|| {
             let mut error = ApiError::new(
@@ -461,7 +582,7 @@ pub async fn transcriptions(
             }
             error
         })?;
-        if model_id != "default" && model_id != loaded.id {
+        if fields.model != "default" && fields.model != loaded.id {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
                 "model_not_active",
@@ -472,8 +593,26 @@ pub async fn transcriptions(
             loaded.model.clone(),
             loaded.id.clone(),
             loaded.diagnostic.clone(),
+            loaded.caps.clone(),
         )
     };
+
+    let parsed = ParsedRequest {
+        language: fields.language,
+        prompt: fields.prompt,
+        temperature: fields.temperature,
+        response_format: fields.response_format,
+        timestamp_granularities: fields.timestamp_granularities,
+    };
+    let tokenizer_model = model.clone();
+    let tokenize = move |text: &str| -> Option<usize> {
+        tokenizer_model
+            .tokenize(text)
+            .ok()
+            .map(|tokens| tokens.len())
+    };
+    let plan = build_plan(&parsed, &caps, endpoint, Some(&tokenize))?;
+
     let (permit, queue_wait_ms) = app.inference.acquire().await.map_err(|error| match error {
         crate::queue::QueueError::Full => ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -488,17 +627,17 @@ pub async fn transcriptions(
     })?;
     let cancellation = CancelToken::new();
     let _cancel_on_disconnect = CancelWhenDropped(cancellation.clone());
-    let inference_started = std::time::Instant::now();
-    let worker = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        let mut session = model.session().map_err(|error| error.to_string())?;
-        session.set_cancel_token(&cancellation);
-        session
-            .run(&pcm, &RunOptions::default())
-            .map(|result| result.text)
-            .map_err(|error| error.to_string())
-    });
-    let text = tokio::time::timeout(Duration::from_secs(180), worker)
+    let run_options = plan.to_run_options();
+    let inference_started = Instant::now();
+    let worker = tokio::task::spawn_blocking(
+        move || -> transcribe_cpp::Result<transcribe_cpp::Transcript> {
+            let _permit = permit;
+            let mut session = model.session()?;
+            session.set_cancel_token(&cancellation);
+            session.run(&pcm, &run_options)
+        },
+    );
+    let run_result = tokio::time::timeout(Duration::from_secs(180), worker)
         .await
         .map_err(|_| {
             ApiError::new(
@@ -507,22 +646,54 @@ pub async fn transcriptions(
                 "Inference exceeded the 180-second limit",
             )
         })?
-        .map_err(internal)?
-        .map_err(|error| {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "inference_failed", error)
-        })?;
+        .map_err(internal)?;
     let inference_ms = inference_started.elapsed().as_millis() as u64;
-    Ok(Json(json!({
-        "text":text,
-        "x_diagnostics": {
-            "queue_wait_ms": queue_wait_ms,
-            "inference_ms": inference_ms,
-            "audio_ms": audio_ms,
-            "model": active_id,
-            "backend": backend.observed_backend,
-            "fallback_reason": backend.fallback_reason,
-        }
-    })))
+
+    let (transcript, truncated) = match classify_run_result(run_result) {
+        RunOutcome::Success(transcript) => (transcript, false),
+        RunOutcome::Truncated(transcript) => (transcript, true),
+        RunOutcome::Failed(error) => return Err(error),
+    };
+
+    let language_evidence = LanguageEvidence::resolve(
+        plan.language_evidence_hint.as_deref(),
+        transcript.language.is_some(),
+    );
+    let extra = DiagnosticsExtra {
+        queue_wait_ms,
+        inference_ms,
+        audio_ms,
+        model: active_id,
+        backend: backend.observed_backend,
+        fallback_reason: backend.fallback_reason,
+        mel_ms: transcript.timings.mel_ms,
+        encode_ms: transcript.timings.encode_ms,
+        decode_ms: transcript.timings.decode_ms,
+        truncated,
+        prompt_applied: plan.initial_prompt.is_some(),
+        language_hint_applied: plan.language_hint_applied,
+        applied_language: plan.applied_language.clone(),
+        language_evidence,
+    };
+
+    let formatted = format_response(&transcript, &plan, samples, &extra);
+    Ok(formatted_into_response(formatted))
+}
+
+pub async fn transcriptions(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> ApiResult<Response> {
+    transcribe_or_translate(app, headers, multipart, Endpoint::Transcriptions).await
+}
+
+pub async fn translations(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> ApiResult<Response> {
+    transcribe_or_translate(app, headers, multipart, Endpoint::Translations).await
 }
 
 pub fn router(app: Arc<App>) -> Router {
@@ -536,6 +707,10 @@ pub fn router(app: Arc<App>) -> Router {
         .route(
             "/v1/audio/transcriptions",
             post(transcriptions).layer(DefaultBodyLimit::max(40 * 1024 * 1024)),
+        )
+        .route(
+            "/v1/audio/translations",
+            post(translations).layer(DefaultBodyLimit::max(40 * 1024 * 1024)),
         )
         .route("/v1/local/recommendations", get(recommendations))
         .route("/v1/local/config", get(get_config).patch(patch_config))
@@ -692,5 +867,172 @@ mod router_tests {
         drop(app);
         let resolved = path.canonicalize().unwrap();
         std::fs::remove_dir_all(resolved).unwrap();
+    }
+
+    /// A minimal valid WAV: 16 kHz mono 16-bit PCM, 200 ms of silence.
+    fn sample_wav_bytes() -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        {
+            let mut writer = hound::WavWriter::new(&mut cursor, spec).unwrap();
+            for _ in 0..3_200 {
+                writer.write_sample(0i16).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    /// Build a `multipart/form-data` body from text fields plus one `file`
+    /// field carrying `wav_bytes`. `text_fields` may repeat a key (e.g.
+    /// `timestamp_granularities`) to produce multiple parts with that name.
+    fn multipart_body(boundary: &str, text_fields: &[(&str, &str)], wav_bytes: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (name, value) in text_fields {
+            body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            body.extend_from_slice(
+                format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+            );
+            body.extend_from_slice(value.as_bytes());
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n",
+        );
+        body.extend_from_slice(b"Content-Type: audio/wav\r\n\r\n");
+        body.extend_from_slice(wav_bytes);
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        body
+    }
+
+    #[tokio::test]
+    async fn translations_without_token_is_unauthorized() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let router = router(app.clone());
+        let boundary = "X-BOUNDARY";
+        let body = multipart_body(boundary, &[("model", "default")], &sample_wav_bytes());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/translations")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn translations_with_token_and_no_model_loaded_is_server_not_ready() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let router = router(app.clone());
+        let boundary = "X-BOUNDARY";
+        let body = multipart_body(boundary, &[("model", "default")], &sample_wav_bytes());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/translations")
+            .header("authorization", format!("Bearer {token}"))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "server_not_ready");
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn transcriptions_unknown_field_is_422_before_model_check() {
+        // Validation order: multipart field-shape validation (unknown field)
+        // happens before the loaded-model / capability-aware planning check,
+        // so this is 422 even with no model loaded.
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let router = router(app.clone());
+        let boundary = "X-BOUNDARY";
+        let body = multipart_body(
+            boundary,
+            &[("model", "default"), ("vocabulary", "hello")],
+            &sample_wav_bytes(),
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", format!("Bearer {token}"))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "unsupported_capability");
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn transcriptions_duplicate_field_is_400() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let router = router(app.clone());
+        let boundary = "X-BOUNDARY";
+        let body = multipart_body(
+            boundary,
+            &[("model", "default"), ("model", "default")],
+            &sample_wav_bytes(),
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", format!("Bearer {token}"))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "duplicate_field");
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
     }
 }
