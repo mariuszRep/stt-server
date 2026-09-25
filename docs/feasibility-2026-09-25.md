@@ -239,3 +239,97 @@ Deviations/gaps: queue overflow (429 `queue_full`) confirmed only by unit test, 
 `whisper-tiny.en` install was started but not polled to completion before the run moved on to the
 queue/swap checks (Parakeet alone was sufficient for those). Language/prompt/translation/verbose
 output remain out of scope for this task, per instructions.
+
+## Real-model parity round — 2026-09-25
+
+HEAD `1fb0f107b72a4981bc97525a64c8e192597a39c7` (branch `codex/prototype`, clean). Built with
+`scripts\build-local.ps1 -Offline`; `s\release\stt-server-next.exe`, 65,990,144 bytes,
+SHA-256 `91a0a08f4c7446b02c841676a14a97092b72b71a3ddff135c4aad602bfa79fa6`. Fresh
+`STT_NEXT_DATA_DIR`, token from `auth.token`, server on `127.0.0.1:54321`. Models: Parakeet
+(`parakeet-unified-en-0.6b`) imported from the local fixture (size matched catalog `Q8_0`,
+731,357,568 bytes) via multipart import (HTTP 201, operation `completed`); `whisper-tiny`
+installed at `Q4_K_M` (smallest quant, 43,621,792 bytes) via the catalog installer (HTTP 202 →
+`completed`); `moonshine-streaming-tiny` installed at `Q8_0` (smallest quant, 50,462,816 bytes,
+HTTP 202 → `completed`). All three downloads/import completed without retries. Audio:
+`test-data\stereo48.wav` (English only; no non-English clip exists in the repo and none was
+synthesized, per instructions).
+
+### Results table
+
+| # | Scenario | Result |
+|---|---|---|
+| 1a | Parakeet select + capabilities | 200; `arch: parakeet`; `language_hint` supported (`["en"]` only); `language_detect`/`prompt`/`temperature`/`translation`/`streaming` unsupported (`reason: model_lacks`); `timestamp_granularity.max: token`; `catalog_mismatch`: `language_hint` and `timestamp_granularity` catalog=unsupported/effective=supported |
+| 1a | Parakeet transcribe json/text/verbose_json | All 200. Text: "Well, I don't wish to see it any more, observed Phoebe, turning away her eyes it is certainly very like the old portrait". verbose_json: 1 segment, `duration: 7.435`, `language: "en"`, `x_diagnostics.language_evidence: "model_constrained"`, `backend: "Vulkan0"` |
+| 1b | whisper-tiny select + capabilities | 200; `arch: whisper`; `language_hint` supported (99 languages incl. `en`); `prompt`/`temperature`/`language_detect`/`translation`/`timestamp_granularity` all supported (`max: segment`); `catalog_mismatch` lists all 6 of those controls as catalog=unsupported/effective=supported |
+| 1b | whisper-tiny transcribe json/text/verbose_json | All 200. Text: "Well, I don't wish to see it anymore, observe Phoebe, turning away her eyes. It is certainly very like the old portrait." verbose_json: 2 segments, `duration: 7.435`, `language: "en"`, `language_evidence: "model_detected"`, `backend: "Vulkan0"` |
+| 1c | moonshine-streaming-tiny select + capabilities | 200; `arch: moonshine_streaming`; `language_hint` supported (`["en"]` only); `prompt`/`temperature`/`language_detect`/`translation`/`streaming` unsupported (`model_lacks`); `timestamp_granularity.max: "none"` yet `status: "supported"` |
+| 1c | moonshine-streaming-tiny transcribe json/text | Both 200, same text as whisper-tiny's json output (near-identical wording) |
+| 1c | moonshine-streaming-tiny transcribe verbose_json | **HTTP 422** `engine_unsupported`: `"run: unsupported timestamp granularity (status 12)"` — see Bug 1 below |
+| 2 | whisper-tiny `language=en` | 200; `x_diagnostics.language_evidence: "user_selected"`, `language_hint_applied: true` |
+| 2 | whisper-tiny `language=auto` | 200; `language_evidence: "model_detected"`, `language: "en"`, no `language_hint_applied` key (falsy/omitted) |
+| 2 | whisper-tiny no language param | 200; same as `auto`: `language_evidence: "model_detected"` |
+| 2 | whisper-tiny `language=xx` (unsupported) | 200; falls back to `language_evidence: "model_detected"`/`language: "en"`; response omits an explicit `language_hint_applied: false` key rather than including it — see Bug 2 below |
+| 2 | whisper-tiny `prompt="Phoebe portrait"` | 200; `x_diagnostics.prompt_applied: true` |
+| 2 | whisper-tiny very long prompt (~3,600 words) | 200; `prompt_applied: true` — accepted, no engine rejection |
+| 2 | whisper-tiny `temperature=0.2` | 200 |
+| 2 | whisper-tiny `timestamp_granularities[]=word` | **HTTP 422** `unsupported_capability`: "This model does not support word-level timestamps" (matches `timestamp_granularity.max: segment`, as expected) |
+| 3 | Parakeet `prompt=x` | **HTTP 422** `unsupported_capability`: "This model does not support 'prompt'" |
+| 3 | Parakeet `language=de` | 200; falls back to `applied_language: "en"`, `language_evidence: "model_constrained"`; no explicit `language_hint_applied: false` key present (same shape as Bug 2) |
+| 3 | Parakeet `temperature=0.2` | **HTTP 422** `unsupported_capability`: "This model does not support 'temperature'" |
+| 4 | `/v1/audio/translations` whisper-tiny, no hint | 200; `task: "translate"`, text unchanged (source already English) |
+| 4 | `/v1/audio/translations` whisper-tiny, `language=en` | 200; **`task: "transcribe"`** (not `"translate"`) with `language_evidence: "translated_to_english"`, `language_hint_applied: true` — see Bug 3 below |
+| 4 | `/v1/audio/translations` Parakeet | **HTTP 422** `unsupported_capability`: "This model does not support translation" |
+| 5 | moonshine-streaming-tiny batch transcription | Transcribes correctly for `json`/`text` (matches whisper-tiny's output closely); fails for `verbose_json` (Bug 1) |
+| 6 | 4 concurrent Parakeet requests | All 200; `queue_wait_ms`: 0, 416, 794, 1159 (FIFO, monotonically increasing as expected); `inference_ms` 374–421 |
+
+### Bugs found (reproductions)
+
+**Bug 1 — moonshine-streaming-tiny rejects `response_format=verbose_json` with a raw engine error, not a clean capability error.**
+Effective capabilities report `timestamp_granularity.status: "supported"` (`max: "none"`) for
+this model, yet requesting `verbose_json` (which needs segment timestamps to populate
+`segments`) surfaces the engine's own failure instead of a `unsupported_capability` response.
+Repro:
+```
+curl -X POST http://127.0.0.1:54321/v1/audio/transcriptions \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file=@test-data/stereo48.wav" -F "model=moonshine-streaming-tiny" \
+  -F "response_format=verbose_json"
+# -> HTTP 422 {"error":{"code":"engine_unsupported","message":"run: unsupported timestamp granularity (status 12)"}}
+```
+(`json`/`text` on the same model, same audio, succeed with HTTP 200.)
+
+**Bug 2 — `language_hint_applied` is omitted (not `false`) when a hint isn't used.**
+Task expected an explicit `language_hint_applied: false` when a hint is unresolvable/unused
+(e.g. whisper-tiny `language=xx`, Parakeet `language=de`). In this build the key is absent from
+`x_diagnostics` entirely in that case rather than present with value `false` (it is present and
+`true` only when a hint was actually applied). Repro:
+```
+curl -X POST http://127.0.0.1:54321/v1/audio/transcriptions \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file=@test-data/stereo48.wav" -F "model=whisper-tiny" -F "language=xx" \
+  -F "response_format=json"
+# -> HTTP 200, x_diagnostics has no "language_hint_applied" key at all
+```
+
+**Bug 3 — `/v1/audio/translations` with `language=en` on an English-source clip reports `task: "transcribe"` instead of `"translate"`.**
+With no language hint, the same endpoint correctly reports `task: "translate"`. Adding
+`language=en` (source already matches the translation target) flips the reported task and
+`language_evidence` to `"translated_to_english"` — the output text is unaffected (unchanged from
+English), but the `task` field misrepresents which endpoint/operation was invoked. Repro:
+```
+curl -X POST http://127.0.0.1:54321/v1/audio/translations \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file=@test-data/stereo48.wav" -F "model=whisper-tiny" -F "language=en" \
+  -F "response_format=verbose_json"
+# -> HTTP 200, "task":"transcribe" (expected "translate")
+```
+
+### Skipped / not exercised
+
+- No non-English audio clip exists in the repo; language-detection accuracy on non-English
+  speech was not tested, and no speech audio was synthesized to fill the gap, per instructions.
+- SRT/VTT response formats, streaming, and Windows service install were out of scope for this
+  round and not touched.
+
+The server process and its temp data directory (imported/installed models, SQLite state, token)
+were stopped and deleted after the round; no other repos or `.projectflows` files were touched.
