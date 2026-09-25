@@ -71,8 +71,9 @@ impl DownloadFailure {
 /// Mirror URL shape: the catalog only publishes mirror *hosts* (e.g.
 /// `https://blob.handy.computer`), not a path template, so this mirrors the
 /// HuggingFace resolve path onto each mirror host
-/// (`{mirror}/{id}/{revision}/{filename}`). This is an assumption pending a
-/// real mirror to confirm against; see the task report.
+/// (`{mirror}/{id}/{revision}/{filename}`). This shape is confirmed by Handy
+/// (`src-tauri/src/catalog/mod.rs:29-30`, commit `8f9cf53`), which builds
+/// mirror URLs the same way.
 pub fn candidate_urls(model: &CatalogModel, file: &CatalogFile, mirrors: &[String]) -> Vec<String> {
     let mut urls = vec![format!(
         "https://huggingface.co/{}/resolve/{}/{}",

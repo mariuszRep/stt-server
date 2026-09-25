@@ -44,10 +44,34 @@ transfer, so a 48 GB file is never killed just for taking a long time); a `.part
 expected size skips the network and goes straight to hash verification; HTTP 416 discards the
 partial and restarts once; each source gets up to 3 attempts with 2s/5s/15s backoff before moving
 to the next; the catalog's `mirrors` (currently just `blob.handy.computer`) are tried after
-HuggingFace, in catalog order, with the assumed URL shape `{mirror}/{id}/{revision}/{filename}`
-(unconfirmed against a real mirror — see the feasibility doc); a disk-space preflight refuses to
+HuggingFace, in catalog order, with URL shape `{mirror}/{id}/{revision}/{filename}`, the same
+shape Handy uses (`src-tauri/src/catalog/mod.rs:29-30`, commit `8f9cf53`); a disk-space preflight
+refuses to
 start when free space is under `(remaining bytes) * 1.05 + 64 MiB`, failing the operation with
 `insufficient_disk_space`; progress is written to SQLite at most every 250 ms or 4 MiB.
+
+## Inference queue and model switching
+
+Exactly one transcription runs at a time, matching the single resident model. A request that
+arrives while another is running joins a bounded FIFO queue (`src/queue.rs`, 8 waiters by
+default) instead of failing immediately; a 9th concurrent waiter gets 429 `queue_full`, and a
+waiter that sits longer than 60s gets 503 `queue_timeout`. Multipart parsing, validation, and
+`decode_wav` all happen before a request joins the queue. If the client disconnects while queued
+or running, the handler future is dropped and the queue slot / cancellation token are released via
+RAII. A successful transcription's JSON response gets an additive `x_diagnostics` object:
+`queue_wait_ms`, `inference_ms`, `audio_ms` (post-resample duration at 16 kHz), `model`, `backend`,
+and `fallback_reason`.
+
+`POST /v1/local/models/{id}/select` (and its `/load` alias) no longer holds the inference slot
+while the new model loads: the old model keeps serving in-flight and newly queued transcriptions
+off its already-loaded handle while the new model loads on a blocking thread, and only the final
+swap of `app.loaded` is briefly exclusive. A failed load leaves the previous selection in place.
+Note that both models are briefly resident in memory during the swap window; this is accepted as
+a tradeoff for non-blocking switching. `DELETE /v1/local/models/selected` now waits up to 30s for
+a running inference to finish before unloading, returning 409 `model_in_use` only if that timeout
+elapses. When transcription's readiness check fails (`server_not_ready`), the error includes
+`error.details.operation_id` when an install/import/verify operation is currently queued or
+running.
 
 ## CORS
 

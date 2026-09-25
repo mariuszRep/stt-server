@@ -23,6 +23,28 @@ impl Drop for CancelWhenDropped {
     }
 }
 
+/// Load a new value with `loader` on a blocking thread, then swap it into
+/// `slot` under a brief lock. `slot` holds its old value (still readable and
+/// clonable by anyone who locked it before this call) for the whole load,
+/// and is only ever locked for the instant of the swap. On a failed load,
+/// `slot` is left untouched and the error is returned. This is the generic
+/// shape behind `select_model`'s non-blocking model switch, factored out so
+/// it can be unit tested with a fake loader instead of a real `Model`.
+pub async fn load_and_swap<T, E>(
+    slot: &std::sync::Mutex<Option<T>>,
+    loader: impl FnOnce() -> Result<T, E> + Send + 'static,
+) -> Result<(), E>
+where
+    T: Send + 'static,
+    E: Send + 'static,
+{
+    let new_value = tokio::task::spawn_blocking(loader)
+        .await
+        .expect("loader task panicked")?;
+    *slot.lock().expect("swap slot poisoned") = Some(new_value);
+    Ok(())
+}
+
 pub fn load_engine(path: &Path, preference: &str) -> Result<(Model, BackendDiagnostic), String> {
     if preference != "cpu" && backend_available(Backend::Vulkan) {
         match Model::load_with(
@@ -80,4 +102,28 @@ pub fn load_engine(path: &Path, preference: &str) -> Result<(Model, BackendDiagn
             },
         },
     ))
+}
+
+#[cfg(test)]
+mod swap_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn old_value_is_served_until_swap_completes() {
+        let slot: Mutex<Option<i32>> = Mutex::new(Some(1));
+        // Snapshot the old value the way a request would, before the swap.
+        let old = *slot.lock().unwrap().as_ref().unwrap();
+        assert_eq!(old, 1);
+        load_and_swap::<i32, String>(&slot, || Ok(2)).await.unwrap();
+        assert_eq!(*slot.lock().unwrap(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn failed_load_keeps_the_old_selection() {
+        let slot: Mutex<Option<i32>> = Mutex::new(Some(1));
+        let result = load_and_swap::<i32, String>(&slot, || Err("boom".to_owned())).await;
+        assert_eq!(result, Err("boom".to_owned()));
+        assert_eq!(*slot.lock().unwrap(), Some(1));
+    }
 }

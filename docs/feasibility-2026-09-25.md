@@ -188,3 +188,54 @@ Deviations/gaps: the mirror URL path template is an unconfirmed assumption (see 
 disk-full path is unit-tested only; a genuinely slow/throttled link was not available to observe
 a non-zero resume offset over real network E2E (covered by unit test instead). The server
 process and its temp data directory used for this run were both stopped/deleted afterward.
+
+## Bounded FIFO inference queue and non-blocking model switch — 2026-09-25 (update)
+
+Replaced the try-acquire-or-429 inference semaphore with `src/queue.rs`, a single-permit
+`InferenceQueue`: one transcription runs at a time; up to 8 requests wait FIFO (tokio's
+`Semaphore` is FIFO-fair); a 9th waiter gets 429 `queue_full`; a waiter stuck longer than 60s
+gets 503 `queue_timeout`. The waiting count is a plain atomic incremented before the wait and
+decremented by an RAII guard, so a dropped/cancelled waiter (client disconnect) always frees its
+slot — verified with a unit test that aborts a waiting task and confirms the counter returns to 0
+and the next waiter proceeds. `select_model` no longer holds the inference permit while loading:
+it loads the new model via `spawn_blocking` while `app.loaded` still holds the old one (readable
+and clonable by any request that locked it first), then swaps `app.loaded` under a brief
+std-mutex lock; a failed load never touches `app.loaded`, so the old selection stays active. The
+general load-then-swap shape is factored into `engine::load_and_swap<T, E>` and unit-tested with
+a fake (`i32`) loader, independent of any real `Model`. `deselect_model` now waits up to 30s for a
+running inference to finish (acquiring the same semaphore with a timeout) instead of failing
+instantly with `try_acquire`, returning 409 `model_in_use` only on that timeout. Transcription
+responses gained an additive `x_diagnostics` object (`queue_wait_ms`, `inference_ms`, `audio_ms`,
+`model`, `backend`, `fallback_reason`); `server_not_ready` gained an optional
+`error.details.operation_id` naming an active install/import/verify operation, via a new
+`ApiError::with_details` that only serializes `details` when set. The mirror URL comment's
+"unconfirmed assumption" wording was replaced with a confirmed reference to Handy
+(`src-tauri/src/catalog/mod.rs:29-30`, commit `8f9cf53`), which builds mirror URLs the same way.
+
+Gates: `cargo fmt --check` clean; `cargo clippy --release --all-targets --offline -- -D warnings`
+clean; `cargo test --release --offline` — 53 passed (45 pre-existing + 8 new: 4 queue tests, 2
+swap tests, 2 `ApiError::details` tests), 0 failed. `scripts\build-local.ps1 -Offline` built
+`s\release\stt-server-next.exe`, 65,555,456 bytes,
+SHA-256 `f9d934567837b9c977278ced0410cd0a83316f689c413acf508d5b29bf2ca5db`.
+
+Real E2E on a fresh `STT_NEXT_DATA_DIR`: imported the Parakeet fixture (HTTP 201, operation
+completed), started installing `whisper-tiny.en` quant `Q4_K_M`, selected Parakeet
+(`observed_backend: "Vulkan0"`). Fired 4 concurrent transcriptions of `test-data/stereo48.wav`
+(`model=default`) via backgrounded curl processes: all HTTP 200, `queue_wait_ms` of 0, 470, 831,
+1193 ms respectively (FIFO ordering, later requests waiting longer as expected), `inference_ms`
+in the 380-470ms range. Started a transcription, then immediately called
+`POST .../whisper-tiny.en/select` while it was still running: the select call returned in 0.15s
+(HTTP 200) while the in-flight transcription (0.94s total) completed on Parakeet
+(`x_diagnostics.model: "parakeet-unified-en-0.6b"`); a following transcription reported
+`x_diagnostics.model: "whisper-tiny.en"`, confirming the swap only affects new requests.
+`DELETE /v1/local/models/selected` then `GET /readiness` returned 503 `not_ready`. Queue-overflow
+(10+ concurrent requests to force `queue_full`) was not exercised live in this run — the
+transcriptions here run in ~0.4-1.2s, so reliably stacking 9+ waiters behind one running request
+over real HTTP would need a much longer/looped clip; this path is instead covered by the unit
+test `queue::tests::ninth_waiter_gets_queue_full`. The server process and its temp data directory
+were both stopped/deleted afterward.
+
+Deviations/gaps: queue overflow (429 `queue_full`) confirmed only by unit test, not live E2E;
+`whisper-tiny.en` install was started but not polled to completion before the run moved on to the
+queue/swap checks (Parakeet alone was sufficient for those). Language/prompt/translation/verbose
+output remain out of scope for this task, per instructions.
