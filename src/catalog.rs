@@ -46,6 +46,10 @@ pub struct CatalogModel {
 
 #[derive(Deserialize)]
 pub struct Catalog {
+    /// Fallback download hosts, tried in catalog order after HuggingFace when
+    /// the primary source fails. Empty for catalogs that don't publish any.
+    #[serde(default)]
+    pub mirrors: Vec<String>,
     pub models: Vec<CatalogModel>,
 }
 

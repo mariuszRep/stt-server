@@ -16,6 +16,9 @@ use crate::engine::{load_engine, LoadedModel};
 
 pub struct App {
     pub catalog: Vec<CatalogModel>,
+    /// Fallback download hosts from the catalog, tried in order after
+    /// HuggingFace (see `download::candidate_urls`).
+    pub mirrors: Vec<String>,
     pub db: Mutex<Connection>,
     pub loaded: Mutex<Option<LoadedModel>>,
     pub data_dir: PathBuf,
@@ -206,15 +209,18 @@ pub fn open_app_at(data_dir: PathBuf) -> Result<Arc<App>, Box<dyn Error>> {
     });
     Ok(Arc::new(App {
         catalog: catalog.models,
+        mirrors: catalog.mirrors,
         db: Mutex::new(db),
         loaded: Mutex::new(loaded),
         data_dir,
         token,
         inference: Arc::new(Semaphore::new(1)),
         selection: tokio::sync::Mutex::new(()),
+        // No blanket total-request timeout: a 48 GB model download must not
+        // be killed just because it is still progressing. Staleness is
+        // instead bounded per-chunk by download::STALL_TIMEOUT.
         http: reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(20))
-            .timeout(Duration::from_secs(3600))
             .build()?,
     }))
 }

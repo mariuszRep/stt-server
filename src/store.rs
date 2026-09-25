@@ -9,7 +9,7 @@ use crate::app::App;
 use crate::catalog::{CatalogFile, CatalogModel};
 use crate::errors::{internal, ApiResult};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+pub const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -62,6 +62,51 @@ pub fn selected_id(app: &App) -> ApiResult<Option<String>> {
     )
     .optional()
     .map_err(internal)
+}
+
+/// Default CORS origin list when the setting has never been written.
+pub fn default_cors_origins() -> Vec<String> {
+    vec!["*".to_owned()]
+}
+
+/// Pure validation: an origin is either the wildcard `*` or an
+/// `http(s)://host[:port]` origin with no path/query/fragment/credentials.
+pub fn is_valid_cors_origin(origin: &str) -> bool {
+    if origin == "*" {
+        return true;
+    }
+    let Some(rest) = origin
+        .strip_prefix("https://")
+        .or_else(|| origin.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    if rest.is_empty() || rest.contains('/') || rest.contains('@') || rest.contains(' ') {
+        return false;
+    }
+    let host_part = rest.rsplit_once(':').map_or(rest, |(host, port)| {
+        if port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+            return rest;
+        }
+        host
+    });
+    !host_part.is_empty()
+}
+
+pub fn cors_allowed_origins(app: &App) -> ApiResult<Vec<String>> {
+    let db = app.db.lock().map_err(internal)?;
+    let raw: Option<String> = db
+        .query_row(
+            "SELECT value FROM settings WHERE key='cors_allowed_origins'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(internal)?;
+    match raw {
+        Some(value) => serde_json::from_str(&value).map_err(internal),
+        None => Ok(default_cors_origins()),
+    }
 }
 
 pub fn backend_preference(app: &App) -> ApiResult<String> {
@@ -162,11 +207,22 @@ fn backup_db(data_dir: &Path, from_version: i64) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Machine-readable error codes surfaced on operation records. Kept as an
+/// explicit list (rather than free-form strings) so API consumers can match
+/// on them without parsing the human-readable message.
+pub const ERROR_CODE_INSUFFICIENT_DISK_SPACE: &str = "insufficient_disk_space";
+pub const ERROR_CODE_STALLED: &str = "stalled";
+pub const ERROR_CODE_SOURCE_UNAVAILABLE: &str = "source_unavailable";
+pub const ERROR_CODE_HASH_MISMATCH: &str = "hash_mismatch";
+pub const ERROR_CODE_CANCELLED: &str = "cancelled";
+
 /// Run all pending schema migrations in one transaction. v1 is today's
 /// unversioned schema (settings, installed(id,path,sha256),
 /// operations(...progress_bytes,total_bytes)). v2 adds installed
 /// quant/filename/size_bytes (backfilled by sha256 match against the
 /// catalog) and operation timestamps created_at/updated_at/finished_at.
+/// v3 adds operations.error_code, a machine-readable companion to the
+/// existing free-text error message (see store::ERROR_CODE_*).
 /// A non-empty older DB is backed up to state.db.bak-v<old> first.
 pub fn migrate(
     conn: &mut Connection,
@@ -181,6 +237,9 @@ pub fn migrate(
     if had_pre_existing_schema {
         conn.execute_batch("PRAGMA wal_checkpoint(FULL);")?;
         backup_db(data_dir, 1)?;
+    } else if version > 0 && version < CURRENT_SCHEMA_VERSION {
+        conn.execute_batch("PRAGMA wal_checkpoint(FULL);")?;
+        backup_db(data_dir, version)?;
     }
     let now = now_ms();
     let tx = conn.transaction()?;
@@ -219,6 +278,9 @@ pub fn migrate(
                 [],
             )?;
         }
+    }
+    if !column_exists(&tx, "operations", "error_code")? {
+        tx.execute("ALTER TABLE operations ADD COLUMN error_code TEXT", [])?;
     }
     {
         let mut statement = tx.prepare("SELECT id, sha256 FROM installed WHERE quant IS NULL")?;
@@ -423,6 +485,64 @@ mod tests {
         assert!(installed.quant.is_none());
         drop(conn);
         cleanup(path);
+    }
+
+    /// Simulates a v2 DB (as produced by the pre-hardening binary: no
+    /// error_code column) and confirms the v2->v3 migration adds it, backs up
+    /// state.db.bak-v2, and leaves existing rows' error_code NULL.
+    #[test]
+    fn migration_from_v2_adds_error_code_and_backs_up() {
+        let path = temp_dir();
+        fs::create_dir_all(&path).unwrap();
+        let db_path = path.join("state.db");
+        let catalog = make_catalog();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE installed(id TEXT PRIMARY KEY, path TEXT NOT NULL, sha256 TEXT NOT NULL, quant TEXT, filename TEXT, size_bytes INTEGER);
+                 CREATE TABLE operations(id TEXT PRIMARY KEY, model_id TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL, error TEXT, progress_bytes INTEGER NOT NULL DEFAULT 0, total_bytes INTEGER NOT NULL DEFAULT 0, created_at INTEGER, updated_at INTEGER, finished_at INTEGER);
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+            let op = Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO operations(id,model_id,kind,state,error,progress_bytes,total_bytes,created_at,updated_at,finished_at) VALUES(?1,'parakeet-unified-en-0.6b','install','failed','boom',0,10,1,1,1)",
+                params![op],
+            )
+            .unwrap();
+        }
+        let mut conn = Connection::open(&db_path).unwrap();
+        migrate(&mut conn, &catalog, &path).unwrap();
+        assert_eq!(user_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
+        assert!(path.join("state.db.bak-v2").exists());
+        assert!(column_exists(&conn, "operations", "error_code").unwrap());
+        let error_code: Option<String> = conn
+            .query_row("SELECT error_code FROM operations LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(error_code.is_none());
+        drop(conn);
+        cleanup(path);
+    }
+
+    #[test]
+    fn cors_origin_validation_accepts_wildcard_and_http_https_host_port() {
+        assert!(is_valid_cors_origin("*"));
+        assert!(is_valid_cors_origin("http://tauri.localhost"));
+        assert!(is_valid_cors_origin("https://example.com:8443"));
+        assert!(is_valid_cors_origin("http://127.0.0.1:1420"));
+    }
+
+    #[test]
+    fn cors_origin_validation_rejects_paths_schemes_and_garbage() {
+        assert!(!is_valid_cors_origin("ftp://example.com"));
+        assert!(!is_valid_cors_origin("http://example.com/path"));
+        assert!(!is_valid_cors_origin("example.com"));
+        assert!(!is_valid_cors_origin(""));
+        assert!(!is_valid_cors_origin("http://"));
+        assert!(!is_valid_cors_origin("http://user@example.com"));
     }
 
     #[test]
