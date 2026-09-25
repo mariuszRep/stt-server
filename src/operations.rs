@@ -64,6 +64,20 @@ pub fn operation_state(app: &App, id: &str) -> ApiResult<Option<String>> {
     .map_err(internal)
 }
 
+/// The id of an active (queued or running) install/import/verify operation,
+/// if one exists. Used to enrich `server_not_ready` errors so a client can
+/// poll something concrete instead of guessing.
+pub fn active_operation_id(app: &App) -> ApiResult<Option<String>> {
+    let db = app.db.lock().map_err(internal)?;
+    db.query_row(
+        "SELECT id FROM operations WHERE state IN ('queued','running') ORDER BY updated_at DESC LIMIT 1",
+        [],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(internal)
+}
+
 pub async fn operation(
     State(app): State<Arc<App>>,
     UrlPath(id): UrlPath<String>,

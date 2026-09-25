@@ -8,6 +8,7 @@ pub mod engine;
 pub mod errors;
 pub mod import;
 pub mod operations;
+pub mod queue;
 #[cfg(windows)]
 pub mod service;
 pub mod store;

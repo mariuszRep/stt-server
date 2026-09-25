@@ -235,19 +235,29 @@ pub async fn selected_model(
     })))
 }
 
+/// How long `deselect_model` waits for an in-flight transcription to finish
+/// before giving up with `model_in_use`.
+const DESELECT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub async fn deselect_model(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     authorized(&headers, &app)?;
     let _selection = app.selection.lock().await;
-    let _inference = app.inference.clone().try_acquire_owned().map_err(|_| {
+    let _inference = tokio::time::timeout(
+        DESELECT_WAIT_TIMEOUT,
+        app.inference.semaphore().acquire_owned(),
+    )
+    .await
+    .map_err(|_| {
         ApiError::new(
             StatusCode::CONFLICT,
             "model_in_use",
-            "Inference must finish before unloading the model",
+            "Inference did not finish before the unload timeout",
         )
-    })?;
+    })?
+    .map_err(internal)?;
     {
         let db = app.db.lock().map_err(internal)?;
         db.execute("DELETE FROM settings WHERE key='selected_model'", [])
@@ -263,13 +273,16 @@ pub async fn select_model(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     authorized(&headers, &app)?;
+    // The selection lock only serializes concurrent selections; it is never
+    // held across the (possibly slow) model load, and the inference permit
+    // is never taken here at all. The old model, still referenced by
+    // `app.loaded`, keeps serving in-flight and newly queued transcriptions
+    // while the new one loads in a blocking thread. Only the brief swap of
+    // `app.loaded` below is exclusive, so dictation is never blocked for the
+    // duration of a model load. Note: while both are resident (between the
+    // new model finishing its load and the swap), memory usage is briefly
+    // the sum of both models -- acceptable per README.
     let _selection = app.selection.lock().await;
-    let _inference = app
-        .inference
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(internal)?;
     catalog_model(&app, &id)?;
     let path = installed_path(&app, &id)?.ok_or_else(|| {
         ApiError::new(
@@ -279,6 +292,11 @@ pub async fn select_model(
         )
     })?;
     let preference = backend_preference(&app)?;
+    let loader_id = id.clone();
+    // Load off the async runtime, then swap the whole `LoadedModel` in one
+    // lock (the same shape as `engine::load_and_swap`, tested generically
+    // there with a fake loader). The old model is never locked out and keeps
+    // serving until this swap.
     let (model, diagnostic) = tokio::task::spawn_blocking(move || load_engine(&path, &preference))
         .await
         .map_err(internal)?
@@ -292,7 +310,7 @@ pub async fn select_model(
         .map_err(internal)?;
     }
     *app.loaded.lock().map_err(internal)? = Some(LoadedModel {
-        id: id.clone(),
+        id: loader_id,
         model,
         diagnostic: diagnostic.clone(),
     });
@@ -426,15 +444,22 @@ pub async fn transcriptions(
     let file = fields.get("file").ok_or_else(|| {
         ApiError::new(StatusCode::BAD_REQUEST, "missing_file", "file is required")
     })?;
+    // Decode/validate happens before joining the queue (above); only the
+    // actual inference run below waits for a turn.
     let pcm = decode_wav(file)?;
-    let model = {
+    let audio_ms = (pcm.len() as u64 * 1000) / 16_000;
+    let (model, active_id, backend) = {
         let active = app.loaded.lock().map_err(internal)?;
         let loaded = active.as_ref().ok_or_else(|| {
-            ApiError::new(
+            let mut error = ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "server_not_ready",
                 "No model loaded",
-            )
+            );
+            if let Ok(Some(operation_id)) = crate::operations::active_operation_id(&app) {
+                error = error.with_details(json!({"operation_id": operation_id}));
+            }
+            error
         })?;
         if model_id != "default" && model_id != loaded.id {
             return Err(ApiError::new(
@@ -443,17 +468,27 @@ pub async fn transcriptions(
                 "The requested model is not active",
             ));
         }
-        loaded.model.clone()
-    };
-    let permit = app.inference.clone().try_acquire_owned().map_err(|_| {
-        ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "inference_busy",
-            "Inference is busy",
+        (
+            loaded.model.clone(),
+            loaded.id.clone(),
+            loaded.diagnostic.clone(),
         )
+    };
+    let (permit, queue_wait_ms) = app.inference.acquire().await.map_err(|error| match error {
+        crate::queue::QueueError::Full => ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "queue_full",
+            "Too many transcriptions are already waiting",
+        ),
+        crate::queue::QueueError::Timeout => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "queue_timeout",
+            "Timed out waiting for a turn in the inference queue",
+        ),
     })?;
     let cancellation = CancelToken::new();
     let _cancel_on_disconnect = CancelWhenDropped(cancellation.clone());
+    let inference_started = std::time::Instant::now();
     let worker = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let mut session = model.session().map_err(|error| error.to_string())?;
@@ -476,7 +511,18 @@ pub async fn transcriptions(
         .map_err(|error| {
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "inference_failed", error)
         })?;
-    Ok(Json(json!({"text":text})))
+    let inference_ms = inference_started.elapsed().as_millis() as u64;
+    Ok(Json(json!({
+        "text":text,
+        "x_diagnostics": {
+            "queue_wait_ms": queue_wait_ms,
+            "inference_ms": inference_ms,
+            "audio_ms": audio_ms,
+            "model": active_id,
+            "backend": backend.observed_backend,
+            "fallback_reason": backend.fallback_reason,
+        }
+    })))
 }
 
 pub fn router(app: Arc<App>) -> Router {

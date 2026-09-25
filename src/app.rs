@@ -8,11 +8,11 @@ use std::{
 };
 
 use rusqlite::{params, Connection, OptionalExtension};
-use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::catalog::{Catalog, CatalogModel};
 use crate::engine::{load_engine, LoadedModel};
+use crate::queue::InferenceQueue;
 
 pub struct App {
     pub catalog: Vec<CatalogModel>,
@@ -23,7 +23,8 @@ pub struct App {
     pub loaded: Mutex<Option<LoadedModel>>,
     pub data_dir: PathBuf,
     pub token: String,
-    pub inference: Arc<Semaphore>,
+    /// Bounded FIFO queue for the single inference slot; see `crate::queue`.
+    pub inference: InferenceQueue,
     pub selection: tokio::sync::Mutex<()>,
     pub http: reqwest::Client,
 }
@@ -214,7 +215,7 @@ pub fn open_app_at(data_dir: PathBuf) -> Result<Arc<App>, Box<dyn Error>> {
         loaded: Mutex::new(loaded),
         data_dir,
         token,
-        inference: Arc::new(Semaphore::new(1)),
+        inference: InferenceQueue::new(),
         selection: tokio::sync::Mutex::new(()),
         // No blanket total-request timeout: a 48 GB model download must not
         // be killed just because it is still progressing. Staleness is
