@@ -4,12 +4,23 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
+use serde_json::Value;
 
 use crate::app::{App, RuntimeLimits};
 use crate::catalog::{CatalogFile, CatalogModel};
 use crate::errors::{internal, ApiResult};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 3;
+pub const CURRENT_SCHEMA_VERSION: i64 = 4;
+
+/// Source of an installed model row (v4). See "Integration rules" in the
+/// drop-in models design: catalog/import rows backfill sensibly, new rows
+/// created by `/v1/local/models/refresh` are always `user_folder`.
+pub const SOURCE_CATALOG_DOWNLOAD: &str = "catalog_download";
+pub const SOURCE_IMPORT: &str = "import";
+pub const SOURCE_USER_FOLDER: &str = "user_folder";
+
+/// Settings key for the user-writable drop-in models folder (v4).
+pub const SETTING_USER_MODELS_DIR: &str = "user_models_dir";
 
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -20,11 +31,26 @@ pub fn now_ms() -> i64 {
 
 #[derive(Debug, Clone)]
 pub struct InstalledFile {
+    pub id: String,
     pub path: PathBuf,
     pub sha256: String,
     pub quant: Option<String>,
     pub filename: Option<String>,
     pub size_bytes: Option<u64>,
+    /// `catalog_download`, `import`, or `user_folder` (v4).
+    pub source: String,
+    pub custom_name: Option<String>,
+    pub custom_arch: Option<String>,
+    pub custom_languages: Option<Vec<String>>,
+    pub custom_claims: Option<Value>,
+    pub mtime_ms: Option<i64>,
+    pub needs_verification: bool,
+}
+
+impl InstalledFile {
+    pub fn is_custom(&self) -> bool {
+        self.custom_arch.is_some()
+    }
 }
 
 pub fn installed_file(app: &App, id: &str) -> ApiResult<Option<InstalledFile>> {
@@ -32,21 +58,76 @@ pub fn installed_file(app: &App, id: &str) -> ApiResult<Option<InstalledFile>> {
     query_installed_file(&db, id).map_err(internal)
 }
 
+pub fn all_installed(app: &App) -> ApiResult<Vec<InstalledFile>> {
+    let db = app.db.lock().map_err(internal)?;
+    let mut statement = db.prepare("SELECT id FROM installed").map_err(internal)?;
+    let ids = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(internal)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(internal)?;
+    drop(statement);
+    ids.into_iter()
+        .map(|id| {
+            query_installed_file(&db, &id)
+                .map_err(internal)
+                .map(|row| row.expect("row just listed by id"))
+        })
+        .collect()
+}
+
 fn query_installed_file(db: &Connection, id: &str) -> rusqlite::Result<Option<InstalledFile>> {
     db.query_row(
-        "SELECT path, sha256, quant, filename, size_bytes FROM installed WHERE id = ?1",
+        "SELECT path, sha256, quant, filename, size_bytes, source, custom_name, custom_arch, custom_languages, custom_claims, mtime_ms, needs_verification FROM installed WHERE id = ?1",
         params![id],
         |row| {
+            let custom_languages: Option<String> = row.get(8)?;
+            let custom_claims: Option<String> = row.get(9)?;
             Ok(InstalledFile {
+                id: id.to_owned(),
                 path: PathBuf::from(row.get::<_, String>(0)?),
                 sha256: row.get(1)?,
                 quant: row.get(2)?,
                 filename: row.get(3)?,
                 size_bytes: row.get::<_, Option<i64>>(4)?.map(|value| value as u64),
+                source: row.get(5)?,
+                custom_name: row.get(6)?,
+                custom_arch: row.get(7)?,
+                custom_languages: custom_languages
+                    .and_then(|value| serde_json::from_str(&value).ok()),
+                custom_claims: custom_claims.and_then(|value| serde_json::from_str(&value).ok()),
+                mtime_ms: row.get(10)?,
+                needs_verification: row.get::<_, i64>(11)? != 0,
             })
         },
     )
     .optional()
+}
+
+/// Read the persisted `user_models_dir` setting (v4), unvalidated.
+pub fn user_models_dir_setting(app: &App) -> ApiResult<Option<String>> {
+    let db = app.db.lock().map_err(internal)?;
+    db.query_row(
+        "SELECT value FROM settings WHERE key=?1",
+        params![SETTING_USER_MODELS_DIR],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(internal)
+}
+
+/// Store a JSON `result` blob on a finished operation (v4). Best-effort:
+/// errors are surfaced to the caller but never block the operation's own
+/// state transition.
+pub fn set_operation_result(app: &App, operation_id: &str, result: &Value) -> ApiResult<()> {
+    let db = app.db.lock().map_err(internal)?;
+    let serialized = serde_json::to_string(result).map_err(internal)?;
+    db.execute(
+        "UPDATE operations SET result=?2 WHERE id=?1",
+        params![operation_id, serialized],
+    )
+    .map_err(internal)?;
+    Ok(())
 }
 
 pub fn installed_path(app: &App, id: &str) -> ApiResult<Option<PathBuf>> {
@@ -176,6 +257,28 @@ pub fn promote_verified_model(
     stage: &Path,
     bytes: u64,
 ) -> Result<(), String> {
+    promote_verified_model_with_source(
+        app,
+        operation_id,
+        model_id,
+        file,
+        stage,
+        bytes,
+        SOURCE_CATALOG_DOWNLOAD,
+    )
+}
+
+/// Same as [`promote_verified_model`], but records an explicit `source`
+/// (`catalog_download` or `import`).
+pub fn promote_verified_model_with_source(
+    app: &App,
+    operation_id: &str,
+    model_id: &str,
+    file: &CatalogFile,
+    stage: &Path,
+    bytes: u64,
+    source: &str,
+) -> Result<(), String> {
     let destination = app
         .data_dir
         .join("models")
@@ -194,14 +297,15 @@ pub fn promote_verified_model(
     }
     transaction
         .execute(
-            "INSERT INTO installed(id,path,sha256,quant,filename,size_bytes) VALUES(?1,?2,?3,?4,?5,?6)",
+            "INSERT INTO installed(id,path,sha256,quant,filename,size_bytes,source) VALUES(?1,?2,?3,?4,?5,?6,?7)",
             params![
                 model_id,
                 destination.to_string_lossy().as_ref(),
                 file.sha256,
                 file.quant,
                 file.filename,
-                file.size_bytes as i64
+                file.size_bytes as i64,
+                source,
             ],
         )
         .map_err(|error| error.to_string())?;
@@ -268,6 +372,9 @@ pub const ERROR_CODE_CANCELLED: &str = "cancelled";
 /// catalog) and operation timestamps created_at/updated_at/finished_at.
 /// v3 adds operations.error_code, a machine-readable companion to the
 /// existing free-text error message (see store::ERROR_CODE_*).
+/// v4 adds installed.source/custom_name/custom_arch/custom_languages/
+/// custom_claims/mtime_ms/needs_verification (drop-in user-folder models,
+/// see `crate::dropin`) and operations.progress_items/total_items/result.
 /// A non-empty older DB is backed up to state.db.bak-v<old> first.
 pub fn migrate(
     conn: &mut Connection,
@@ -327,6 +434,58 @@ pub fn migrate(
     if !column_exists(&tx, "operations", "error_code")? {
         tx.execute("ALTER TABLE operations ADD COLUMN error_code TEXT", [])?;
     }
+    // v4: model sources (drop-in support) and durable operation results.
+    if !column_exists(&tx, "installed", "source")? {
+        tx.execute(
+            "ALTER TABLE installed ADD COLUMN source TEXT NOT NULL DEFAULT 'catalog_download'",
+            [],
+        )?;
+    }
+    for column in [
+        "custom_name",
+        "custom_arch",
+        "custom_languages",
+        "custom_claims",
+    ] {
+        if !column_exists(&tx, "installed", column)? {
+            tx.execute(
+                &format!("ALTER TABLE installed ADD COLUMN {column} TEXT"),
+                [],
+            )?;
+        }
+    }
+    if !column_exists(&tx, "installed", "mtime_ms")? {
+        tx.execute("ALTER TABLE installed ADD COLUMN mtime_ms INTEGER", [])?;
+    }
+    if !column_exists(&tx, "installed", "needs_verification")? {
+        tx.execute(
+            "ALTER TABLE installed ADD COLUMN needs_verification INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    for (column, ddl) in [
+        (
+            "progress_items",
+            "ALTER TABLE operations ADD COLUMN progress_items INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "total_items",
+            "ALTER TABLE operations ADD COLUMN total_items INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("result", "ALTER TABLE operations ADD COLUMN result TEXT"),
+    ] {
+        if !column_exists(&tx, "operations", column)? {
+            tx.execute(ddl, [])?;
+        }
+    }
+    // Backfill existing rows sensibly: a row promoted by a completed `import`
+    // operation is `import`; everything else defaults to `catalog_download`
+    // via the column default above (drop-in `user_folder` rows are only ever
+    // created going forward, by refresh).
+    tx.execute(
+        "UPDATE installed SET source='import' WHERE source='catalog_download' AND id IN (SELECT model_id FROM operations WHERE kind='import' AND state='completed')",
+        [],
+    )?;
     {
         let mut statement = tx.prepare("SELECT id, sha256 FROM installed WHERE quant IS NULL")?;
         let rows: Vec<(String, String)> = statement
@@ -568,6 +727,80 @@ mod tests {
             })
             .unwrap();
         assert!(error_code.is_none());
+        drop(conn);
+        cleanup(path);
+    }
+
+    /// Simulates a v3 DB (as produced by the pre-drop-in binary: no
+    /// source/custom_*/mtime_ms/needs_verification on `installed`, no
+    /// progress_items/total_items/result on `operations`) and confirms the
+    /// v3->v4 migration adds them, backs up state.db.bak-v3, backfills an
+    /// `import`-sourced row from its completed operation, and defaults an
+    /// ordinary row to `catalog_download`.
+    #[test]
+    fn migration_from_v3_adds_drop_in_columns_and_backfills_source() {
+        let path = temp_dir();
+        fs::create_dir_all(&path).unwrap();
+        let db_path = path.join("state.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE installed(id TEXT PRIMARY KEY, path TEXT NOT NULL, sha256 TEXT NOT NULL, quant TEXT, filename TEXT, size_bytes INTEGER);
+                 CREATE TABLE operations(id TEXT PRIMARY KEY, model_id TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL, error TEXT, error_code TEXT, progress_bytes INTEGER NOT NULL DEFAULT 0, total_bytes INTEGER NOT NULL DEFAULT 0, created_at INTEGER, updated_at INTEGER, finished_at INTEGER);
+                 PRAGMA user_version = 3;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO installed(id,path,sha256,quant,filename,size_bytes) VALUES('imported-model','/tmp/imported.gguf','deadbeef',NULL,'imported.gguf',10)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO installed(id,path,sha256,quant,filename,size_bytes) VALUES('parakeet-unified-en-0.6b','/tmp/downloaded.gguf','feedface','Q8_0','model.gguf',20)",
+                [],
+            )
+            .unwrap();
+            let op = Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO operations(id,model_id,kind,state,progress_bytes,total_bytes,created_at,updated_at,finished_at) VALUES(?1,'imported-model','import','completed',10,10,1,1,1)",
+                params![op],
+            )
+            .unwrap();
+        }
+        let catalog = make_catalog();
+        let mut conn = Connection::open(&db_path).unwrap();
+        migrate(&mut conn, &catalog, &path).unwrap();
+        assert_eq!(user_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
+        assert!(path.join("state.db.bak-v3").exists());
+        for column in [
+            "source",
+            "custom_name",
+            "custom_arch",
+            "custom_languages",
+            "custom_claims",
+            "mtime_ms",
+            "needs_verification",
+        ] {
+            assert!(
+                column_exists(&conn, "installed", column).unwrap(),
+                "missing {column}"
+            );
+        }
+        for column in ["progress_items", "total_items", "result"] {
+            assert!(
+                column_exists(&conn, "operations", column).unwrap(),
+                "missing {column}"
+            );
+        }
+        let imported = query_installed_file(&conn, "imported-model")
+            .unwrap()
+            .unwrap();
+        assert_eq!(imported.source, SOURCE_IMPORT);
+        let downloaded = query_installed_file(&conn, "parakeet-unified-en-0.6b")
+            .unwrap()
+            .unwrap();
+        assert_eq!(downloaded.source, SOURCE_CATALOG_DOWNLOAD);
         drop(conn);
         cleanup(path);
     }

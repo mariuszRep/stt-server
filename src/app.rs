@@ -42,8 +42,12 @@ pub struct RuntimeLimits {
     pub inference_timeout_ms: Option<u64>,
 }
 
+pub fn is_service_mode() -> bool {
+    std::env::args().nth(1).as_deref() == Some("service")
+}
+
 pub fn data_dir() -> PathBuf {
-    if std::env::args().nth(1).as_deref() == Some("service") {
+    if is_service_mode() {
         return std::env::var_os("PROGRAMDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
@@ -56,6 +60,29 @@ pub fn data_dir() -> PathBuf {
             std::env::var_os("LOCALAPPDATA").map(|base| PathBuf::from(base).join("STT Server Next"))
         })
         .unwrap_or_else(|| PathBuf::from(".stt-server-next"))
+}
+
+/// Default drop-in `user_models_dir` when the setting has never been written
+/// (user decision 2026-09-25): `%LOCALAPPDATA%\OpenVibeAI\STT Server\models`
+/// of the installing/running user, in *normal* (non-service) runs only. A
+/// LocalSystem service run has no useful per-user `LOCALAPPDATA`, so there is
+/// no default in service mode; `service::install` instead records the
+/// installing user's path explicitly as the `user_models_dir` setting.
+/// `STT_NEXT_USER_MODELS_DIR_DEFAULT` overrides this for tests, mirroring
+/// `STT_NEXT_DATA_DIR`'s role for the data directory.
+pub fn default_user_models_dir() -> Option<PathBuf> {
+    if let Some(over) = std::env::var_os("STT_NEXT_USER_MODELS_DIR_DEFAULT") {
+        return Some(PathBuf::from(over));
+    }
+    if is_service_mode() {
+        return None;
+    }
+    std::env::var_os("LOCALAPPDATA").map(|base| {
+        PathBuf::from(base)
+            .join("OpenVibeAI")
+            .join("STT Server")
+            .join("models")
+    })
 }
 
 pub fn token_file(dir: &Path) -> Result<String, Box<dyn Error>> {
@@ -81,12 +108,57 @@ pub fn token_file(dir: &Path) -> Result<String, Box<dyn Error>> {
     }
 }
 
+/// Reconcile a single `user_folder` (drop-in) row at startup: rule 5 from the
+/// drop-in models design applies here, and only here -- these files live
+/// outside the managed store by design, so startup reconciliation never
+/// quarantines or moves them. It only checks existence/size/mtime (no
+/// re-hash; that is refresh's job, see `crate::dropin`):
+/// - the file disappeared -> unregister (and deselect/unload if selected);
+/// - the file's size or mtime changed -> mark `needs_verification` in place,
+///   which blocks selection until an explicit refresh re-hashes it;
+/// - otherwise leave the row untouched.
+fn reconcile_user_folder_row(
+    db: &Connection,
+    id: &str,
+    path: &str,
+    recorded_size: Option<u64>,
+    recorded_mtime: Option<i64>,
+) -> Result<(), Box<dyn Error>> {
+    let artifact = PathBuf::from(path);
+    let metadata = fs::metadata(&artifact);
+    match metadata {
+        Err(_) => {
+            db.execute("DELETE FROM installed WHERE id=?1", params![id])?;
+            db.execute(
+                "DELETE FROM settings WHERE key='selected_model' AND value=?1",
+                params![id],
+            )?;
+        }
+        Ok(info) => {
+            let mtime_ms = info
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis() as i64);
+            let changed = Some(info.len()) != recorded_size || mtime_ms != recorded_mtime;
+            if changed {
+                db.execute(
+                    "UPDATE installed SET needs_verification=1 WHERE id=?1",
+                    params![id],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn reconcile_installed(
     db: &Connection,
     catalog: &[CatalogModel],
     data_dir: &Path,
 ) -> Result<(), Box<dyn Error>> {
-    let mut query = db.prepare("SELECT id,path,sha256,quant FROM installed")?;
+    let mut query =
+        db.prepare("SELECT id,path,sha256,quant,source,size_bytes,mtime_ms FROM installed")?;
     let installed = query
         .query_map([], |row| {
             Ok((
@@ -94,12 +166,27 @@ fn reconcile_installed(
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     drop(query);
     let model_dir = fs::canonicalize(data_dir.join("models"))?;
-    for (id, path, recorded_hash, recorded_quant) in installed {
+    for (id, path, recorded_hash, recorded_quant, source, recorded_size, recorded_mtime) in
+        installed
+    {
+        if source == crate::store::SOURCE_USER_FOLDER {
+            reconcile_user_folder_row(
+                db,
+                &id,
+                &path,
+                recorded_size.map(|v| v as u64),
+                recorded_mtime,
+            )?;
+            continue;
+        }
         let artifact = PathBuf::from(&path);
         // Use the recorded quant (not the model's current default_quant) so a
         // model installed at a non-default quant reconciles against the file
@@ -324,5 +411,82 @@ mod tests {
             .to_string_lossy()
             .starts_with("stt-server-next-test-"));
         fs::remove_dir_all(resolved).unwrap();
+    }
+
+    /// Startup reconciliation must never quarantine or move a `user_folder`
+    /// (drop-in) file -- it lives outside the managed store by design. An
+    /// untouched file's row is left exactly as registered; a changed file is
+    /// flagged `needs_verification` in place (no hashing, no move); a
+    /// disappeared file is unregistered.
+    #[test]
+    fn startup_reconcile_leaves_user_folder_files_untouched() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let dropdir = parent.join(format!("stt-server-next-dropin-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dropdir).unwrap();
+        let kept = dropdir.join("kept.gguf");
+        fs::write(&kept, b"kept bytes").unwrap();
+        let changed = dropdir.join("changed.gguf");
+        fs::write(&changed, b"original bytes").unwrap();
+
+        let app = open_app_at(path.clone()).unwrap();
+        {
+            let db = app.db.lock().unwrap();
+            let kept_meta = fs::metadata(&kept).unwrap();
+            let kept_mtime = kept_meta
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            db.execute(
+                "INSERT INTO installed(id,path,sha256,source,size_bytes,mtime_ms) VALUES('kept-model',?1,'x','user_folder',?2,?3)",
+                params![kept.to_string_lossy().as_ref(), kept_meta.len() as i64, kept_mtime],
+            )
+            .unwrap();
+            // Recorded size deliberately wrong to simulate a file that
+            // changed on disk since it was registered.
+            db.execute(
+                "INSERT INTO installed(id,path,sha256,source,size_bytes,mtime_ms) VALUES('changed-model',?1,'x','user_folder',1,0)",
+                params![changed.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        }
+        drop(app);
+        // Reopen: startup reconciliation runs again on open.
+        let reopened = open_app_at(path.clone()).unwrap();
+        let db = reopened.db.lock().unwrap();
+
+        // Untouched file: row and file both survive unchanged.
+        let kept_row: (String, i64) = db
+            .query_row(
+                "SELECT path, needs_verification FROM installed WHERE id='kept-model'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kept_row.0, kept.to_string_lossy());
+        assert_eq!(kept_row.1, 0);
+        assert!(kept.exists(), "user_folder file must never be moved");
+
+        // Changed file: flagged needs_verification, never moved/quarantined.
+        let changed_flag: i64 = db
+            .query_row(
+                "SELECT needs_verification FROM installed WHERE id='changed-model'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(changed_flag, 1);
+        assert!(changed.exists(), "user_folder file must never be moved");
+        assert!(
+            !path.join("quarantine").exists()
+                || fs::read_dir(path.join("quarantine")).unwrap().count() == 0
+        );
+
+        drop(db);
+        drop(reopened);
+        fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+        fs::remove_dir_all(dropdir.canonicalize().unwrap()).unwrap();
     }
 }
