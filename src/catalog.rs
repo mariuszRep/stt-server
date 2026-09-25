@@ -46,8 +46,10 @@ pub struct CatalogModel {
 
 #[derive(Deserialize)]
 pub struct Catalog {
-    /// Fallback download hosts, tried in catalog order after HuggingFace when
-    /// the primary source fails. Empty for catalogs that don't publish any.
+    /// Unused (user decision): we do not use Handy's `blob.handy.computer`
+    /// mirror without that project's permission, so downloads are
+    /// HuggingFace-only (see `download::candidate_urls`). Kept deserializable
+    /// so the embedded catalog JSON stays byte-identical to upstream.
     #[serde(default)]
     pub mirrors: Vec<String>,
     pub models: Vec<CatalogModel>,
@@ -95,7 +97,6 @@ pub fn capability_matrix(model: &CatalogModel) -> Value {
     };
     json!({
         "prompt": unimplemented(Value::Null, false),
-        "vocabulary": unimplemented(Value::Null, false),
         "temperature": unimplemented(Value::Null, false),
         "language_hint": unimplemented(json!(model.languages), !multi_language),
         "language_detect": unimplemented(json!(model.capabilities.lang_detect), !model.capabilities.lang_detect),
@@ -163,7 +164,7 @@ mod tests {
         let parakeet = recommended.first().unwrap();
         let matrix = capability_matrix(parakeet);
         assert_eq!(matrix["prompt"]["status"], "unsupported");
-        assert_eq!(matrix["vocabulary"]["status"], "unsupported");
+        assert!(matrix.get("vocabulary").is_none());
         assert_eq!(matrix["streaming"]["status"], "unsupported");
         let nemotron = catalog
             .models
