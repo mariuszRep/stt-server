@@ -108,3 +108,83 @@ No bugs were found in the install/import/verify/migration paths exercised. Devia
 the task scope; download hardening, queue, CORS, and language/prompt controls were intentionally
 left out as separate later tasks. All temp data directories created for this run were deleted
 after the checks above.
+
+## Download hardening and CORS — 2026-09-25 (update)
+
+Added: stall timeout (60s, connect and per-chunk, via `tokio::time::timeout`; replaces the old
+3600s blanket client timeout so a 48 GB download is never killed for merely taking a long time);
+resume edge cases (a `.part` already at the expected size skips the network and verifies
+directly; HTTP 416 discards the partial and restarts once; a 206 whose `Content-Range` doesn't
+start at our offset is rejected); a mirror fallback list (HuggingFace, then each catalog
+`mirrors` entry in order — the catalog's top-level `mirrors: ["https://blob.handy.computer"]`,
+previously undeserialized, is now read into `Catalog.mirrors` and `App.mirrors`); per-source
+retries (3 attempts, 2s/5s/15s backoff, interruptible every 200ms); a disk-space preflight
+(`fs4::available_space`, requiring `(remaining bytes) * 1.05 + 64 MiB` free, failing with
+`insufficient_disk_space`); progress writes throttled to 250ms/4 MiB; a new `operations.error_code`
+column (schema v3) surfaced on `GET /v1/local/operations/{id}`.
+
+**Mirror URL shape — unconfirmed assumption**: the catalog publishes mirror *hosts* only
+(`https://blob.handy.computer`), no path template, and no second real mirror was available to
+test against. `candidate_urls` guesses `{mirror}/{id}/{revision}/{filename}`, mirroring the
+HuggingFace resolve path. This is documented in code and here; it should be verified against a
+real mirror response before being relied on.
+
+New dependencies: `fs4 =1.1.0` (disk free-space query, `sync` feature only, no libc) and
+`tower-http =0.7.1` (feature `cors`, compatible with the pinned `axum =0.8.9`). Both are pure
+Rust; the DLL-dependents audit below confirms no new non-system DLL imports.
+
+Adapted from Handy's `src-tauri/src/managers/model/download.rs` (commit `8f9cf53`, MIT — see
+`THIRD_PARTY_NOTICES.md`): the `DOWNLOAD_STALL_TIMEOUT` value and rationale, the
+`Content-Range` start parser, and the shape of the resume/416/oversized-partial decision logic.
+Retries-with-backoff and the disk preflight are new (Handy has neither, per the earlier parity
+research).
+
+CORS: `tower_http::cors::CorsLayer` built at router construction from a new
+`cors_allowed_origins` setting (JSON array, default `["*"]`), validated as `*` or
+`http(s)://host[:port]`. `preferred_backend` was made independently optional on
+`PATCH /v1/local/config` (still `deny_unknown_fields`) so either field can be patched alone.
+
+Gates: `cargo fmt --check`, `cargo clippy --release --all-targets --offline -- -D warnings`, and
+`cargo test --release --offline` (45 lib unit/integration tests, plus empty bin/doc test
+harnesses) all passed. New unit/integration coverage: pure functions (candidate URL list with/without mirrors,
+retry schedule, disk math, resume/416/range-mismatch decisions, progress-throttle decision) and
+an in-process axum test server exercising happy-path download+hash, a stall (server sends a
+prefix then hangs, caught within a shortened injectable timeout), resume via Range from a
+pre-written partial, first-source-failure-then-mirror-success, and hash-mismatch quarantine.
+A v2→v3 migration test confirms `error_code` is added and `state.db.bak-v2` is written.
+
+Build via `scripts/build-local.ps1 -Offline`: **65,529,344 bytes**, SHA-256
+`ED5236F2CD0D3DE4A2C105ABE08DFDE4824C346646F0C236953C902BE3137415`. `dumpbin /DEPENDENTS` shows
+only Windows system DLLs (`ws2_32.dll`, `advapi32.dll`, `ntdll.dll`, `bcrypt.dll`,
+`bcryptprimitives.dll`, `kernel32.dll`, `api-ms-win-core-synch-l1-2-0.dll`) plus `vulkan-1.dll` —
+no new non-system DLL import from `fs4` or `tower-http`.
+
+Real E2E on a fresh `STT_NEXT_DATA_DIR`:
+1. `GET /v1/local/config` showed the new default `"cors_allowed_origins":["*"]`.
+2. Installed `whisper-tiny.en` quant `Q4_K_M` (43,545,248 bytes); cancelled a second attempt via
+   `POST .../operations/{id}/cancel` before any bytes were written — HTTP 200,
+   `{"state":"cancelled","error_code":"cancelled"}`; `GET .../operations/{id}` confirmed
+   `state: "cancelled"`, `error_code: "cancelled"`. The `.part` file was 0 bytes at cancel time (a
+   local/CDN-fast 43 MB transfer on this link completes inside the 250ms progress-flush interval,
+   so an intermediate non-zero `progress_bytes` was not observable over the network in this run —
+   resume from a non-zero partial is instead exercised directly by
+   `download::http_tests::resumes_via_range_after_partial_write`). Re-running install completed
+   normally (HTTP 202 → `state: "completed"`, 43,545,248 bytes). Selected the model
+   (`observed_backend: "Vulkan0"`) and transcribed `test-data/stereo48.wav`: HTTP 200, text
+   "Well, I don't wish to see it anymore, observe Phoebe, turning away her eyes. It is certainly
+   very like the old portrait."
+3. CORS: `curl -i -X OPTIONS .../v1/audio/transcriptions` with `Origin: http://tauri.localhost`,
+   `Access-Control-Request-Method: POST`, `Access-Control-Request-Headers: authorization` → HTTP
+   200 with `access-control-allow-origin: *`, `access-control-allow-methods: *`,
+   `access-control-allow-headers: authorization,content-type` (no token sent or required). A plain
+   `GET /v1/local/config` with `Origin` and a valid token → HTTP 200 with
+   `access-control-allow-origin: *`. `PATCH /v1/local/config {"cors_allowed_origins":["not-a-url"]}`
+   → HTTP 400; with `["http://tauri.localhost"]` → HTTP 200,
+   `{"cors_allowed_origins":["http://tauri.localhost"],"restart_required":true}`.
+4. Disk preflight: not exercised live (hard to fake a real low-disk condition safely); covered by
+   `download::pure_tests::disk_requirement_*` and `has_enough_disk_space_true_and_false`.
+
+Deviations/gaps: the mirror URL path template is an unconfirmed assumption (see above); the
+disk-full path is unit-tested only; a genuinely slow/throttled link was not available to observe
+a non-zero resume offset over real network E2E (covered by unit test instead). The server
+process and its temp data directory used for this run were both stopped/deleted afterward.

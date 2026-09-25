@@ -34,7 +34,31 @@ actually installed, not the catalog's current default.
 
 State is stored in a versioned SQLite schema (`PRAGMA user_version`). Opening an older,
 unversioned database migrates it to the current schema in one transaction, backing up the file
-to `state.db.bak-v<old>` first when it already had data.
+to `state.db.bak-v<old>` first when it already had data. Schema v3 adds a machine-readable
+`error_code` on operations (`insufficient_disk_space`, `stalled`, `source_unavailable`,
+`hash_mismatch`, `cancelled`), returned alongside the free-text `error` by
+`GET /v1/local/operations/{id}`.
+
+Downloads are hardened: a 60s stall timeout applies to connect and every chunk (not the whole
+transfer, so a 48 GB file is never killed just for taking a long time); a `.part` already at the
+expected size skips the network and goes straight to hash verification; HTTP 416 discards the
+partial and restarts once; each source gets up to 3 attempts with 2s/5s/15s backoff before moving
+to the next; the catalog's `mirrors` (currently just `blob.handy.computer`) are tried after
+HuggingFace, in catalog order, with the assumed URL shape `{mirror}/{id}/{revision}/{filename}`
+(unconfirmed against a real mirror — see the feasibility doc); a disk-space preflight refuses to
+start when free space is under `(remaining bytes) * 1.05 + 64 MiB`, failing the operation with
+`insufficient_disk_space`; progress is written to SQLite at most every 250 ms or 4 MiB.
+
+## CORS
+
+`GET /v1/local/config` and `PATCH /v1/local/config` expose `cors_allowed_origins` (JSON array,
+default `["*"]`; `preferred_backend` is independently optional on PATCH so either can be patched
+alone). Each entry must be `*` or an `http(s)://host[:port]` origin; an invalid entry returns 400
+`invalid_cors_origins`. A CORS `PATCH` returns `restart_required: true` and takes effect on the
+next server start, when the `tower_http::cors::CorsLayer` is built from the persisted setting.
+`OPTIONS` preflight requests succeed without a bearer token; every other route (except `/health`)
+still requires one. When origins are restricted (not `*`), `Authorization` and `Content-Type` are
+explicitly allowed.
 
 ## Local build
 
