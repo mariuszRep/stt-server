@@ -18,7 +18,7 @@ use crate::auth::authorized;
 use crate::catalog::{catalog_model, CatalogFile};
 use crate::errors::{internal, ApiError, ApiResult};
 use crate::operations::update_operation;
-use crate::store::{installed_path, promote_verified_model};
+use crate::store::{installed_path, promote_verified_model_with_source, SOURCE_IMPORT};
 
 pub struct ImportGuard {
     pub app: Arc<App>,
@@ -227,8 +227,16 @@ pub async fn import_model(
                         "Catalog size or SHA-256 mismatch",
                     ));
                 };
-                promote_verified_model(&app, &op, id, &matched_file, &stage, size)
-                    .map_err(internal)?;
+                promote_verified_model_with_source(
+                    &app,
+                    &op,
+                    id,
+                    &matched_file,
+                    &stage,
+                    size,
+                    SOURCE_IMPORT,
+                )
+                .map_err(internal)?;
                 guard.complete = true;
                 imported = true;
             }

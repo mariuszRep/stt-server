@@ -24,6 +24,7 @@ use crate::auth::authorized;
 use crate::capabilities::catalog_mismatch;
 use crate::catalog::{capability_matrix, catalog_model, model_view};
 use crate::download::install_model;
+use crate::dropin::run_refresh;
 use crate::engine::{load_engine, CancelWhenDropped, LoadedModel};
 use crate::errors::{classify_run_result, internal, ApiError, ApiResult, RunOutcome};
 use crate::format::{format_response, DiagnosticsExtra, Formatted, LanguageEvidence};
@@ -31,14 +32,17 @@ use crate::import::import_model;
 use crate::operations::{cancel_operation, operation};
 use crate::run_plan::{plan as build_plan, Endpoint, ParsedRequest};
 use crate::store::{
-    backend_preference, cors_allowed_origins, installed_file, installed_path, is_valid_cors_origin,
-    selected_id,
+    all_installed, backend_preference, cors_allowed_origins, installed_file, installed_path,
+    is_valid_cors_origin, selected_id, user_models_dir_setting, SOURCE_USER_FOLDER,
 };
 use crate::verify::verify_model;
 
 pub async fn get_config(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     authorized(&headers, &app)?;
     let limits = crate::store::runtime_limits(&app)?;
+    let user_models_dir = user_models_dir_setting(&app)?.or_else(|| {
+        crate::app::default_user_models_dir().map(|path| path.to_string_lossy().into_owned())
+    });
     Ok(Json(json!({
         "bind":"127.0.0.1:54321",
         "preferred_backend":backend_preference(&app)?,
@@ -48,6 +52,7 @@ pub async fn get_config(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiR
         "queue_max_waiting": limits.queue_max_waiting,
         "queue_wait_timeout_ms": limits.queue_wait_timeout_ms,
         "inference_timeout_ms": limits.inference_timeout_ms,
+        "user_models_dir": user_models_dir,
     })))
 }
 
@@ -76,6 +81,9 @@ pub struct ConfigPatch {
     queue_wait_timeout_ms: Option<Option<i64>>,
     #[serde(default, deserialize_with = "deserialize_some")]
     inference_timeout_ms: Option<Option<i64>>,
+    /// The drop-in models folder (see "Drop-in models and refresh"). Must be
+    /// an absolute, existing directory, else 400 `invalid_user_models_dir`.
+    user_models_dir: Option<String>,
 }
 
 pub async fn patch_config(
@@ -151,6 +159,16 @@ pub async fn patch_config(
         ),
         None => None,
     };
+    if let Some(dir) = &patch.user_models_dir {
+        let path = std::path::Path::new(dir);
+        if !path.is_absolute() || !path.is_dir() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_user_models_dir",
+                "user_models_dir must be an absolute, existing directory",
+            ));
+        }
+    }
     {
         let db = app.db.lock().map_err(internal)?;
         if let Some(backend) = &patch.preferred_backend {
@@ -171,6 +189,14 @@ pub async fn patch_config(
             .map_err(internal)?;
             response.insert("cors_allowed_origins".to_owned(), json!(origins));
             restart_required = true;
+        }
+        if let Some(dir) = &patch.user_models_dir {
+            db.execute(
+                "INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![crate::store::SETTING_USER_MODELS_DIR, dir],
+            )
+            .map_err(internal)?;
+            response.insert("user_models_dir".to_owned(), json!(dir));
         }
         for (key, value, response_key) in [
             (
@@ -313,23 +339,83 @@ fn effective_view_if_loaded(app: &App, id: &str) -> ApiResult<Option<Value>> {
         }))
 }
 
+/// Build the `/v1/local/models` view for an installed custom model (a
+/// drop-in file whose header, not the catalog, is the source of its
+/// metadata). See "Integration rules": `source`, `custom: true`, an
+/// `evidence: "gguf_header"` capability view, `installable: false`, and
+/// `recommended_rank: null`.
+fn custom_model_view(installed: &crate::store::InstalledFile) -> Value {
+    let claims = installed.custom_claims.clone().unwrap_or(Value::Null);
+    let languages = installed.custom_languages.clone().unwrap_or_default();
+    let multi_language = languages.len() > 1;
+    json!({
+        "id": installed.id,
+        "name": installed.custom_name.clone().unwrap_or_else(|| installed.id.clone()),
+        "architecture": installed.custom_arch,
+        "languages": languages,
+        "source": installed.source,
+        "custom": true,
+        "evidence": "gguf_header",
+        "model_capabilities": claims,
+        "effective_capabilities": {
+            "prompt": {"status": "unknown"},
+            "temperature": {"status": "unknown"},
+            "language_hint": {"status": if multi_language { "unknown" } else { "unsupported" }},
+            "language_detect": {"status": "unknown"},
+            "translation": {"status": "unknown"},
+            "timestamp_granularity": {"status": "unknown"},
+            "streaming": {"status": "unsupported"},
+            "response_formats": {"json": "supported", "text": "unsupported", "verbose_json": "unsupported"},
+        },
+        "installed": true,
+        "installed_quant": installed.quant,
+        "installable": false,
+        "recommended_rank": Value::Null,
+        "needs_verification": installed.needs_verification,
+        "file_path": installed.path.to_string_lossy(),
+    })
+}
+
+/// Custom (non-catalog) installed models: rows with `custom_arch` set, i.e.
+/// registered by `/v1/local/models/refresh` from a GGUF header probe rather
+/// than a catalog match.
+fn installed_custom_models(app: &App) -> ApiResult<Vec<crate::store::InstalledFile>> {
+    Ok(all_installed(app)?
+        .into_iter()
+        .filter(|row| row.is_custom())
+        .collect())
+}
+
 pub async fn local_models(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     authorized(&headers, &app)?;
-    let data = app
+    let mut data = app
         .catalog
         .iter()
         .map(|model| {
             let installed = installed_file(&app, &model.slug)?;
-            let mut view = model_view(model, installed.and_then(|file| file.quant).as_deref());
+            let mut view = model_view(
+                model,
+                installed
+                    .as_ref()
+                    .and_then(|file| file.quant.clone())
+                    .as_deref(),
+            );
+            if let Some(installed) = &installed {
+                view["source"] = json!(installed.source);
+                view["needs_verification"] = json!(installed.needs_verification);
+            }
             if let Some(effective) = effective_view_if_loaded(&app, &model.slug)? {
                 view["effective_capabilities"] = effective;
             }
             Ok(view)
         })
         .collect::<ApiResult<Vec<_>>>()?;
+    for custom in installed_custom_models(&app)? {
+        data.push(custom_model_view(&custom));
+    }
     Ok(Json(json!({"object":"list", "data":data})))
 }
 
@@ -344,7 +430,27 @@ pub async fn openai_models(
             data.push(json!({"id":model.slug,"object":"model","owned_by":"local"}));
         }
     }
+    for custom in installed_custom_models(&app)? {
+        data.push(json!({"id":custom.id,"object":"model","owned_by":"local"}));
+    }
     Ok(Json(json!({"object":"list", "data":data})))
+}
+
+/// True when `id` is either a known catalog model, or an installed custom
+/// (drop-in) model registered by refresh. Used where an endpoint must accept
+/// any installed model regardless of source (select/load/remove).
+fn known_or_installed(app: &App, id: &str) -> ApiResult<()> {
+    if catalog_model(app, id).is_ok() {
+        return Ok(());
+    }
+    if installed_file(app, id)?.is_some() {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        StatusCode::NOT_FOUND,
+        "model_not_found",
+        "Unknown model ID",
+    ))
 }
 
 pub async fn selected_model(
@@ -422,14 +528,22 @@ pub async fn select_model(
     // new model finishing its load and the swap), memory usage is briefly
     // the sum of both models -- acceptable per README.
     let _selection = app.selection.lock().await;
-    catalog_model(&app, &id)?;
-    let path = installed_path(&app, &id)?.ok_or_else(|| {
+    known_or_installed(&app, &id)?;
+    let installed = installed_file(&app, &id)?.ok_or_else(|| {
         ApiError::new(
             StatusCode::CONFLICT,
             "model_not_installed",
             "Install the model first",
         )
     })?;
+    if installed.needs_verification {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "needs_verification",
+            "This drop-in model changed on disk; refresh to re-verify it before selecting",
+        ));
+    }
+    let path = installed.path.clone();
     let preference = backend_preference(&app)?;
     let loader_id = id.clone();
     // Load off the async runtime, then swap the whole `LoadedModel` in one
@@ -460,7 +574,7 @@ pub async fn remove_model(
 ) -> ApiResult<Json<Value>> {
     authorized(&headers, &app)?;
     let _selection = app.selection.lock().await;
-    catalog_model(&app, &id)?;
+    known_or_installed(&app, &id)?;
     {
         let db = app.db.lock().map_err(internal)?;
         let active: i64 = db
@@ -485,13 +599,24 @@ pub async fn remove_model(
             "The selected model cannot be removed",
         ));
     }
-    let path = installed_path(&app, &id)?.ok_or_else(|| {
+    let installed = installed_file(&app, &id)?.ok_or_else(|| {
         ApiError::new(
             StatusCode::NOT_FOUND,
             "model_not_installed",
             "Model is not installed",
         )
     })?;
+    // A `user_folder` (drop-in) model is unregistered only; its file lives
+    // outside the managed store by design and is never touched.
+    if installed.source == SOURCE_USER_FOLDER {
+        let db = app.db.lock().map_err(internal)?;
+        db.execute("DELETE FROM installed WHERE id=?1", params![id])
+            .map_err(internal)?;
+        return Ok(Json(
+            json!({"model":id,"removed":true,"file_deleted":false}),
+        ));
+    }
+    let path = installed.path.clone();
     let model_root = std::fs::canonicalize(app.data_dir.join("models")).map_err(internal)?;
     if !std::fs::canonicalize(&path)
         .map_err(internal)?
@@ -517,7 +642,7 @@ pub async fn remove_model(
         return Err(internal(error));
     }
     tokio::fs::remove_file(&stage).await.map_err(internal)?;
-    Ok(Json(json!({"model":id,"removed":true})))
+    Ok(Json(json!({"model":id,"removed":true,"file_deleted":true})))
 }
 
 /// The multipart fields both `/v1/audio/transcriptions` and
@@ -820,6 +945,35 @@ pub async fn translations(
     transcribe_or_translate(app, headers, multipart, Endpoint::Translations).await
 }
 
+/// `POST /v1/local/models/refresh`: a durable operation (kind `refresh`)
+/// that scans the drop-in `user_models_dir` for new/changed/removed `.gguf`
+/// files. See `crate::dropin` for the scan/registration rules.
+pub async fn refresh_models(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    authorized(&headers, &app)?;
+    let op = Uuid::new_v4().to_string();
+    {
+        let db = app.db.lock().map_err(internal)?;
+        let now = crate::store::now_ms();
+        db.execute(
+            "INSERT INTO operations(id,model_id,kind,state,error,progress_bytes,total_bytes,progress_items,total_items,created_at,updated_at) VALUES(?1,'','refresh','queued',NULL,0,0,0,0,?2,?2)",
+            params![op, now],
+        )
+        .map_err(internal)?;
+    }
+    let task_app = app.clone();
+    let task_op = op.clone();
+    tokio::spawn(async move {
+        run_refresh(task_app, task_op).await;
+    });
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({"operation_id":op,"state":"queued"})),
+    ))
+}
+
 pub fn router(app: Arc<App>) -> Router {
     let origins =
         cors_allowed_origins(&app).unwrap_or_else(|_| crate::store::default_cors_origins());
@@ -839,6 +993,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/local/recommendations", get(recommendations))
         .route("/v1/local/config", get(get_config).patch(patch_config))
         .route("/v1/local/models", get(local_models))
+        .route("/v1/local/models/refresh", post(refresh_models))
         .route(
             "/v1/local/models/selected",
             get(selected_model).delete(deselect_model),
@@ -1304,5 +1459,208 @@ mod router_tests {
         assert_eq!(body["error"]["code"], "duplicate_field");
         drop(app);
         std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn patch_config_rejects_nonexistent_or_relative_user_models_dir() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let router = router(app.clone());
+        for body in [
+            r#"{"user_models_dir":"relative\\path"}"#,
+            r#"{"user_models_dir":"C:\\definitely-not-a-real-directory-xyz-123"}"#,
+        ] {
+            let request = Request::builder()
+                .method("PATCH")
+                .uri("/v1/local/config")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "body: {body}");
+        }
+        drop(router);
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn patch_config_accepts_and_round_trips_an_existing_absolute_user_models_dir() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let router = router(app.clone());
+        let dropdir = parent.join(format!("stt-server-next-dropin-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dropdir).unwrap();
+        let dropdir_json = serde_json::to_string(&dropdir.to_string_lossy()).unwrap();
+
+        let request = Request::builder()
+            .method("PATCH")
+            .uri("/v1/local/config")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                "{{\"user_models_dir\":{dropdir_json}}}"
+            )))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let get_request = Request::builder()
+            .method("GET")
+            .uri("/v1/local/config")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(get_request).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["user_models_dir"], dropdir.to_string_lossy().as_ref());
+
+        drop(router);
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+        std::fs::remove_dir_all(dropdir.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_returns_202_and_the_operation_completes() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let router = router(app.clone());
+        // No user_models_dir configured and no LOCALAPPDATA default in this
+        // test process, so the operation completes fast (an unconfigured
+        // folder is a `failed` terminal state, still reachable via polling).
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/local/models/refresh")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let operation_id = body["operation_id"].as_str().unwrap().to_owned();
+
+        let mut state = String::new();
+        for _ in 0..100 {
+            let get_request = Request::builder()
+                .method("GET")
+                .uri(format!("/v1/local/operations/{operation_id}"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            let response = router.clone().oneshot(get_request).await.unwrap();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let record: Value = serde_json::from_slice(&bytes).unwrap();
+            state = record["state"].as_str().unwrap().to_owned();
+            if state != "queued" && state != "running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            state == "completed" || state == "failed",
+            "operation did not finish: {state}"
+        );
+
+        drop(router);
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn remove_of_user_folder_model_keeps_the_file() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let dropdir = parent.join(format!("stt-server-next-dropin-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dropdir).unwrap();
+        let file_path = dropdir.join("mine.gguf");
+        std::fs::write(&file_path, b"user file bytes").unwrap();
+        {
+            let db = app.db.lock().unwrap();
+            db.execute(
+                "INSERT INTO installed(id,path,sha256,source) VALUES('custom-mine-abc12345',?1,'x','user_folder')",
+                rusqlite::params![file_path.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        }
+        let router = router(app.clone());
+        let request = Request::builder()
+            .method("DELETE")
+            .uri("/v1/local/models/custom-mine-abc12345")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["file_deleted"], false);
+        assert!(file_path.exists());
+        assert!(installed_file(&app, "custom-mine-abc12345")
+            .unwrap()
+            .is_none());
+
+        drop(router);
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+        std::fs::remove_dir_all(dropdir.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn select_of_a_needs_verification_model_is_refused() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let dropdir = parent.join(format!("stt-server-next-dropin-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dropdir).unwrap();
+        let file_path = dropdir.join("mine.gguf");
+        std::fs::write(&file_path, b"user file bytes").unwrap();
+        {
+            let db = app.db.lock().unwrap();
+            db.execute(
+                "INSERT INTO installed(id,path,sha256,source,needs_verification) VALUES('custom-mine-abc12345',?1,'x','user_folder',1)",
+                rusqlite::params![file_path.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        }
+        let router = router(app.clone());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/local/models/custom-mine-abc12345/select")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "needs_verification");
+
+        drop(router);
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+        std::fs::remove_dir_all(dropdir.canonicalize().unwrap()).unwrap();
     }
 }

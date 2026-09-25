@@ -48,6 +48,7 @@ pub async fn verify_model(
         )
     })?;
     let path = installed.path.clone();
+    let is_user_folder = installed.source == crate::store::SOURCE_USER_FOLDER;
     // Use the recorded quant/size/sha (from install/import time), not the
     // catalog's current default_quant, so a non-default install still verifies.
     let file = CatalogFile {
@@ -125,6 +126,26 @@ pub async fn verify_model(
             .as_deref()
             == Some("cancelled")
         {
+            return;
+        }
+        // A `user_folder` (drop-in) model is outside the managed store by
+        // design: a verify mismatch marks it `needs_verification` in place
+        // (no unregister, no quarantine move of the user's file). Selection
+        // is refused while that flag is set until a refresh re-hashes it.
+        if is_user_folder {
+            if let Ok(db) = task_app.db.lock() {
+                let _ = db.execute(
+                    "UPDATE installed SET needs_verification=1 WHERE id=?1",
+                    params![id],
+                );
+            }
+            let _ = update_operation(
+                &task_app,
+                &task_op,
+                "failed",
+                Some("Drop-in model size or SHA-256 mismatch; needs re-verification"),
+                0,
+            );
             return;
         }
         if let Ok(db) = task_app.db.lock() {

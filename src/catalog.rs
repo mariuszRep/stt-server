@@ -85,6 +85,25 @@ pub fn resolve_quant<'a>(
         })
 }
 
+/// Find a catalog model/file whose size and SHA-256 match a candidate
+/// drop-in file, across every model and quant. Used by `crate::dropin` to
+/// register a drop-in file under its catalog identity when the bytes match a
+/// known artifact, regardless of which quant or model happened to produce it.
+pub fn catalog_match_by_hash<'a>(
+    catalog: &'a [CatalogModel],
+    size_bytes: u64,
+    sha256: &str,
+) -> Option<(&'a CatalogModel, &'a CatalogFile)> {
+    for model in catalog {
+        for file in &model.files {
+            if file.size_bytes == size_bytes && file.sha256.eq_ignore_ascii_case(sha256) {
+                return Some((model, file));
+            }
+        }
+    }
+    None
+}
+
 pub fn capability_matrix(model: &CatalogModel) -> Value {
     let multi_language = model.languages.len() > 1;
     let has_timestamps = model.capabilities.timestamps != "none";

@@ -46,7 +46,66 @@ unversioned database migrates it to the current schema in one transaction, backi
 to `state.db.bak-v<old>` first when it already had data. Schema v3 adds a machine-readable
 `error_code` on operations (`insufficient_disk_space`, `stalled`, `source_unavailable`,
 `hash_mismatch`, `cancelled`), returned alongside the free-text `error` by
-`GET /v1/local/operations/{id}`.
+`GET /v1/local/operations/{id}`. Schema v4 adds `installed.source`
+(`catalog_download`/`import`/`user_folder`) plus nullable `custom_name`/`custom_arch`/
+`custom_languages`/`custom_claims`/`mtime_ms`/`needs_verification` columns for drop-in models, and
+`operations.progress_items`/`total_items`/`result` (a JSON blob) for item-counted, durable
+operations such as refresh; existing rows backfill `import` (from a completed `import` operation)
+or `catalog_download` (everything else).
+
+## Drop-in models and refresh
+
+A user may copy `.gguf` files directly into a user-writable folder instead of using
+install/import. The folder is `%LOCALAPPDATA%\OpenVibeAI\STT Server\models` of the user who is
+running the server (Local, not Roaming, so multi-gigabyte files are never synced with a roaming
+profile). It is the `user_models_dir` setting: visible on `GET /v1/local/config` (defaulted when
+unset, in a normal non-service run, to the path above) and settable via `PATCH /v1/local/config`
+with `{"user_models_dir": "<absolute path>"}`; a relative or nonexistent path returns 400
+`invalid_user_models_dir`. In service mode there is no default (`LocalSystem` has no useful
+`LOCALAPPDATA`), so an unconfigured folder makes refresh fail with `error_code:
+"user_models_dir_not_configured"`; `service::install` records the installing user's folder
+explicitly (creating it if missing, without touching its ACLs) so a fresh service install already
+has one configured. The protected `ProgramData` store still holds downloaded/imported models,
+state, and the token; only this folder is user-writable.
+
+`POST /v1/local/models/refresh` is a durable operation (`kind: "refresh"`, 202 + operation ID,
+observable and cancellable like install/import/verify) that non-recursively scans the drop folder
+for `*.gguf` files (ignoring `.part`). For each file:
+
+1. A file already registered at the same path, size, and mtime is skipped.
+2. Otherwise it is hashed (`spawn_blocking`) and its item progress is reported via the operation's
+   `progress_items`/`total_items`.
+3. A size+SHA-256 match against any catalog file registers it as that catalog model/quant,
+   `source: "user_folder"`, in place (never moved or copied). If that catalog model is already
+   installed from the managed store, the drop-in copy is reported as a duplicate and left alone.
+4. Otherwise its GGUF header is probed (`src/gguf_probe.rs`, ported from Handy's
+   `gguf_meta.rs`/`model_capabilities.rs`, MIT, commit `8f9cf53`) for `general.architecture`. A
+   known speech architecture registers a custom model: ID `custom-<slug>-<first 8 hex of sha256>`
+   (slug from `general.name`, else the file stem, lowercased to `[a-z0-9-]`), with name,
+   architecture, languages, and capability claims read from the header. An unknown/unsupported/
+   unreadable file is listed with a reason and left untouched.
+5. A previously registered file that disappeared is unregistered (deselecting/unloading it first
+   if it was active). One whose size or mtime changed is re-hashed and re-probed by this same
+   refresh (registering it under a possibly new identity if its content changed architecture/hash).
+
+The operation's `result` (visible on `GET /v1/local/operations/{id}`) lists `registered`,
+`duplicates`, `unsupported`, `removed`, and `changed`.
+
+Startup reconciliation (`app::reconcile_installed`) treats `user_folder` rows differently from
+catalog/import rows: it never quarantines or moves them (they are outside the managed store by
+design), only checking existence/size/mtime -- a disappeared file is unregistered, and a
+changed-on-disk file is flagged `needs_verification` (blocking selection until an explicit refresh
+re-hashes it) without itself re-hashing anything.
+
+`GET /v1/local/models` lists custom (non-catalog) installed models alongside catalog entries, with
+`source`, `custom: true`, a capability view built from the GGUF header claims
+(`evidence: "gguf_header"`), `installable: false` (they can only arrive via refresh), and
+`recommended_rank: null`; `GET /v1/models` includes any installed custom model too. Select/load and
+transcription work the same regardless of source. `DELETE /v1/local/models/{id}` on a
+`user_folder` model unregisters it only -- the file is never deleted (`file_deleted: false` in the
+response); catalog/import models keep the previous move-then-delete behavior
+(`file_deleted: true`). `POST /v1/local/models/{id}/verify` on a `user_folder` model re-hashes it
+in place; a mismatch marks it `needs_verification` rather than quarantining the user's file.
 
 Downloads are hardened: a 60s stall timeout applies to connect and every chunk (not the whole
 transfer, so a 48 GB file is never killed just for taking a long time); a `.part` already at the

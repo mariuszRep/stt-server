@@ -87,9 +87,10 @@ pub async fn operation(
     let db = app.db.lock().map_err(internal)?;
     let record = db
         .query_row(
-            "SELECT model_id, kind, state, error, error_code, progress_bytes, total_bytes, created_at, updated_at, finished_at FROM operations WHERE id=?1",
+            "SELECT model_id, kind, state, error, error_code, progress_bytes, total_bytes, created_at, updated_at, finished_at, progress_items, total_items, result FROM operations WHERE id=?1",
             params![id],
             |row| {
+                let result: Option<String> = row.get(12)?;
                 Ok(json!({
                     "id":id,
                     "model_id":row.get::<_, String>(0)?,
@@ -101,7 +102,10 @@ pub async fn operation(
                     "total_bytes":row.get::<_, u64>(6)?,
                     "created_at":row.get::<_, Option<i64>>(7)?,
                     "updated_at":row.get::<_, Option<i64>>(8)?,
-                    "finished_at":row.get::<_, Option<i64>>(9)?
+                    "finished_at":row.get::<_, Option<i64>>(9)?,
+                    "progress_items":row.get::<_, u64>(10)?,
+                    "total_items":row.get::<_, u64>(11)?,
+                    "result": result.and_then(|value| serde_json::from_str::<Value>(&value).ok())
                 }))
             },
         )

@@ -116,6 +116,39 @@ fn icacls(path: &Path, rules: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Record the installing user's drop-in `user_models_dir` (user decision
+/// 2026-09-25): the service runs as LocalSystem, which has no useful
+/// per-user `LOCALAPPDATA`, so the folder must be captured now, while
+/// `install()` still runs as the interactive installing user. Creates the
+/// folder if missing (never changes its ACLs -- it's the user's own profile
+/// directory) and writes the setting directly into `state.db`, running the
+/// same migrations `App::open` would run so a fresh install already has the
+/// v4 schema. Best-effort: `LOCALAPPDATA` being unset (unusual, but not
+/// fatal) just leaves the setting unset, matching a service-mode start with
+/// no configured drop folder (`user_models_dir_not_configured` on refresh).
+fn record_installing_user_models_dir(data: &Path) -> Result<(), Box<dyn Error>> {
+    let Some(base) = std::env::var_os("LOCALAPPDATA") else {
+        return Ok(());
+    };
+    let dir = PathBuf::from(base)
+        .join("OpenVibeAI")
+        .join("STT Server")
+        .join("models");
+    fs::create_dir_all(&dir)?;
+    let catalog: crate::catalog::Catalog =
+        serde_json::from_str(include_str!("../catalog/handy-2026-08-17.json"))?;
+    let mut db = rusqlite::Connection::open(data.join("state.db"))?;
+    crate::store::migrate(&mut db, &catalog.models, data)?;
+    db.execute(
+        "INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        rusqlite::params![
+            crate::store::SETTING_USER_MODELS_DIR,
+            dir.to_string_lossy().as_ref()
+        ],
+    )?;
+    Ok(())
+}
+
 pub fn install() -> Result<(), Box<dyn Error>> {
     let install_dir = install_dir();
     fs::create_dir_all(&install_dir)?;
@@ -153,6 +186,7 @@ pub fn install() -> Result<(), Box<dyn Error>> {
             format!("{owner}:R"),
         ],
     )?;
+    record_installing_user_models_dir(&data)?;
     let manager = ServiceManager::local_computer(
         None::<&str>,
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
