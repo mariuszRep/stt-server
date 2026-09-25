@@ -15,6 +15,7 @@ use axum::{
 use rusqlite::params;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use transcribe_cpp::{CancelToken, RunOptions};
 use uuid::Uuid;
 
@@ -27,7 +28,10 @@ use crate::engine::{load_engine, CancelWhenDropped, LoadedModel};
 use crate::errors::{internal, ApiError, ApiResult};
 use crate::import::import_model;
 use crate::operations::{cancel_operation, operation};
-use crate::store::{backend_preference, installed_file, installed_path, selected_id};
+use crate::store::{
+    backend_preference, cors_allowed_origins, installed_file, installed_path, is_valid_cors_origin,
+    selected_id,
+};
 use crate::verify::verify_model;
 
 pub async fn get_config(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult<Json<Value>> {
@@ -36,14 +40,16 @@ pub async fn get_config(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiR
         "bind":"127.0.0.1:54321",
         "preferred_backend":backend_preference(&app)?,
         "max_audio_bytes":40 * 1024 * 1024,
-        "streaming":false
+        "streaming":false,
+        "cors_allowed_origins":cors_allowed_origins(&app)?
     })))
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigPatch {
-    preferred_backend: String,
+    preferred_backend: Option<String>,
+    cors_allowed_origins: Option<Vec<String>>,
 }
 
 pub async fn patch_config(
@@ -52,22 +58,81 @@ pub async fn patch_config(
     Json(patch): Json<ConfigPatch>,
 ) -> ApiResult<Json<Value>> {
     authorized(&headers, &app)?;
-    if !matches!(patch.preferred_backend.as_str(), "auto" | "cpu" | "vulkan") {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "invalid_backend",
-            "preferred_backend must be auto, cpu, or vulkan",
-        ));
+    let mut response = serde_json::Map::new();
+    let mut restart_required = false;
+    if let Some(backend) = &patch.preferred_backend {
+        if !matches!(backend.as_str(), "auto" | "cpu" | "vulkan") {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_backend",
+                "preferred_backend must be auto, cpu, or vulkan",
+            ));
+        }
     }
-    let db = app.db.lock().map_err(internal)?;
-    db.execute(
-        "INSERT INTO settings(key,value) VALUES('preferred_backend',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        params![patch.preferred_backend],
-    )
-    .map_err(internal)?;
-    Ok(Json(
-        json!({"preferred_backend":patch.preferred_backend,"reload_required":true}),
-    ))
+    if let Some(origins) = &patch.cors_allowed_origins {
+        if origins.is_empty() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_cors_origins",
+                "cors_allowed_origins must contain at least one entry",
+            ));
+        }
+        for origin in origins {
+            if !is_valid_cors_origin(origin) {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_cors_origins",
+                    format!("'{origin}' is not '*' or an http(s)://host[:port] origin"),
+                ));
+            }
+        }
+    }
+    {
+        let db = app.db.lock().map_err(internal)?;
+        if let Some(backend) = &patch.preferred_backend {
+            db.execute(
+                "INSERT INTO settings(key,value) VALUES('preferred_backend',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![backend],
+            )
+            .map_err(internal)?;
+            response.insert("preferred_backend".to_owned(), json!(backend));
+            response.insert("reload_required".to_owned(), json!(true));
+        }
+        if let Some(origins) = &patch.cors_allowed_origins {
+            let serialized = serde_json::to_string(origins).map_err(internal)?;
+            db.execute(
+                "INSERT INTO settings(key,value) VALUES('cors_allowed_origins',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![serialized],
+            )
+            .map_err(internal)?;
+            response.insert("cors_allowed_origins".to_owned(), json!(origins));
+            restart_required = true;
+        }
+    }
+    response.insert("restart_required".to_owned(), json!(restart_required));
+    Ok(Json(Value::Object(response)))
+}
+
+/// Build the CORS layer from the persisted `cors_allowed_origins` setting
+/// (default `["*"]`). Applied at router construction time; a change via
+/// `PATCH /v1/local/config` takes effect on the next server start.
+fn cors_layer(origins: &[String]) -> CorsLayer {
+    let allow_origin = if origins.iter().any(|origin| origin == "*") {
+        AllowOrigin::any()
+    } else {
+        let parsed: Vec<axum::http::HeaderValue> = origins
+            .iter()
+            .filter_map(|origin| origin.parse().ok())
+            .collect();
+        AllowOrigin::list(parsed)
+    };
+    CorsLayer::new()
+        .allow_origin(allow_origin)
+        .allow_methods(tower_http::cors::Any)
+        .allow_headers([
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::CONTENT_TYPE,
+        ])
 }
 
 pub async fn health() -> Json<Value> {
@@ -415,6 +480,9 @@ pub async fn transcriptions(
 }
 
 pub fn router(app: Arc<App>) -> Router {
+    let origins =
+        cors_allowed_origins(&app).unwrap_or_else(|_| crate::store::default_cors_origins());
+    let cors = cors_layer(&origins);
     Router::new()
         .route("/health", get(health))
         .route("/readiness", get(readiness))
@@ -441,6 +509,7 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route("/v1/local/operations/{id}", get(operation))
         .route("/v1/local/operations/{id}/cancel", post(cancel_operation))
+        .layer(cors)
         .with_state(app)
 }
 
@@ -469,6 +538,94 @@ mod router_tests {
     use axum::http::Request;
     use tower::ServiceExt;
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn options_preflight_succeeds_without_token_and_reports_cors_headers() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let router = router(app.clone());
+        let request = Request::builder()
+            .method("OPTIONS")
+            .uri("/v1/audio/transcriptions")
+            .header("origin", "http://tauri.localhost")
+            .header("access-control-request-method", "POST")
+            .header("access-control-request-headers", "authorization")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert!(response.status().is_success());
+        assert!(response
+            .headers()
+            .contains_key("access-control-allow-origin"));
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_protected_route_without_token_is_unauthorized() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let router = router(app.clone());
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/local/config")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn patch_config_rejects_a_bad_origin() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let router = router(app.clone());
+        let request = Request::builder()
+            .method("PATCH")
+            .uri("/v1/local/config")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"cors_allowed_origins":["not-a-url"]}"#))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn patch_config_accepts_valid_origins_and_requires_restart() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let router = router(app.clone());
+        let request = Request::builder()
+            .method("PATCH")
+            .uri("/v1/local/config")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"cors_allowed_origins":["http://tauri.localhost"]}"#,
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["restart_required"], true);
+        assert_eq!(body["cors_allowed_origins"][0], "http://tauri.localhost");
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
 
     #[tokio::test]
     async fn install_with_invalid_quant_returns_400() {
