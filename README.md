@@ -208,6 +208,8 @@ stt-server-next models select <id> [--json] [--data-dir <path>]
 stt-server-next models unload [--json] [--data-dir <path>]
 stt-server-next models remove <id> [--json] [--data-dir <path>]
 stt-server-next models refresh [--wait] [--json] [--data-dir <path>]
+stt-server-next update check [--json]
+stt-server-next update install [--yes] [--json] [--data-dir <path>]
 ```
 
 `run`/`start`/`restart`/`autostart enable` share: `--port <n>` (default 54321), `--host <addr>`
@@ -276,6 +278,29 @@ rule.
   `--json` output is a short human-readable rendering. An absent/dead server or a `{"error":
   {"code","message"}}` response from the API prints a clear message to stderr (or, under
   `--json`, the error body) and exits non-zero -- these commands never crash on a down server.
+
+**Self-update** (`src/selfupdate.rs`): the release source is GitHub Releases of this repo,
+overridable via `STT_NEXT_UPDATE_URL` (used to rehearse against a local/mock server while the
+repo is private). A release must publish two assets: `stt-server-next.exe` and
+`stt-server-next.exe.sha256` (a `sha256sum`-style text file: the hex digest, optionally followed
+by whitespace and a filename).
+
+- `update check` fetches the release manifest and reports whether a newer version is available.
+  It never downloads anything.
+- `update install` re-checks, downloads the executable and checksum assets into
+  `<data dir>\update\`, and verifies the executable's SHA-256 against the checksum asset
+  *before* touching anything else. Without `--yes` it stops there and prints what it would do.
+  With `--yes` it then: stops the running server (if any, via the same graceful `stop` path),
+  renames the current executable aside to `<exe>.old`, installs the verified executable in its
+  place, and restarts it with the same bind host/port. If the new process does not answer
+  `/health` within `start`'s existing 30s window, the CLI stops it, restores `<exe>.old` over the
+  current executable, and restarts the previous version automatically -- the update is reported
+  as rolled back, not failed silently.
+- Models, settings, the auth token, and operation history live in `<data dir>` and are untouched
+  by any of this; only the executable file itself is replaced.
+- An older executable refuses to open a database with a newer `PRAGMA user_version` (see
+  `src/store.rs::migrate`) with a clear error instead of silently reading it, so a rolled-back
+  older binary can never misinterpret state a newer version already migrated.
 
 ## Local build
 

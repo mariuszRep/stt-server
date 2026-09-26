@@ -433,7 +433,16 @@ pub fn migrate(
     data_dir: &Path,
 ) -> Result<(), Box<dyn Error>> {
     let version = user_version(conn)?;
-    if version >= CURRENT_SCHEMA_VERSION {
+    if version > CURRENT_SCHEMA_VERSION {
+        return Err(format!(
+            "This database was created by a newer version of stt-server-next (schema v{version}); \
+             this executable only understands up to schema v{CURRENT_SCHEMA_VERSION}. \
+             Update stt-server-next before opening this data directory, or point --data-dir at a \
+             different (older-schema) directory."
+        )
+        .into());
+    }
+    if version == CURRENT_SCHEMA_VERSION {
         return Ok(());
     }
     let had_pre_existing_schema = version == 0 && table_exists(conn, "installed")?;
@@ -872,6 +881,31 @@ mod tests {
         assert!(!is_valid_cors_origin(""));
         assert!(!is_valid_cors_origin("http://"));
         assert!(!is_valid_cors_origin("http://user@example.com"));
+    }
+
+    /// An older executable must refuse to open a database stamped with a
+    /// newer schema version instead of silently treating it as compatible.
+    #[test]
+    fn migration_refuses_a_database_with_a_newer_schema_version() {
+        let path = temp_dir();
+        fs::create_dir_all(&path).unwrap();
+        let db_path = path.join("state.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(&format!(
+                "PRAGMA user_version = {};",
+                CURRENT_SCHEMA_VERSION + 1
+            ))
+            .unwrap();
+        }
+        let catalog = make_catalog();
+        let mut conn = Connection::open(&db_path).unwrap();
+        let error = migrate(&mut conn, &catalog, &path).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("newer version"), "{message}");
+        assert!(!path.join("state.db.bak-v1").exists());
+        drop(conn);
+        cleanup(path);
     }
 
     #[test]

@@ -31,6 +31,8 @@ USAGE:
     stt-server-next models unload [--json] [--data-dir <path>]
     stt-server-next models remove <id> [--json] [--data-dir <path>]
     stt-server-next models refresh [--wait] [--json] [--data-dir <path>]
+    stt-server-next update check [--json]
+    stt-server-next update install [--yes] [--json] [--data-dir <path>]
     stt-server-next --help
 
 FLAGS:
@@ -45,6 +47,14 @@ The `models`/`health` commands talk to an already-running server over its
 existing authenticated local API (same discovery/token as `stop`/`status`);
 they do not start or manage the process themselves. `--wait` polls the
 returned operation until it reaches a terminal state, printing progress.
+
+`update check` looks at the release source (GitHub Releases; overridable via
+STT_NEXT_UPDATE_URL for local rehearsal) and reports whether a newer version
+is available; it never downloads anything. `update install` downloads and
+verifies the release, then stops the running server (if any), replaces this
+executable, and restarts it; without `--yes` it asks for confirmation first.
+If the new version does not become healthy, the previous executable and
+server are restored automatically.
 ";
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -91,7 +101,20 @@ pub enum Command {
         data_dir: Option<PathBuf>,
     },
     Models(ModelsCommand),
+    Update(UpdateCommand),
     Help,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpdateCommand {
+    Check {
+        json: bool,
+    },
+    Install {
+        yes: bool,
+        json: bool,
+        data_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -553,6 +576,48 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
                 ))),
             }
         }
+        "update" => {
+            let sub = args
+                .get(1)
+                .ok_or_else(|| CliError::usage("update requires a subcommand: check|install"))?;
+            let rest = &args[2..];
+            match sub.as_str() {
+                "check" => {
+                    let mut json = false;
+                    for flag in rest {
+                        match flag.as_str() {
+                            "--json" => json = true,
+                            other => return Err(CliError::usage(format!("unknown flag: {other}"))),
+                        }
+                    }
+                    Ok(Command::Update(UpdateCommand::Check { json }))
+                }
+                "install" => {
+                    let mut json = false;
+                    let mut yes = false;
+                    let mut data_dir = None;
+                    let mut iter = rest.iter();
+                    while let Some(flag) = iter.next() {
+                        match flag.as_str() {
+                            "--json" => json = true,
+                            "--yes" => yes = true,
+                            "--data-dir" => {
+                                data_dir = Some(PathBuf::from(next_value(&mut iter, flag)?))
+                            }
+                            other => return Err(CliError::usage(format!("unknown flag: {other}"))),
+                        }
+                    }
+                    Ok(Command::Update(UpdateCommand::Install {
+                        yes,
+                        json,
+                        data_dir,
+                    }))
+                }
+                other => Err(CliError::usage(format!(
+                    "unknown update subcommand: {other}"
+                ))),
+            }
+        }
         other => Err(CliError::usage(format!("unknown command: {other}"))),
     }
 }
@@ -909,6 +974,53 @@ mod tests {
                 data_dir: Some(PathBuf::from("C:\\d"))
             })
         );
+    }
+
+    #[test]
+    fn update_check_parses_json_flag() {
+        assert_eq!(
+            parse(&args(&["update", "check"])).unwrap(),
+            Command::Update(UpdateCommand::Check { json: false })
+        );
+        assert_eq!(
+            parse(&args(&["update", "check", "--json"])).unwrap(),
+            Command::Update(UpdateCommand::Check { json: true })
+        );
+        assert!(parse(&args(&["update", "check", "--bogus"])).is_err());
+    }
+
+    #[test]
+    fn update_install_parses_yes_json_data_dir() {
+        assert_eq!(
+            parse(&args(&["update", "install"])).unwrap(),
+            Command::Update(UpdateCommand::Install {
+                yes: false,
+                json: false,
+                data_dir: None
+            })
+        );
+        assert_eq!(
+            parse(&args(&[
+                "update",
+                "install",
+                "--yes",
+                "--json",
+                "--data-dir",
+                "C:\\d"
+            ]))
+            .unwrap(),
+            Command::Update(UpdateCommand::Install {
+                yes: true,
+                json: true,
+                data_dir: Some(PathBuf::from("C:\\d"))
+            })
+        );
+    }
+
+    #[test]
+    fn update_requires_subcommand() {
+        assert!(parse(&args(&["update"])).is_err());
+        assert!(parse(&args(&["update", "bogus"])).is_err());
     }
 
     #[test]

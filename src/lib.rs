@@ -19,6 +19,7 @@ pub mod model_cli;
 pub mod operations;
 pub mod queue;
 pub mod run_plan;
+pub mod selfupdate;
 #[cfg(windows)]
 pub mod service;
 pub mod store;

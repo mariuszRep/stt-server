@@ -3,10 +3,11 @@ use std::time::Duration;
 
 use stt_server_next::app::{self, BindOverrides, DEFAULT_BIND_HOST, DEFAULT_BIND_PORT};
 use stt_server_next::cli::{
-    self, AutostartAction, Command, ModelsCommand, RunFlags, ServiceAction,
+    self, AutostartAction, Command, ModelsCommand, RunFlags, ServiceAction, UpdateCommand,
 };
 use stt_server_next::discovery;
 use stt_server_next::model_cli::{self, ConnectError};
+use stt_server_next::selfupdate;
 
 fn effective_data_dir(flags: &RunFlags) -> PathBuf {
     flags.data_dir.clone().unwrap_or_else(app::data_dir)
@@ -57,7 +58,243 @@ async fn dispatch(command: Command) -> i32 {
             cmd_health(effective_data_dir_opt(&data_dir), json).await
         }
         Command::Models(models_command) => cmd_models(models_command).await,
+        Command::Update(update_command) => cmd_update(update_command).await,
     }
+}
+
+// ---------------------------------------------------------------------------
+// update: check GitHub Releases (or STT_NEXT_UPDATE_URL for local rehearsal),
+// then, on `install`, download+verify, stop, replace this executable, and
+// restart -- rolling back automatically if the new version never becomes
+// healthy. See `src/selfupdate.rs` for the download/verify/replace/rollback
+// primitives; this function is just the orchestration glue, mirroring how
+// `cmd_stop`/`cmd_start` are the glue over `discovery`/`api`.
+// ---------------------------------------------------------------------------
+
+async fn cmd_update(command: UpdateCommand) -> i32 {
+    match command {
+        UpdateCommand::Check { json } => cmd_update_check(json).await,
+        UpdateCommand::Install {
+            yes,
+            json,
+            data_dir,
+        } => cmd_update_install(effective_data_dir_opt(&data_dir), yes, json).await,
+    }
+}
+
+fn update_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+async fn cmd_update_check(json: bool) -> i32 {
+    let http = update_http_client();
+    let endpoint = selfupdate::default_update_endpoint();
+    match selfupdate::check_latest(&http, &endpoint).await {
+        Ok(check) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "current_version": check.current_version,
+                        "latest_version": check.release.version,
+                        "update_available": check.update_available,
+                    })
+                );
+            } else if check.update_available {
+                println!(
+                    "update available: {} -> {}",
+                    check.current_version, check.release.version
+                );
+                println!("run `stt-server-next update install --yes` to install it");
+            } else {
+                println!(
+                    "up to date: {} is the latest release",
+                    check.current_version
+                );
+            }
+            0
+        }
+        Err(error) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"error": {"code": "update_check_failed", "message": error.to_string()}})
+                );
+            } else {
+                eprintln!("error: could not check for updates: {error}");
+            }
+            1
+        }
+    }
+}
+
+async fn cmd_update_install(data_dir: PathBuf, yes: bool, json: bool) -> i32 {
+    let http = update_http_client();
+    let endpoint = selfupdate::default_update_endpoint();
+    let check = match selfupdate::check_latest(&http, &endpoint).await {
+        Ok(check) => check,
+        Err(error) => {
+            eprintln!("error: could not check for updates: {error}");
+            return 1;
+        }
+    };
+    if !check.update_available {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"installed": false, "reason": "already_up_to_date", "current_version": check.current_version})
+            );
+        } else {
+            println!(
+                "already up to date: {} is the latest release",
+                check.current_version
+            );
+        }
+        return 0;
+    }
+    if !yes {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "installed": false,
+                    "reason": "confirmation_required",
+                    "current_version": check.current_version,
+                    "latest_version": check.release.version,
+                })
+            );
+        } else {
+            println!(
+                "update available: {} -> {}",
+                check.current_version, check.release.version
+            );
+            println!("re-run with --yes to download, verify, and install it");
+        }
+        return 0;
+    }
+
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => {
+            eprintln!("error: could not resolve current executable: {error}");
+            return 1;
+        }
+    };
+    let stage_dir = data_dir.join("update");
+    println!("downloading and verifying {} ...", check.release.version);
+    let staged = match selfupdate::download_and_verify(&http, &check.release, &stage_dir).await {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("error: download/verification failed, nothing was changed: {error}");
+            return 1;
+        }
+    };
+
+    // Remember how the running instance was reachable (if any) so the
+    // restart after replacement uses the same bind host/port.
+    let previous_info = discovery::read_server_json(&data_dir);
+    let was_running = previous_info
+        .as_ref()
+        .map(|info| discovery::pid_is_alive(info.pid))
+        .unwrap_or(false);
+    if was_running {
+        println!("stopping the running server before replacing its executable ...");
+        let stop_code = cmd_stop(data_dir.clone()).await;
+        if stop_code != 0 {
+            eprintln!(
+                "error: could not stop the running server; update aborted, nothing was changed"
+            );
+            return 1;
+        }
+    }
+
+    let backup = match selfupdate::replace_exe(&exe, &staged) {
+        Ok(backup) => backup,
+        Err(error) => {
+            eprintln!("error: could not install the new executable: {error}");
+            if was_running {
+                eprintln!(
+                    "the previous executable is unchanged; restart it with `stt-server-next start`"
+                );
+            }
+            return 1;
+        }
+    };
+
+    let restart_flags = RunFlags {
+        data_dir: Some(data_dir.clone()),
+        host: previous_info.as_ref().map(|info| info.host.clone()),
+        port: previous_info.as_ref().map(|info| info.port),
+        limits: Default::default(),
+    };
+
+    if !was_running {
+        // Nothing was running before, so there is nothing to restart or
+        // verify health of; the swap itself (already hash-verified) is the
+        // whole job here.
+        println!(
+            "installed {} (was not running; start it with `stt-server-next start`)",
+            check.release.version
+        );
+        return 0;
+    }
+
+    println!("starting the new version ...");
+    let start_code = cmd_start(restart_flags.clone()).await;
+    if start_code == 0 {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "installed": true,
+                    "from_version": check.current_version,
+                    "to_version": check.release.version,
+                })
+            );
+        } else {
+            println!(
+                "update installed: {} -> {}",
+                check.current_version, check.release.version
+            );
+        }
+        return 0;
+    }
+
+    eprintln!("error: new version did not become healthy; rolling back");
+    // Best-effort: stop whatever the failed new instance left behind before
+    // restoring the previous binary underneath it.
+    let _ = cmd_stop(data_dir.clone()).await;
+    if let Err(error) = selfupdate::rollback_exe(&exe, &backup) {
+        eprintln!("error: automatic rollback failed: {error}");
+        eprintln!(
+            "the previous executable is still at {}; restore it manually",
+            backup.display()
+        );
+        return 1;
+    }
+    let restore_code = cmd_start(restart_flags).await;
+    if restore_code != 0 {
+        eprintln!("error: rolled back the executable but could not restart the previous version");
+    } else {
+        eprintln!(
+            "rolled back to the previous version ({})",
+            check.current_version
+        );
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "installed": false,
+                "reason": "rolled_back",
+                "current_version": check.current_version,
+                "attempted_version": check.release.version,
+            })
+        );
+    }
+    1
 }
 
 // ---------------------------------------------------------------------------
