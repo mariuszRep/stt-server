@@ -20,6 +20,14 @@ use crate::errors::{internal, ApiError, ApiResult};
 use crate::operations::{operation_state, update_operation};
 use crate::store::installed_file;
 
+pub fn file_mtime_ms(path: &Path) -> std::io::Result<i64> {
+    let modified = fs::metadata(path)?.modified()?;
+    let elapsed = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(std::io::Error::other)?;
+    Ok(elapsed.as_millis() as i64)
+}
+
 pub fn sha256_file(path: &Path) -> std::io::Result<String> {
     let mut file = fs::File::open(path)?;
     let mut digest = Sha256::new();
@@ -97,9 +105,16 @@ pub async fn verify_model(
         let _ = update_operation(&task_app, &task_op, "running", None, 0);
         let verify_path = path.clone();
         let actual = tokio::task::spawn_blocking(move || {
-            let size = fs::metadata(&verify_path).map(|metadata| metadata.len());
-            let hash = sha256_file(&verify_path);
-            (size, hash)
+            let before = file_mtime_ms(&verify_path)?;
+            let size = fs::metadata(&verify_path)?.len();
+            let hash = sha256_file(&verify_path)?;
+            let after = file_mtime_ms(&verify_path)?;
+            if before != after || fs::metadata(&verify_path)?.len() != size {
+                return Err(std::io::Error::other(
+                    "Model changed during verification; retry",
+                ));
+            }
+            Ok::<_, std::io::Error>((size, hash, after))
         })
         .await;
         if operation_state(&task_app, &task_op)
@@ -110,9 +125,42 @@ pub async fn verify_model(
         {
             return;
         }
-        let valid = matches!(actual, Ok((Ok(size), Ok(ref hash))) if size == file.size_bytes && hash.eq_ignore_ascii_case(&file.sha256));
-        if valid {
-            let _ = update_operation(&task_app, &task_op, "completed", None, file.size_bytes);
+        let (size, hash, mtime) = match actual {
+            Ok(Ok(result)) => result,
+            other => {
+                let message =
+                    format!("Model could not be read safely; retry verification: {other:?}");
+                if let Ok(db) = task_app.db.lock() {
+                    let _ = db.execute(
+                        "UPDATE installed SET needs_verification=1 WHERE id=?1",
+                        params![id],
+                    );
+                }
+                let _ = update_operation(&task_app, &task_op, "failed", Some(&message), 0);
+                return;
+            }
+        };
+        if size == file.size_bytes && hash.eq_ignore_ascii_case(&file.sha256) {
+            let saved = task_app
+                .db
+                .lock()
+                .map_err(|error| error.to_string())
+                .and_then(|db| {
+                    db.execute(
+                        "UPDATE installed SET mtime_ms=?2, needs_verification=0 WHERE id=?1",
+                        params![id, mtime],
+                    )
+                    .map_err(|error| error.to_string())
+                });
+            match saved {
+                Ok(_) => {
+                    let _ =
+                        update_operation(&task_app, &task_op, "completed", None, file.size_bytes);
+                }
+                Err(error) => {
+                    let _ = update_operation(&task_app, &task_op, "failed", Some(&error), 0);
+                }
+            }
             return;
         }
         let _selection = task_app.selection.lock().await;
@@ -179,4 +227,101 @@ pub async fn verify_model(
         StatusCode::ACCEPTED,
         Json(json!({"operation_id":op,"state":"queued"})),
     ))
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    async fn run_verify(app: &Arc<App>, id: &str) -> String {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {}", app.token).parse().unwrap(),
+        );
+        let (_, Json(body)) = verify_model(State(app.clone()), UrlPath(id.into()), headers)
+            .await
+            .unwrap();
+        let op = body["operation_id"].as_str().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let state = operation_state(app, op).unwrap().unwrap();
+                if state == "completed" || state == "failed" {
+                    return state;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn verification_restores_changed_model_and_rejects_corruption() {
+        let dir = std::env::temp_dir().join(format!("stt-verify-recovery-{}", Uuid::new_v4()));
+        let app = crate::app::open_app_at(dir.clone()).unwrap();
+        let artifact = dir.join("models/test.gguf");
+        fs::write(&artifact, b"verified").unwrap();
+        let hash = sha256_file(&artifact).unwrap();
+        app.db.lock().unwrap().execute("INSERT INTO installed(id,path,sha256,size_bytes,source,needs_verification) VALUES('test',?1,?2,8,'import',1)", params![artifact.to_string_lossy(), hash]).unwrap();
+        assert_eq!(run_verify(&app, "test").await, "completed");
+        let installed = installed_file(&app, "test").unwrap().unwrap();
+        assert!(!installed.needs_verification);
+        assert!(installed.mtime_ms.is_some());
+        fs::write(&artifact, b"corrupt!").unwrap();
+        assert_eq!(run_verify(&app, "test").await, "failed");
+        assert!(installed_file(&app, "test").unwrap().is_none());
+        assert!(!artifact.exists());
+        assert_eq!(fs::read_dir(dir.join("quarantine")).unwrap().count(), 1);
+        drop(app);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn locked_verification_preserves_model_then_retry_succeeds() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("stt-verify-recovery-{}", Uuid::new_v4()));
+        let app = crate::app::open_app_at(dir.clone()).unwrap();
+        let artifact = dir.join("models/test.gguf");
+        fs::write(&artifact, b"verified").unwrap();
+        let hash = sha256_file(&artifact).unwrap();
+        app.db.lock().unwrap().execute("INSERT INTO installed(id,path,sha256,size_bytes,source) VALUES('test',?1,?2,8,'import')", params![artifact.to_string_lossy(), hash]).unwrap();
+        app.db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO settings(key,value) VALUES('selected_model','test')",
+                [],
+            )
+            .unwrap();
+        let handle = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&artifact)
+            .unwrap();
+        assert_eq!(run_verify(&app, "test").await, "failed");
+        assert!(
+            installed_file(&app, "test")
+                .unwrap()
+                .unwrap()
+                .needs_verification
+        );
+        assert_eq!(
+            crate::store::selected_id(&app).unwrap().as_deref(),
+            Some("test")
+        );
+        assert!(!dir.join("quarantine").exists());
+        drop(handle);
+        assert_eq!(run_verify(&app, "test").await, "completed");
+        assert!(
+            !installed_file(&app, "test")
+                .unwrap()
+                .unwrap()
+                .needs_verification
+        );
+        assert!(artifact.exists());
+        drop(app);
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

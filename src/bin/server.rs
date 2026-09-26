@@ -198,84 +198,64 @@ async fn health_ok(host: &str, port: u16) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// stop: graceful shutdown via the authenticated endpoint, PID fallback.
+// stop: authenticated graceful shutdown, confirmed by the data-folder lock.
 // ---------------------------------------------------------------------------
 
 async fn cmd_stop(data_dir: PathBuf) -> i32 {
-    let Some(info) = discovery::read_server_json(&data_dir) else {
-        println!("not running");
-        return 0;
-    };
-    if !discovery::pid_is_alive(info.pid) {
-        println!("not running (stale server.json cleaned up)");
-        discovery::remove_server_json(&data_dir);
-        return 0;
-    }
-
-    let probe = probe_host(&info.host);
-    let mut stopped_via_endpoint = false;
-    if let Ok(token) = std::fs::read_to_string(data_dir.join("auth.token")) {
-        let url = format!("http://{probe}:{}/v1/local/shutdown", info.port);
-        if let Ok(client) = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-        {
-            if let Ok(response) = client
-                .post(&url)
-                .header("authorization", format!("Bearer {}", token.trim()))
-                .send()
-                .await
-            {
-                if response.status().is_success() {
-                    stopped_via_endpoint = true;
-                }
-            }
-        }
-    }
-
-    if stopped_via_endpoint {
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        while discovery::pid_is_alive(info.pid) && std::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        if !discovery::pid_is_alive(info.pid) {
+    match discovery::acquire_lock(&data_dir) {
+        Ok(_lock) => {
             discovery::remove_server_json(&data_dir);
-            println!("stopped via shutdown endpoint");
+            println!("not running (stale discovery information cleared)");
             return 0;
         }
-        eprintln!("warning: shutdown endpoint accepted but process did not exit; terminating");
-    }
-
-    if kill_pid(info.pid) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while discovery::pid_is_alive(info.pid) && std::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        Err(error) => {
+            eprintln!("error: cannot determine server ownership: {error}");
+            return 1;
         }
-        discovery::remove_server_json(&data_dir);
-        println!("stopped by terminating pid {}", info.pid);
-        0
-    } else {
-        eprintln!("error: could not stop pid {}", info.pid);
-        1
     }
-}
-
-#[cfg(windows)]
-fn kill_pid(pid: u32) -> bool {
-    std::process::Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/F", "/T"])
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-#[cfg(not(windows))]
-fn kill_pid(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-9", &pid.to_string()])
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    let Some(info) = discovery::read_server_json(&data_dir) else {
+        eprintln!("error: server is starting or discovery information is unavailable; retry stop");
+        return 1;
+    };
+    let probe = probe_host(&info.host);
+    let result = async {
+        let token = std::fs::read_to_string(data_dir.join("auth.token"))?;
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()?
+            .post(format!("http://{probe}:{}/v1/local/shutdown", info.port))
+            .bearer_auth(token.trim())
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    if let Err(error) = result {
+        eprintln!("error: graceful shutdown failed: {error}; no process was forcibly terminated");
+        return 1;
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match discovery::acquire_lock(&data_dir) {
+            Ok(_lock) => {
+                discovery::remove_server_json(&data_dir);
+                println!("stopped via shutdown endpoint");
+                return 0;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => {
+                eprintln!("error: cannot confirm shutdown: {error}");
+                return 1;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!("error: shutdown is still pending; retry status or stop; no process was forcibly terminated");
+            return 1;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -428,4 +408,32 @@ fn cmd_service(action: ServiceAction) -> i32 {
 fn cmd_service(_action: ServiceAction) -> i32 {
     eprintln!("error: the Windows service host is only supported on Windows");
     2
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stale_live_pid_is_never_killed() {
+        let dir = std::env::temp_dir().join(format!("stt-stop-test-{}", uuid::Uuid::new_v4()));
+        // Simulates PID reuse by pointing stale discovery at this test process.
+        discovery::write_server_json(&dir, &discovery::ServerInfo::new("127.0.0.1".into(), 54499))
+            .unwrap();
+        assert_eq!(cmd_stop(dir.clone()).await, 0);
+        assert!(!dir.join("server.json").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn held_lock_without_endpoint_fails_safely() {
+        let dir = std::env::temp_dir().join(format!("stt-stop-test-{}", uuid::Uuid::new_v4()));
+        let lock = discovery::acquire_lock(&dir).unwrap();
+        discovery::write_server_json(&dir, &discovery::ServerInfo::new("127.0.0.1".into(), 54499))
+            .unwrap();
+        assert_eq!(cmd_stop(dir.clone()).await, 1);
+        assert!(dir.join("server.json").exists());
+        drop(lock);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

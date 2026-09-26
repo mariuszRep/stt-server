@@ -389,3 +389,27 @@ Fresh `STT_NEXT_DATA_DIR` under `%TEMP%`, server on `127.0.0.1:54321`. Installed
 
 Server stopped and its temp data directory deleted after the round; no other repos or
 `.projectflows` files touched; no service install performed.
+
+## 2026-09-26: safe stop, startup and model-file recovery
+
+Implemented lock-aware graceful stop without PID force termination; lightweight startup
+fingerprints recorded after install/verification; preservation of inaccessible model files,
+registrations and selected preferences; startup load exclusion for unverified models;
+per-file refresh failures with retry and changing-file detection; explicit verification
+recovery while retaining confirmed-corruption rejection.
+
+Validation: cargo fmt --check; cargo clippy --release --all-targets --offline -- -D warnings;
+cargo test --release --offline: 173 tests passed (171 library + 2 CLI). New regression tests
+cover stale live PID, held lock with unavailable shutdown, managed startup without hashing,
+locked startup selection, mixed locked/readable refresh and retry, verification access-error
+recovery, and actual corruption quarantine. Static release build passed with the repository
+build environment. Real binary check passed: isolated start, health, status, restart, stop,
+and repeated stop, on port 54471. Test server stopped; no user data directory was used.
+
+Binary size: 66224128 bytes. SHA-256: 2A421EE00E9E65DDA8BD14798694C50E3D32E00228B89A24497DDB41C7D71307.
+
+Limits: metadata checks are not continuous hash verification; an unchanged size/timestamp
+is trusted after prior verification. Older installations without fingerprints require one
+explicit verification (no download). Selected-model loading cost still applies. No clean-PC,
+full-disk, CPU-only, LAN or transcription-quality claims are made by these checks. No release
+or commit was made as part of this goal.

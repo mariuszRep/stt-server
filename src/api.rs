@@ -603,7 +603,7 @@ pub async fn select_model(
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "needs_verification",
-            "This drop-in model changed on disk; refresh to re-verify it before selecting",
+            "This model needs verification before selecting; run verify, or refresh for a drop-in model",
         ));
     }
     let path = installed.path.clone();

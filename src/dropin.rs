@@ -72,12 +72,15 @@ struct RegisteredRow {
     path: String,
     size_bytes: Option<u64>,
     mtime_ms: Option<i64>,
+    needs_verification: bool,
 }
 
 fn registered_user_folder_rows(app: &App) -> Result<Vec<RegisteredRow>, String> {
     let db = app.db.lock().map_err(|error| error.to_string())?;
     let mut statement = db
-        .prepare("SELECT id,path,size_bytes,mtime_ms FROM installed WHERE source=?1")
+        .prepare(
+            "SELECT id,path,size_bytes,mtime_ms,needs_verification FROM installed WHERE source=?1",
+        )
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map(params![SOURCE_USER_FOLDER], |row| {
@@ -86,6 +89,7 @@ fn registered_user_folder_rows(app: &App) -> Result<Vec<RegisteredRow>, String> 
                 path: row.get(1)?,
                 size_bytes: row.get::<_, Option<i64>>(2)?.map(|v| v as u64),
                 mtime_ms: row.get(3)?,
+                needs_verification: row.get::<_, i64>(4)? != 0,
             })
         })
         .map_err(|error| error.to_string())?
@@ -101,8 +105,18 @@ fn hash_and_probe(
     let size = std::fs::metadata(&path)
         .map(|meta| meta.len())
         .map_err(|error| error.to_string())?;
+    let before = crate::verify::file_mtime_ms(&path).map_err(|error| error.to_string())?;
     let sha256 = sha256_file(&path).map_err(|error| error.to_string())?;
     let probe = probe_gguf_file(&path);
+    let after = crate::verify::file_mtime_ms(&path).map_err(|error| error.to_string())?;
+    if before != after
+        || std::fs::metadata(&path)
+            .map_err(|error| error.to_string())?
+            .len()
+            != size
+    {
+        return Err("File changed while being read; retry refresh after copying finishes".into());
+    }
     Ok((size, sha256, probe))
 }
 
@@ -195,6 +209,9 @@ async fn scan_and_register(
     dir: &Path,
     catalog: &[crate::catalog::CatalogModel],
 ) -> Result<Value, String> {
+    // Fail the operation if the folder itself cannot be enumerated.
+    let entries =
+        std::fs::read_dir(dir).map_err(|error| format!("Cannot read model folder: {error}"))?;
     let mut registered = Vec::new();
     let mut duplicates = Vec::new();
     let mut unsupported = Vec::new();
@@ -211,24 +228,65 @@ async fn scan_and_register(
     let mut done_items = 0u64;
     for row in existing {
         let path = PathBuf::from(&row.path);
-        let current = std::fs::metadata(&path).ok();
+        let current = std::fs::metadata(&path);
         match current {
-            None => {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 unregister_and_deselect(app, &row.id)?;
                 removed.push(json!({"id": row.id, "path": row.path}));
             }
-            Some(metadata) => {
+            Err(error) => {
+                app.db
+                    .lock()
+                    .map_err(|error| error.to_string())?
+                    .execute(
+                        "UPDATE installed SET needs_verification=1 WHERE id=?1",
+                        params![row.id],
+                    )
+                    .map_err(|error| error.to_string())?;
+                unsupported.push(
+                    json!({"path": row.path, "reason": error.to_string(), "retryable": true}),
+                );
+                seen.insert(path.canonicalize().unwrap_or(path));
+            }
+            Ok(metadata) => {
                 let mtime = file_mtime_ms(&path);
-                if Some(metadata.len()) == row.size_bytes && mtime == row.mtime_ms {
+                if !row.needs_verification
+                    && Some(metadata.len()) == row.size_bytes
+                    && mtime == row.mtime_ms
+                {
                     seen.insert(path.canonicalize().unwrap_or(path));
                 } else {
                     // Changed: re-hash and re-probe (unlike the cheap
                     // startup reconciliation, refresh actually re-verifies).
                     let hash_path = path.clone();
-                    let (size, sha256, probe) =
-                        tokio::task::spawn_blocking(move || hash_and_probe(hash_path))
-                            .await
-                            .map_err(|error| error.to_string())??;
+                    let checked = tokio::task::spawn_blocking(move || hash_and_probe(hash_path))
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let (size, sha256, probe) = match checked {
+                        Ok(result) => result,
+                        Err(error) => {
+                            app.db
+                                .lock()
+                                .map_err(|error| error.to_string())?
+                                .execute(
+                                    "UPDATE installed SET needs_verification=1 WHERE id=?1",
+                                    params![row.id],
+                                )
+                                .map_err(|error| error.to_string())?;
+                            unsupported.push(
+                                json!({"path": row.path, "reason": error, "retryable": true}),
+                            );
+                            seen.insert(path.canonicalize().unwrap_or(path));
+                            done_items += 1;
+                            let _ = set_progress_items(
+                                app,
+                                operation_id,
+                                done_items,
+                                total_candidates as u64,
+                            );
+                            continue;
+                        }
+                    };
                     if let Some((model, file)) = catalog_match_by_hash(catalog, size, &sha256) {
                         upsert_user_folder_row(
                             app,
@@ -299,10 +357,19 @@ async fn scan_and_register(
     // Rule 1-4: scan the directory for `.gguf` files not already accounted
     // for above, ignoring `.part` (in-progress download/upload artifacts).
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
+    {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    unsupported.push(json!({"path": dir.to_string_lossy(), "reason": error.to_string(), "retryable": true}));
+                    continue;
+                }
+            };
             let path = entry.path();
-            if !path.is_file() {
+            // A locked file may fail metadata lookup; still try it so the
+            // result reports an individual access error rather than hiding it.
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
                 continue;
             }
             let is_gguf = path
@@ -325,9 +392,20 @@ async fn scan_and_register(
 
     for path in candidates {
         let hash_path = path.clone();
-        let (size, sha256, probe) = tokio::task::spawn_blocking(move || hash_and_probe(hash_path))
+        let checked = tokio::task::spawn_blocking(move || hash_and_probe(hash_path))
             .await
-            .map_err(|error| error.to_string())??;
+            .map_err(|error| error.to_string())?;
+        let (size, sha256, probe) = match checked {
+            Ok(result) => result,
+            Err(error) => {
+                unsupported.push(
+                    json!({"path": path.to_string_lossy(), "reason": error, "retryable": true}),
+                );
+                done_items += 1;
+                let _ = set_progress_items(app, operation_id, done_items, total);
+                continue;
+            }
+        };
         if let Some((model, file)) = catalog_match_by_hash(catalog, size, &sha256) {
             if installed_from_managed_store(app, &model.slug)? {
                 duplicates.push(json!({
@@ -506,6 +584,81 @@ mod tests {
     fn temp_dir() -> PathBuf {
         let parent = std::env::temp_dir().canonicalize().unwrap();
         parent.join(format!("stt-server-next-test-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn refresh_skips_locked_files_and_recovers_on_retry() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = temp_dir();
+        let app = open_app_at(dir.clone()).unwrap();
+        let folder = dir.join("drop");
+        std::fs::create_dir_all(&folder).unwrap();
+        let good = folder.join("good.gguf");
+        let locked = folder.join("locked.gguf");
+        std::fs::write(&good, fake_gguf("whisper", "Good")).unwrap();
+        std::fs::write(&locked, fake_gguf("whisper", "Locked")).unwrap();
+        let op = uuid::Uuid::new_v4().to_string();
+        app.db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO operations(id,model_id,kind,state) VALUES(?1,'','refresh','running')",
+                params![op],
+            )
+            .unwrap();
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&locked)
+            .unwrap();
+        let first = scan_and_register(&app, &op, &folder, &[]).await.unwrap();
+        assert_eq!(first["registered"].as_array().unwrap().len(), 1);
+        assert_eq!(first["unsupported"].as_array().unwrap().len(), 1);
+        assert_eq!(first["unsupported"][0]["retryable"], true);
+        drop(handle);
+        let second = scan_and_register(&app, &op, &folder, &[]).await.unwrap();
+        assert_eq!(second["registered"].as_array().unwrap().len(), 1);
+        // Also exercise an already registered, subsequently locked file.
+        app.db
+            .lock()
+            .unwrap()
+            .execute("UPDATE installed SET needs_verification=1", [])
+            .unwrap();
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&locked)
+            .unwrap();
+        let third = scan_and_register(&app, &op, &folder, &[]).await.unwrap();
+        assert_eq!(third["unsupported"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            app.db
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM installed", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        drop(handle);
+        let fourth = scan_and_register(&app, &op, &folder, &[]).await.unwrap();
+        assert!(fourth["unsupported"].as_array().unwrap().is_empty());
+        assert_eq!(
+            app.db
+                .lock()
+                .unwrap()
+                .query_row("SELECT sum(needs_verification) FROM installed", [], |r| r
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            0
+        );
+        assert!(scan_and_register(&app, &op, &folder.join("missing"), &[])
+            .await
+            .is_err());
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn sha256_hex(bytes: &[u8]) -> String {

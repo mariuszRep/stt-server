@@ -138,8 +138,8 @@ or descriptors.
   trusted (`CONVENTIONS.md`'s trust rule).
 - **Select (load):** `POST /v1/local/models/{id}/select` (alias:
   `.../load`) -> `200 {"model": id, "backend": {"observed_backend",
-  "fallback_reason"}}`, or `422 unsupported_capability` if the model needs
-  verification first. Loading never triggers a download (`CONVENTIONS.md`:
+  "fallback_reason"}}`, or `409 needs_verification` if the model needs
+  verification first. Verify a managed model, or refresh a drop-in model, then select again. Loading never triggers a download (`CONVENTIONS.md`:
   "First start and transcription have no download side effects").
 - **Deselect / current selection:**
   `GET /v1/local/models/selected` -> the loaded model's `id` plus its full
@@ -355,3 +355,31 @@ From `whisper-vibes/apps/web/src/lib/stt-server-client.ts` and
 | `LocalRuntimeProvider.listModels()` (`GET /v1/config`) | `GET /v1/local/models` or `GET /v1/models` |
 | `LocalRuntimeProvider.transcribe()` (`POST /v1/audio/transcriptions`, `{ text }`) | same path, same multipart shape, richer response (`language`/`duration`/`segments`/`x_diagnostics`); **always send `model` going forward** even though the server now defaults it (see 5) |
 | sherpa-onnx per-runtime quirks (`prompt` dropped, no per-request `language`) | not applicable: one engine (whisper-family via `transcribe-cpp`); use the capability matrix (4.1) instead of hardcoding per-runtime quirks |
+
+## Startup and model-file recovery
+
+Startup checks installed model size and modification time against the fingerprint recorded
+after a successful install or verification; it does not hash every managed model on each
+launch. Changed, missing or temporarily inaccessible managed files stay registered with
+their saved selection, but are marked as needing verification and are not automatically
+loaded. Existing installations without a recorded modification time need one explicit
+verification to establish that fingerprint. No model download is required for this step.
+The selected model's normal loading cost still applies; this change removes catalog-wide
+hashing, not inference-engine initialization.
+
+Explicit verification distinguishes an unreadable or concurrently changing file from a
+confirmed size/hash mismatch. Read failures preserve the file and registration and report
+a retryable failure. A successful retry records the fingerprint and clears the verification
+flag. Confirmed corruption retains the existing rejection/quarantine policy for managed
+files; user-folder files are never moved or deleted.
+
+Folder refresh continues past individual unreadable files, listing their reasons and
+retryable: true in the existing unsupported result list. Existing registrations are
+preserved and flagged for verification on read errors. A later refresh retries flagged
+files even if their size and timestamp are unchanged. An unreadable folder itself fails
+the operation instead of reporting a successful empty scan.
+
+The CLI stop command uses the data-folder lock and authenticated shutdown. It never
+force-kills a saved PID. Stale discovery is cleared only while holding that lock. If
+shutdown cannot be requested or confirmed, stop returns failure and leaves processes alone;
+retry after the server finishes starting or its outstanding work completes.

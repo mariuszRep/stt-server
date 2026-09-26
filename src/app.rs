@@ -148,10 +148,17 @@ fn reconcile_user_folder_row(
     let artifact = PathBuf::from(path);
     let metadata = fs::metadata(&artifact);
     match metadata {
-        Err(_) => {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             db.execute("DELETE FROM installed WHERE id=?1", params![id])?;
             db.execute(
                 "DELETE FROM settings WHERE key='selected_model' AND value=?1",
+                params![id],
+            )?;
+        }
+        Err(error) => {
+            eprintln!("model {id} temporarily unavailable: {error}; verify or refresh to retry");
+            db.execute(
+                "UPDATE installed SET needs_verification=1 WHERE id=?1",
                 params![id],
             )?;
         }
@@ -161,7 +168,9 @@ fn reconcile_user_folder_row(
                 .ok()
                 .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|duration| duration.as_millis() as i64);
-            let changed = Some(info.len()) != recorded_size || mtime_ms != recorded_mtime;
+            let changed = mtime_ms.is_none()
+                || Some(info.len()) != recorded_size
+                || mtime_ms != recorded_mtime;
             if changed {
                 db.execute(
                     "UPDATE installed SET needs_verification=1 WHERE id=?1",
@@ -218,32 +227,23 @@ fn reconcile_installed(
                 .find(|model| model.slug == id)
                 .and_then(|model| model.files.iter().find(|file| file.quant == quant))
         });
-        let owned_path = fs::canonicalize(&artifact)
-            .ok()
-            .is_some_and(|resolved| resolved.starts_with(&model_dir));
-        let verified = if let Some(file) = expected {
-            owned_path
-                && file.sha256.eq_ignore_ascii_case(&recorded_hash)
-                && fs::metadata(&artifact).is_ok_and(|info| info.len() == file.size_bytes)
-                && crate::verify::sha256_file(&artifact)
-                    .is_ok_and(|actual| actual.eq_ignore_ascii_case(&file.sha256))
-        } else {
-            false
-        };
-        if !verified {
-            db.execute("DELETE FROM installed WHERE id=?1", params![id])?;
+        // Startup only checks the fingerprint recorded after verification.
+        // Missing/changed/inaccessible files stay registered, but cannot load.
+        let unchanged = expected.is_some_and(|file| {
+            file.sha256.eq_ignore_ascii_case(&recorded_hash)
+                && recorded_size == Some(file.size_bytes as i64)
+                && fs::canonicalize(&artifact).is_ok_and(|p| p.starts_with(&model_dir))
+                && fs::metadata(&artifact).is_ok_and(|m| m.len() == file.size_bytes)
+                && crate::verify::file_mtime_ms(&artifact)
+                    .ok()
+                    .is_some_and(|mtime| Some(mtime) == recorded_mtime)
+        });
+        if !unchanged {
             db.execute(
-                "DELETE FROM settings WHERE key='selected_model' AND value=?1",
+                "UPDATE installed SET needs_verification=1 WHERE id=?1",
                 params![id],
             )?;
-            if owned_path {
-                let quarantine = data_dir.join("quarantine");
-                fs::create_dir_all(&quarantine)?;
-                fs::rename(
-                    &artifact,
-                    quarantine.join(format!("{}-invalid.gguf", Uuid::new_v4())),
-                )?;
-            }
+            eprintln!("model {id} needs verification; file and saved selection preserved");
         }
     }
     Ok(())
@@ -309,7 +309,7 @@ pub fn open_app_at_full(
     reconcile_installed(&db, &catalog.models, &data_dir)?;
     let selected: Option<(String, String)> = db
         .query_row(
-            "SELECT i.id,i.path FROM installed i JOIN settings s ON s.key='selected_model' AND s.value=i.id",
+            "SELECT i.id,i.path FROM installed i JOIN settings s ON s.key='selected_model' AND s.value=i.id WHERE i.needs_verification=0",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -531,5 +531,99 @@ mod tests {
         drop(reopened);
         fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
         fs::remove_dir_all(dropdir.canonicalize().unwrap()).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn managed_startup_checks_metadata_without_reading_contents() {
+        let dir = std::env::temp_dir().join(format!("stt-recovery-test-{}", Uuid::new_v4()));
+        let app = open_app_at(dir.clone()).unwrap();
+        let mut model = app.catalog[0].clone();
+        model.files[0].size_bytes = 4;
+        let file = &model.files[0];
+        let artifact = dir.join("models/test.gguf");
+        // Deliberately not the catalog hash: an unchanged fingerprint means no
+        // startup content read. Explicit verification remains responsible for hashes.
+        fs::write(&artifact, b"test").unwrap();
+        let mtime = crate::verify::file_mtime_ms(&artifact).unwrap();
+        let db = app.db.lock().unwrap();
+        db.execute("INSERT INTO installed(id,path,sha256,quant,size_bytes,source,mtime_ms) VALUES(?1,?2,?3,?4,4,'import',?5)",
+            params![model.slug, artifact.to_string_lossy(), file.sha256, file.quant, mtime]).unwrap();
+        reconcile_installed(&db, &[model.clone()], &dir).unwrap();
+        let needs = || {
+            db.query_row("SELECT needs_verification FROM installed", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(needs(), 0);
+        db.execute("UPDATE installed SET mtime_ms=NULL", [])
+            .unwrap();
+        reconcile_installed(&db, &[model.clone()], &dir).unwrap();
+        assert_eq!(needs(), 1);
+        assert!(artifact.exists());
+        db.execute(
+            "UPDATE installed SET needs_verification=0,mtime_ms=?1",
+            params![mtime],
+        )
+        .unwrap();
+        fs::write(&artifact, b"changed size").unwrap();
+        reconcile_installed(&db, &[model], &dir).unwrap();
+        assert_eq!(needs(), 1);
+        assert!(artifact.exists());
+        drop(db);
+        drop(app);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn startup_preserves_locked_model_and_saved_selection() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("stt-recovery-test-{}", Uuid::new_v4()));
+        let app = open_app_at(dir.clone()).unwrap();
+        let artifact = dir.join("locked.gguf");
+        fs::write(&artifact, b"test").unwrap();
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&artifact)
+            .unwrap();
+        {
+            let db = app.db.lock().unwrap();
+            db.execute("INSERT INTO installed(id,path,sha256,source,size_bytes,mtime_ms) VALUES('locked',?1,'x','user_folder',4,0)", params![artifact.to_string_lossy()]).unwrap();
+            db.execute(
+                "INSERT INTO settings(key,value) VALUES('selected_model','locked')",
+                [],
+            )
+            .unwrap();
+        }
+        drop(app);
+        let reopened = open_app_at(dir.clone()).unwrap();
+        assert!(reopened.loaded.lock().unwrap().is_none());
+        let db = reopened.db.lock().unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT value FROM settings WHERE key='selected_model'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "locked"
+        );
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM installed", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        drop(db);
+        drop(reopened);
+        drop(lock);
+        assert!(artifact.exists());
+        fs::remove_dir_all(dir).unwrap();
     }
 }

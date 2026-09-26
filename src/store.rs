@@ -353,7 +353,14 @@ pub fn promote_verified_model_with_source(
             ],
         )
         .map_err(|error| error.to_string())?;
+    let mtime = crate::verify::file_mtime_ms(stage).map_err(|error| error.to_string())?;
     fs::rename(stage, &destination).map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "UPDATE installed SET mtime_ms=?2, needs_verification=0 WHERE id=?1",
+            params![model_id, mtime],
+        )
+        .map_err(|error| error.to_string())?;
     let now = now_ms();
     transaction
         .execute(

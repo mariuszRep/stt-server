@@ -213,16 +213,17 @@ default the same way.
 **Single instance and discovery**: on startup the server writes `<data dir>\server.json`
 (`{pid, host, port, version, started_at}`, atomically) and holds an exclusive
 `<data dir>\server.lock`; a second instance pointed at the same data directory exits immediately
-with a clear error (exit code 3). `status` and `stop` read `server.json`, then verify the PID is
-still alive *and* `/health` answers -- a stale file (crashed process) is treated as "not running"
-and cleaned up. A bind failure (e.g. port already in use) exits with code 4.
+with a clear error (exit code 3). `status` checks the saved PID and health endpoint. `stop`
+uses the exclusive lock to identify an absent instance and safely clear stale discovery.
+A bind failure (e.g. port already in use) exits with code 4.
 
 **`start`** spawns the same executable with `run` and the given flags as a detached background
 process (`CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` on Windows), waits up
 to 30s for `/health`, then prints the pid and port. Calling `start` again while already running
 is a no-op success. **`stop`** calls the authenticated `POST /v1/local/shutdown` (using the token
-from `<data dir>\auth.token`) to trigger a graceful axum shutdown, waits up to 15s, and falls
-back to terminating the process by PID if the endpoint doesn't work or the process doesn't exit.
+from `<data dir>\auth.token`) to trigger graceful shutdown and waits up to 15s for the
+data-folder lock to be released. An unavailable endpoint or a shutdown timeout returns
+failure without forcibly terminating any process.
 
 **LAN mode**: binding to anything other than a loopback address (`127.0.0.1`/`::1`) -- including
 `0.0.0.0`/`::` or a specific LAN IP -- logs a warning that the server is reachable from the
@@ -286,3 +287,31 @@ respective upstream attribution and licences in their package sources.
 The four Voice Typer dictation clips in the nested server's completed Parakeet benchmark goal
 form a seed corpus. Broader language, long-dictation, and technical-vocabulary evidence is
 required before any replacement verdict.
+
+## Startup and model-file recovery
+
+Startup checks installed model size and modification time against the fingerprint recorded
+after a successful install or verification; it does not hash every managed model on each
+launch. Changed, missing or temporarily inaccessible managed files stay registered with
+their saved selection, but are marked as needing verification and are not automatically
+loaded. Existing installations without a recorded modification time need one explicit
+verification to establish that fingerprint. No model download is required for this step.
+The selected model's normal loading cost still applies; this change removes catalog-wide
+hashing, not inference-engine initialization.
+
+Explicit verification distinguishes an unreadable or concurrently changing file from a
+confirmed size/hash mismatch. Read failures preserve the file and registration and report
+a retryable failure. A successful retry records the fingerprint and clears the verification
+flag. Confirmed corruption retains the existing rejection/quarantine policy for managed
+files; user-folder files are never moved or deleted.
+
+Folder refresh continues past individual unreadable files, listing their reasons and
+retryable: true in the existing unsupported result list. Existing registrations are
+preserved and flagged for verification on read errors. A later refresh retries flagged
+files even if their size and timestamp are unchanged. An unreadable folder itself fails
+the operation instead of reporting a successful empty scan.
+
+The CLI stop command uses the data-folder lock and authenticated shutdown. It never
+force-kills a saved PID. Stale discovery is cleared only while holding that lock. If
+shutdown cannot be requested or confirmed, stop returns failure and leaves processes alone;
+retry after the server finishes starting or its outstanding work completes.
