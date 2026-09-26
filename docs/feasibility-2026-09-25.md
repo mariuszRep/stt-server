@@ -311,17 +311,18 @@ curl -X POST http://127.0.0.1:54321/v1/audio/transcriptions \
 # -> HTTP 200, x_diagnostics has no "language_hint_applied" key at all
 ```
 
-**Bug 3 — `/v1/audio/translations` with `language=en` on an English-source clip reports `task: "transcribe"` instead of `"translate"`.**
-With no language hint, the same endpoint correctly reports `task: "translate"`. Adding
-`language=en` (source already matches the translation target) flips the reported task and
-`language_evidence` to `"translated_to_english"` — the output text is unaffected (unchanged from
-English), but the `task` field misrepresents which endpoint/operation was invoked. Repro:
+**Not a bug — `/v1/audio/translations` with `language=en` on an English-source clip reports
+`task: "transcribe"` (previously mislabeled "Bug 3").** This is the designed Handy rule: when the
+translation source already matches the `en` translation target, the plan runs `transcribe` instead
+of a no-op `translate`, and reports `language_evidence: "translated_to_english"` so the client can
+tell the two apart. The output text is correct either way (unchanged from English); `task` reports
+which operation actually ran, not which endpoint was hit. No change made. Repro (for reference):
 ```
 curl -X POST http://127.0.0.1:54321/v1/audio/translations \
   -H "Authorization: Bearer $TOKEN" \
   -F "file=@test-data/stereo48.wav" -F "model=whisper-tiny" -F "language=en" \
   -F "response_format=verbose_json"
-# -> HTTP 200, "task":"transcribe" (expected "translate")
+# -> HTTP 200, "task":"transcribe", "language_evidence":"translated_to_english" — intended.
 ```
 
 ### Skipped / not exercised
@@ -333,3 +334,58 @@ curl -X POST http://127.0.0.1:54321/v1/audio/translations \
 
 The server process and its temp data directory (imported/installed models, SQLite state, token)
 were stopped and deleted after the round; no other repos or `.projectflows` files were touched.
+
+## Bug fixes + real-model re-check — 2026-09-26
+
+Fixed Bug 1 and Bug 2 above. Bug 3 was reclassified as intended behaviour (see the "Not a bug"
+note above) — no code change for it.
+
+**Bug 1 fix.** `src/run_plan.rs`: `Plan` gained `timestamps_explicit` (was the `verbose_json`
+timestamp kind chosen by an explicit `timestamp_granularities` entry, or defaulted?) and the pure,
+unit-tested `should_retry_without_timestamps(response_format, timestamps, timestamps_explicit,
+error_code)` decision function. `src/api.rs`'s `transcribe_or_translate` now runs the retry inside
+the same `spawn_blocking` task and permit hold (no re-queue): on `Unsupported` from a defaulted
+segment-timestamp `verbose_json` run, it re-runs once with `TimestampKind::None` on a fresh session
+against the same loaded model. A successful retry returns 200 with `x_diagnostics.
+timestamps_unavailable: true` and no `segments`/`words` data; an explicit
+`timestamp_granularities[]=segment` request is never retried and still surfaces the engine's 422.
+`src/capabilities.rs`: `LoadedCaps` gained `timestamp_granularity_rejected`
+(`EffectiveCaps::mark_timestamp_granularity_rejected`); once a real run rejects the model's
+advertised granularity, the cached `EffectiveCaps` on `App::loaded` is updated under that struct's
+existing brief lock so `timestamp_granularity` reports `status: unsupported`, `evidence:
+run_rejected` for the rest of that model's load, without touching the catalog view.
+
+**Bug 2 fix.** `src/run_plan.rs`: `Plan` gained `language_hint_provided` (was a non-empty,
+non-`auto` `language` sent at all?), independent of `language_hint_applied` (was it honored?).
+`src/format.rs`: `DiagnosticsExtra.language_hint_applied` changed from `bool` to `Option<bool>`;
+`x_diagnostics.language_hint_applied` is now emitted (`true` or `false`) only when a hint was
+provided, and omitted entirely otherwise.
+
+### Real re-check
+
+Env per the gate matrix (Vulkan SDK, static CRT, offline cargo). `cargo fmt --check`, `cargo clippy
+--release --all-targets --offline -- -D warnings`, and `cargo test --release --offline` all green
+(138 tests: 132 + 6, 0 failed). `scripts\build-local.ps1 -Offline` produced
+`s\release\stt-server-next.exe`, 65,995,264 bytes, SHA-256
+`e3ddb6b91430d66efa9122db07d4bef68c743917be61b93e51890a01c7b80256`.
+
+Fresh `STT_NEXT_DATA_DIR` under `%TEMP%`, server on `127.0.0.1:54321`. Installed `whisper-tiny`
+(`Q4_K_M`, HTTP 202 → `completed`) and `moonshine-streaming-tiny` (`Q8_0`, HTTP 202 →
+`completed`); imported Parakeet from the `test-data\models` fixture (multipart, HTTP 201 →
+`completed`).
+
+| Check | Result |
+|---|---|
+| moonshine-streaming-tiny `verbose_json` (default timestamps) | HTTP 200; `x_diagnostics.timestamps_unavailable: true`; no `segments`/`words` content; `language_evidence: "model_constrained"` |
+| `/v1/local/models/selected` after that run | `effective_capabilities.timestamp_granularity`: `status: "unsupported"`, `evidence: "run_rejected"`, `reason: "run_rejected"` |
+| moonshine-streaming-tiny `verbose_json` + explicit `timestamp_granularities[]=segment` | HTTP 422 `engine_unsupported` (unchanged — explicit request, no downgrade) |
+| Parakeet `verbose_json` | HTTP 200 with a populated `segments` array (unaffected by Bug 1's retry path) |
+| whisper-tiny `verbose_json` | HTTP 200 with 2 populated `segments` (unaffected) |
+| whisper-tiny `language=xx` | HTTP 200; `x_diagnostics.language_hint_applied: false` present |
+| Parakeet `language=de` | HTTP 200; `x_diagnostics.language_hint_applied: false` present |
+| whisper-tiny, no language param | HTTP 200; `language_hint_applied` key absent |
+| Parakeet, no language param | HTTP 200; `language_hint_applied` key absent |
+| whisper-tiny `/v1/audio/translations` `language=en` | HTTP 200; `task: "transcribe"`, `language_evidence: "translated_to_english"`, `language_hint_applied: true` — confirmed intended, unchanged |
+
+Server stopped and its temp data directory deleted after the round; no other repos or
+`.projectflows` files touched; no service install performed.
