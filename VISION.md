@@ -1,19 +1,36 @@
-# STT Server Next
+# STT Server Next — Vision
 
-> Prototype intent approved for local validation; a separate decision is required for a Voice
-> Typer production cutover.
+> Approved by the user on 2026-09-26. Change only on explicit human instruction.
 
-One Windows executable owns local GGUF speech-model installation, durable state, and batch
-transcription. It exposes an authenticated OpenAI-compatible API and local management routes,
-with no provider subprocesses or shipped inference DLLs. The first release target is Windows
-x64 with CPU and Vulkan in the same binary, falling back to CPU if a chosen model cannot load
-on Vulkan.
+## What it is
 
-A fresh service presents a fixed Handy-informed model recommendation order and waits for a
-user's explicit download choice. No hardware-detection endpoint ranks models. A per-model
-capability matrix states which optional request fields the engine and API actually support.
+One self-contained local speech-to-text server. A person installs a single program, and it
+manages speech models and turns audio into text for any application that asks, through the
+OpenAI audio API that many tools already understand. Voice Typer is its first client, not its
+only one.
 
-The current STT SDK, server, Windows app, and Voice Typer gitlink pins stay unchanged while
-this repository proves its own behavior. SDK and app integration belong to a separate cutover
-goal after parity evidence and a replacement verdict.
+## What it promises
 
+- **One program, one engine.** No helper processes, no Python, no separately shipped inference
+  libraries. It runs on the CPU everywhere and uses the GPU through Vulkan when it can, and it
+  always says which one it actually used.
+- **Every model Handy supports.** The full Handy GGUF catalog is available in every published
+  quantisation. People can also drop their own GGUF files into a folder and refresh.
+- **The person decides.** Nothing downloads until someone chooses a model. Recommendations
+  follow a fixed curated order, never a guess about the user's hardware.
+- **Honest capabilities.** Each loaded model states which options it really supports (prompt,
+  language hint, translation, temperature, timestamps). Clients use that to show or hide
+  controls. The server never pretends an option worked.
+- **Transcription stays simple.** Applications send finished audio and get text back. The
+  client owns the dictation session: microphone, chunking, prompts and vocabulary, and editing
+  the result. The server passes a prompt through unchanged and never rewrites a transcript.
+- **Runs the way people need it.** By default it starts and stops with the app that uses it.
+  It can also run on its own: at Windows sign-in, as a Windows Service, or on the local network
+  for other devices, always behind a token.
+- **Open source.** It will be published as an open-source project, with public releases the
+  server can update itself from.
+
+## Not in scope
+
+Live streaming transcripts, server-side microphone capture or voice-activity detection,
+holding a user's dictation session, and cloud or multi-tenant hosting.
