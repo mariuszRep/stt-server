@@ -138,10 +138,10 @@ All three are visible on `GET /v1/local/config` and settable via `PATCH /v1/loca
 (`null` clears a setting back to unbounded/no-timeout; a non-positive value is rejected with 400).
 They apply **live**: the server keeps an in-memory copy (`App::limits`, a `std::sync::RwLock`,
 read at request time), so a `PATCH` takes effect on the very next request with no restart. The
-default binary (`stt-server-next.exe`, not the `service`/`install`/`uninstall` subcommands) also
-accepts `--queue-max-waiting <n>`, `--queue-wait-timeout-ms <n>`, and `--inference-timeout-ms <n>`
-flags, which override the stored settings for that process only; an unrecognized flag or a
-non-positive value prints an error to stderr and exits with code 2.
+`run`/`start`/`restart` commands (see "CLI" below; not `service`/`autostart`) also accept
+`--queue-max-waiting <n>`, `--queue-wait-timeout-ms <n>`, and `--inference-timeout-ms <n>` flags,
+which override the stored settings for that process only; an unrecognized flag or a non-positive
+value prints an error to stderr and exits with code 2.
 
 Multipart parsing, validation, and `decode_wav` all happen before a request joins the queue. If
 the client disconnects while queued or running, the handler future is dropped and the queue slot
@@ -171,6 +171,63 @@ next server start, when the `tower_http::cors::CorsLayer` is built from the pers
 still requires one. When origins are restricted (not `*`), `Authorization` and `Content-Type` are
 explicitly allowed.
 
+## CLI
+
+`stt-server-next.exe` is hand-parsed (no argument-parsing dependency); `--help`/`-h`/`help`
+prints usage, and an unknown command or flag prints an error and exits with code 2.
+
+```
+stt-server-next [run] [flags]              foreground (default when no command given)
+stt-server-next start [flags]              detached background process; no-op if already running
+stt-server-next stop [--data-dir <path>]   graceful stop of the running instance
+stt-server-next restart [flags]            stop then start
+stt-server-next status [--json] [--data-dir <path>]
+stt-server-next autostart enable [flags]   per-user "start with Windows" (no admin)
+stt-server-next autostart disable
+stt-server-next autostart status
+stt-server-next service install|uninstall|run   existing Windows Service host
+```
+
+`run`/`start`/`restart`/`autostart enable` share: `--port <n>` (default 54321), `--host <addr>`
+(default `127.0.0.1`), `--data-dir <path>`, plus the existing `--queue-max-waiting`,
+`--queue-wait-timeout-ms`, `--inference-timeout-ms`. The top-level `install`/`uninstall`
+spellings and bare `service` (no subcommand vs. `service run`) keep working as aliases for
+`service install`/`service uninstall`/`service run`.
+
+**Bind precedence**: `--port`/`--host` (CLI flag) > the stored `bind_host`/`bind_port` settings
+(readable/settable via `GET`/`PATCH /v1/local/config`; a bind change reports
+`restart_required: true` and takes effect on the next start) > the hard default
+`127.0.0.1:54321`. `--data-dir` overrides `STT_NEXT_DATA_DIR` and the `%LOCALAPPDATA%`-based
+default the same way.
+
+**Single instance and discovery**: on startup the server writes `<data dir>\server.json`
+(`{pid, host, port, version, started_at}`, atomically) and holds an exclusive
+`<data dir>\server.lock`; a second instance pointed at the same data directory exits immediately
+with a clear error (exit code 3). `status` and `stop` read `server.json`, then verify the PID is
+still alive *and* `/health` answers -- a stale file (crashed process) is treated as "not running"
+and cleaned up. A bind failure (e.g. port already in use) exits with code 4.
+
+**`start`** spawns the same executable with `run` and the given flags as a detached background
+process (`CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` on Windows), waits up
+to 30s for `/health`, then prints the pid and port. Calling `start` again while already running
+is a no-op success. **`stop`** calls the authenticated `POST /v1/local/shutdown` (using the token
+from `<data dir>\auth.token`) to trigger a graceful axum shutdown, waits up to 15s, and falls
+back to terminating the process by PID if the endpoint doesn't work or the process doesn't exit.
+
+**LAN mode**: binding to anything other than a loopback address (`127.0.0.1`/`::1`) -- including
+`0.0.0.0`/`::` or a specific LAN IP -- logs a warning that the server is reachable from the
+network and requires a usable bearer token (fails closed if the token file can't be read/created).
+`/health` stays unauthenticated; every other route, including the new shutdown endpoint, still
+requires the token. The shutdown endpoint additionally only accepts callers connecting from a
+loopback address, regardless of token, even when the server itself is bound to a LAN address.
+
+**Autostart**: `enable` writes a per-user (no admin) `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+value named `OpenVibeSttServer` set to `"<exe path>" start --data-dir "<data dir>"` (plus any
+given `--port`/`--host`); `disable` removes it; `status` reports the stored command line or
+"disabled". Implemented with the built-in `reg.exe` (the same pattern `service.rs` already uses
+for `icacls`), so no new registry-access dependency was added. Windows-only; other platforms
+report "not supported" and exit 2.
+
 ## Local build
 
 Requires Rust MSVC, Visual Studio C++ Build Tools, CMake, and the Vulkan SDK. Build the service
@@ -188,8 +245,9 @@ cargo run --release --bin stt-proof -- "C:\path\to\model.gguf" "C:\path\to\sampl
 cargo run --release --bin stt-proof -- "C:\path\to\model.gguf" "C:\path\to\sample.wav" --cpu
 ```
 
-Set `STT_NEXT_DATA_DIR` to a test directory and run `stt-server-next.exe` for a local instance
-on `127.0.0.1:54321`. `install` and `uninstall`
+Set `STT_NEXT_DATA_DIR` to a test directory and run `stt-server-next.exe start` (or plain `run`
+for the foreground default) for a local instance on `127.0.0.1:54321`; see "CLI" above for the
+full command surface. `service install` and `service uninstall` (aliases: `install`/`uninstall`)
 register or remove the Windows Service with elevation. Installation copies the same executable
 under `%ProgramFiles%\\OpenVibeAI\\STT Server Next` and keeps state, models, and a protected
 token under `%ProgramData%\\OpenVibeAI\\STT Server Next`. Uninstall

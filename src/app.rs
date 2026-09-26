@@ -31,6 +31,27 @@ pub struct App {
     pub limits: std::sync::RwLock<RuntimeLimits>,
     pub selection: tokio::sync::Mutex<()>,
     pub http: reqwest::Client,
+    /// Effective bind host/port this process resolved at startup (CLI flag >
+    /// stored `bind_host`/`bind_port` setting > default 127.0.0.1:54321).
+    /// `run_http` binds to this; `/v1/local/shutdown` uses it to decide
+    /// whether a caller is loopback.
+    pub bind_host: String,
+    pub bind_port: u16,
+    /// Set by `api::run_http_full` while serving; `POST /v1/local/shutdown`
+    /// takes it and fires it to trigger axum's graceful shutdown.
+    pub shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+pub const DEFAULT_BIND_HOST: &str = "127.0.0.1";
+pub const DEFAULT_BIND_PORT: u16 = 54321;
+
+/// CLI-supplied bind overrides (from `--host`/`--port`), taking precedence
+/// over the stored `bind_host`/`bind_port` settings, which in turn take
+/// precedence over the hard defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BindOverrides {
+    pub host: Option<String>,
+    pub port: Option<u16>,
 }
 
 /// Optional operational limits; `None` means unbounded/no-timeout, matching
@@ -265,6 +286,16 @@ pub fn open_app_at_with_overrides(
     data_dir: PathBuf,
     cli_overrides: RuntimeLimits,
 ) -> Result<Arc<App>, Box<dyn Error>> {
+    open_app_at_full(data_dir, cli_overrides, BindOverrides::default())
+}
+
+/// Full opener: also resolves the effective bind host/port from
+/// `bind_overrides` (CLI `--host`/`--port`) > stored settings > default.
+pub fn open_app_at_full(
+    data_dir: PathBuf,
+    cli_overrides: RuntimeLimits,
+    bind_overrides: BindOverrides,
+) -> Result<Arc<App>, Box<dyn Error>> {
     let catalog: Catalog = serde_json::from_str(include_str!("../catalog/handy-2026-08-17.json"))?;
     fs::create_dir_all(data_dir.join("models"))?;
     fs::create_dir_all(data_dir.join("staging"))?;
@@ -327,6 +358,15 @@ pub fn open_app_at_with_overrides(
             .inference_timeout_ms
             .or(stored_limits.inference_timeout_ms),
     };
+    let (stored_host, stored_port) = crate::store::read_bind_settings(&db)?;
+    let bind_host = bind_overrides
+        .host
+        .or(stored_host)
+        .unwrap_or_else(|| DEFAULT_BIND_HOST.to_owned());
+    let bind_port = bind_overrides
+        .port
+        .or(stored_port)
+        .unwrap_or(DEFAULT_BIND_PORT);
     Ok(Arc::new(App {
         catalog: catalog.models,
         db: Mutex::new(db),
@@ -342,6 +382,9 @@ pub fn open_app_at_with_overrides(
         http: reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(20))
             .build()?,
+        bind_host,
+        bind_port,
+        shutdown: Mutex::new(None),
     }))
 }
 

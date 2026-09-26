@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::{
-    extract::{DefaultBodyLimit, Multipart, Path as UrlPath, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path as UrlPath, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -43,8 +43,11 @@ pub async fn get_config(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiR
     let user_models_dir = user_models_dir_setting(&app)?.or_else(|| {
         crate::app::default_user_models_dir().map(|path| path.to_string_lossy().into_owned())
     });
+    let (stored_bind_host, stored_bind_port) = crate::store::bind_settings(&app)?;
     Ok(Json(json!({
-        "bind":"127.0.0.1:54321",
+        "bind": format!("{}:{}", app.bind_host, app.bind_port),
+        "bind_host": stored_bind_host,
+        "bind_port": stored_bind_port,
         "preferred_backend":backend_preference(&app)?,
         "max_audio_bytes":40 * 1024 * 1024,
         "streaming":false,
@@ -84,6 +87,10 @@ pub struct ConfigPatch {
     /// The drop-in models folder (see "Drop-in models and refresh"). Must be
     /// an absolute, existing directory, else 400 `invalid_user_models_dir`.
     user_models_dir: Option<String>,
+    /// Stored bind host/port (phase 1a). Takes effect on the next server
+    /// start; a running process keeps its current bind.
+    bind_host: Option<String>,
+    bind_port: Option<i64>,
 }
 
 pub async fn patch_config(
@@ -169,6 +176,24 @@ pub async fn patch_config(
             ));
         }
     }
+    if let Some(host) = &patch.bind_host {
+        if !crate::store::validate_bind_host(host) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_bind_host",
+                "bind_host must be a valid IPv4 or IPv6 address",
+            ));
+        }
+    }
+    if let Some(port) = patch.bind_port {
+        if !crate::store::validate_bind_port(port) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_bind_port",
+                "bind_port must be an integer from 1 to 65535",
+            ));
+        }
+    }
     {
         let db = app.db.lock().map_err(internal)?;
         if let Some(backend) = &patch.preferred_backend {
@@ -197,6 +222,24 @@ pub async fn patch_config(
             )
             .map_err(internal)?;
             response.insert("user_models_dir".to_owned(), json!(dir));
+        }
+        if let Some(host) = &patch.bind_host {
+            db.execute(
+                "INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![crate::store::SETTING_BIND_HOST, host],
+            )
+            .map_err(internal)?;
+            response.insert("bind_host".to_owned(), json!(host));
+            restart_required = true;
+        }
+        if let Some(port) = patch.bind_port {
+            db.execute(
+                "INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![crate::store::SETTING_BIND_PORT, port.to_string()],
+            )
+            .map_err(internal)?;
+            response.insert("bind_port".to_owned(), json!(port));
+            restart_required = true;
         }
         for (key, value, response_key) in [
             (
@@ -1050,6 +1093,7 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route("/v1/local/recommendations", get(recommendations))
         .route("/v1/local/config", get(get_config).patch(patch_config))
+        .route("/v1/local/shutdown", post(shutdown_endpoint))
         .route("/v1/local/models", get(local_models))
         .route("/v1/local/models/refresh", post(refresh_models))
         .route(
@@ -1084,18 +1128,132 @@ pub async fn run_http_with_overrides(
     cli_overrides: crate::app::RuntimeLimits,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn Error>> {
-    let app = crate::app::open_app_at_with_overrides(crate::app::data_dir(), cli_overrides)?;
+    run_http_full(
+        crate::app::data_dir(),
+        cli_overrides,
+        crate::app::BindOverrides::default(),
+        shutdown,
+    )
+    .await
+    .map_err(|error| -> Box<dyn Error> { Box::new(std::io::Error::other(error.to_string())) })
+}
+
+/// Errors distinguished so the CLI can map them to the spec's exit codes:
+/// single-instance lock held (3) vs bind failure / port in use (4).
+#[derive(Debug)]
+pub enum ServeError {
+    AlreadyRunning,
+    BindFailed(std::io::Error),
+    Other(Box<dyn Error>),
+}
+
+impl std::fmt::Display for ServeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServeError::AlreadyRunning => write!(f, "another instance holds the data dir's lock"),
+            ServeError::BindFailed(e) => write!(f, "failed to bind: {e}"),
+            ServeError::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+impl std::error::Error for ServeError {}
+
+/// Full foreground server run: opens `App` at `data_dir` with the given
+/// overrides, acquires the single-instance lock, enforces the LAN token
+/// guard, writes `server.json`, serves until `shutdown` resolves, then
+/// cleans up the discovery file. Used by both `run` and the detached process
+/// `start` spawns.
+pub async fn run_http_full(
+    data_dir: std::path::PathBuf,
+    cli_overrides: crate::app::RuntimeLimits,
+    bind_overrides: crate::app::BindOverrides,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), ServeError> {
+    // Single-instance guard: held for the process lifetime (the returned
+    // file's lock releases on drop/exit).
+    let _lock =
+        crate::discovery::acquire_lock(&data_dir).map_err(|_| ServeError::AlreadyRunning)?;
+
+    let app = crate::app::open_app_at_full(data_dir.clone(), cli_overrides, bind_overrides)
+        .map_err(ServeError::Other)?;
+
+    // LAN guard: refuse to start on a non-loopback bind unless the token is
+    // present and non-empty. `token_file`/`open_app_at_full` already fail if
+    // the token can't be created/read, but re-check explicitly here so a
+    // future refactor of that path can't silently weaken this guard.
+    let loopback = crate::discovery::is_loopback_host(&app.bind_host);
+    if !loopback {
+        if app.token.is_empty() {
+            return Err(ServeError::Other(
+                "refusing to bind a non-loopback address without a usable auth token".into(),
+            ));
+        }
+        eprintln!(
+            "warning: binding to {}:{} is reachable from the network; all routes except /health require the bearer token",
+            app.bind_host, app.bind_port
+        );
+    }
+
     let router = router(app.clone());
-    let address: SocketAddr = "127.0.0.1:54321".parse()?;
-    let listener = tokio::net::TcpListener::bind(address).await?;
+    let address: SocketAddr = format!("{}:{}", app.bind_host, app.bind_port)
+        .parse()
+        .map_err(|e| ServeError::Other(Box::new(e)))?;
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .map_err(ServeError::BindFailed)?;
     println!(
         "listening on {address}; token file: {}",
         app.data_dir.join("auth.token").display()
     );
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown)
-        .await?;
-    Ok(())
+    let info = crate::discovery::ServerInfo::new(app.bind_host.clone(), app.bind_port);
+    if let Err(error) = crate::discovery::write_server_json(&data_dir, &info) {
+        eprintln!("warning: could not write server.json: {error}");
+    }
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    *app.shutdown.lock().unwrap() = Some(shutdown_tx);
+    let combined_shutdown = async move {
+        tokio::select! {
+            _ = shutdown => {},
+            _ = shutdown_rx => {},
+        }
+    };
+    let result = axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(combined_shutdown)
+    .await;
+    crate::discovery::remove_server_json(&data_dir);
+    result.map_err(|e| ServeError::Other(Box::new(e)))
+}
+
+/// Pure decision used by [`shutdown_endpoint`] (and exercised directly by
+/// tests without spinning up a real connection): only a loopback peer
+/// address may request shutdown, regardless of token validity.
+pub fn caller_is_loopback(peer: SocketAddr) -> bool {
+    peer.ip().is_loopback()
+}
+
+/// `POST /v1/local/shutdown`: triggers graceful axum shutdown. Loopback-only
+/// (rejected with 403 even when the bearer token is valid) and otherwise
+/// token-protected like every other mutating route.
+pub async fn shutdown_endpoint(
+    State(app): State<Arc<App>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    if !caller_is_loopback(peer) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "loopback_only",
+            "The shutdown endpoint only accepts loopback callers",
+        ));
+    }
+    authorized(&headers, &app)?;
+    if let Some(sender) = app.shutdown.lock().map_err(internal)?.take() {
+        let _ = sender.send(());
+    }
+    Ok(Json(json!({"stopping": true})))
 }
 
 #[cfg(test)]
@@ -1720,5 +1878,182 @@ mod router_tests {
         drop(app);
         std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
         std::fs::remove_dir_all(dropdir.canonicalize().unwrap()).unwrap();
+    }
+
+    fn with_peer(mut request: Request<Body>, peer: SocketAddr) -> Request<Body> {
+        request.extensions_mut().insert(ConnectInfo(peer));
+        request
+    }
+
+    fn loopback_peer() -> SocketAddr {
+        "127.0.0.1:55555".parse().unwrap()
+    }
+
+    fn lan_peer() -> SocketAddr {
+        "192.168.1.50:55555".parse().unwrap()
+    }
+
+    #[test]
+    fn caller_is_loopback_accepts_v4_and_v6_loopback_only() {
+        assert!(caller_is_loopback("127.0.0.1:1".parse().unwrap()));
+        assert!(caller_is_loopback("[::1]:1".parse().unwrap()));
+        assert!(!caller_is_loopback(lan_peer()));
+        assert!(!caller_is_loopback("0.0.0.0:1".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn shutdown_without_token_is_unauthorized() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let router = router(app.clone());
+        let request = with_peer(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/local/shutdown")
+                .body(Body::empty())
+                .unwrap(),
+            loopback_peer(),
+        );
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_from_non_loopback_peer_is_forbidden_even_with_a_valid_token() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let router = router(app.clone());
+        let request = with_peer(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/local/shutdown")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+            lan_peer(),
+        );
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_from_loopback_with_valid_token_succeeds_and_fires_the_signal() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        *app.shutdown.lock().unwrap() = Some(tx);
+        let router = router(app.clone());
+        let request = with_peer(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/local/shutdown")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+            loopback_peer(),
+        );
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        rx.await.expect("shutdown signal should have fired");
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_get_reports_effective_and_stored_bind() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = crate::app::open_app_at_full(
+            path.clone(),
+            crate::app::RuntimeLimits::default(),
+            crate::app::BindOverrides {
+                host: Some("0.0.0.0".to_owned()),
+                port: Some(54400),
+            },
+        )
+        .unwrap();
+        let token = app.token.clone();
+        let router = router(app.clone());
+        let request = Request::builder()
+            .uri("/v1/local/config")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["bind"], "0.0.0.0:54400");
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_patch_rejects_invalid_bind_host_and_port() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let router = router(app.clone());
+        let request = Request::builder()
+            .method("PATCH")
+            .uri("/v1/local/config")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"bind_host":"not-an-ip"}"#))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let request = Request::builder()
+            .method("PATCH")
+            .uri("/v1/local/config")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"bind_port":0}"#))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_patch_accepts_valid_bind_host_and_port_and_reports_restart_required() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let router = router(app.clone());
+        let request = Request::builder()
+            .method("PATCH")
+            .uri("/v1/local/config")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"bind_host":"0.0.0.0","bind_port":54402}"#))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["restart_required"], true);
+        let (stored_host, stored_port) = crate::store::bind_settings(&app).unwrap();
+        assert_eq!(stored_host.as_deref(), Some("0.0.0.0"));
+        assert_eq!(stored_port, Some(54402));
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
     }
 }

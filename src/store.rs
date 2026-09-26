@@ -22,6 +22,11 @@ pub const SOURCE_USER_FOLDER: &str = "user_folder";
 /// Settings key for the user-writable drop-in models folder (v4).
 pub const SETTING_USER_MODELS_DIR: &str = "user_models_dir";
 
+/// Settings keys for the configurable bind address (phase 1a). Absent means
+/// unset (the process falls back to its CLI flag, then the hard default).
+pub const SETTING_BIND_HOST: &str = "bind_host";
+pub const SETTING_BIND_PORT: &str = "bind_port";
+
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -233,6 +238,45 @@ pub fn validate_positive_limit(value: Option<i64>) -> Result<Option<u64>, &'stat
         Some(v) if v > 0 => Ok(Some(v as u64)),
         Some(_) => Err("must be a positive integer or null"),
     }
+}
+
+/// Read the persisted `bind_host` / `bind_port` settings directly from an
+/// open connection, unvalidated. Used at startup (before `App` exists) and
+/// by `bind_settings` below (for the running `App`/config endpoint).
+pub fn read_bind_settings(db: &Connection) -> rusqlite::Result<(Option<String>, Option<u16>)> {
+    let host: Option<String> = db
+        .query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            params![SETTING_BIND_HOST],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let port: Option<u16> = db
+        .query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            params![SETTING_BIND_PORT],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|value| value.parse::<u16>().ok());
+    Ok((host, port))
+}
+
+/// Read the persisted `bind_host` / `bind_port` settings, unvalidated.
+pub fn bind_settings(app: &App) -> ApiResult<(Option<String>, Option<u16>)> {
+    let db = app.db.lock().map_err(internal)?;
+    read_bind_settings(&db).map_err(internal)
+}
+
+/// Pure validation: a bind host must parse as an IP address (v4 or v6); a
+/// bind port must be a non-zero u16 (0..=65535, with 0 reserved by the OS
+/// meaning "pick any port", which this server does not support).
+pub fn validate_bind_host(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>().is_ok()
+}
+
+pub fn validate_bind_port(port: i64) -> bool {
+    port > 0 && port <= u16::MAX as i64
 }
 
 pub fn backend_preference(app: &App) -> ApiResult<String> {

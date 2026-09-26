@@ -2,8 +2,12 @@ pub mod api;
 pub mod app;
 pub mod audio;
 pub mod auth;
+#[cfg(windows)]
+pub mod autostart;
 pub mod capabilities;
 pub mod catalog;
+pub mod cli;
+pub mod discovery;
 pub mod download;
 pub mod dropin;
 pub mod engine;
