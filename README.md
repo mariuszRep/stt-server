@@ -19,16 +19,26 @@ both sharing one pipeline (parse → decode → plan → queue → run → forma
 Audio is converted to 16 kHz mono before inference. Accepted multipart fields are `file`, `model`,
 `language`, `prompt`, `temperature`, `response_format` (`json`/`text`/`verbose_json`), and repeatable
 `timestamp_granularities`/`timestamp_granularities[]`; `prompt` is passed to the engine verbatim
-(no server-side composition or trimming) and is only accepted on whisper-family models. An
-unresolvable `language` hint is never an error: the server falls back to auto-detection, then
-English, then the model's first language (matching Handy), and reports whether the hint was
-actually applied via `x_diagnostics.language_hint_applied`/`applied_language`/`language_evidence`.
+(no server-side composition or trimming) and is only accepted on whisper-family models. `model` is
+optional: an absent field is treated as `model=default` (whichever model is currently selected)
+rather than a 400, since OpenAI-shaped clients typically send it but this server's own SDK client
+often doesn't. An unresolvable `language` hint is never an error: the server falls back to
+auto-detection, then English, then the model's first language (matching Handy), and reports whether
+the hint was actually applied via
+`x_diagnostics.language_hint_applied`/`applied_language`/`language_evidence` (`user_selected`,
+`model_constrained`, `model_detected`, `translated_to_english`, or `unknown`; a `translations`
+request whose source is already English transcribes instead of translating but reports whichever of
+`user_selected`/`model_constrained` decided that language, never the stale `translated_to_english`
+label for a run that didn't translate anything).
 The `/v1/local/*` routes expose fixed recommendations, per-model capability matrices (a `catalog`
 view when unloaded, an `effective` view computed from the live model plus `catalog_mismatch` once
 loaded), installed models, explicit install/import/verification, selection/load/removal, operation
 progress and cancellation, and CPU/Vulkan preference. Unsupported optional transcription fields
 return `unsupported_capability`. Every catalog model is installable (`installable: true`); admission
 is catalog membership plus a resolvable quant/hash, not a hard-coded model ID.
+`GET /v1/local/system` (authenticated) reports the server's own OS/CPU/memory/GPU/process
+info for a client's hardware/health card -- see `docs/client-contract.md` for the full shape,
+field provenance, and a mapping from the old provider-lifecycle client calls to the new ones.
 
 `POST /v1/local/models/{id}/install` takes an optional JSON body `{"quant":"Q8_0"}`; an absent or
 empty body installs the model's `default_quant`. An unknown quant returns 400 `invalid_quant`;
