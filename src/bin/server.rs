@@ -185,6 +185,10 @@ fn probe_host(host: &str) -> String {
     }
 }
 
+/// True only when something that identifies itself as this server answers
+/// `/health` (independent review L2): checking the status code alone would
+/// misreport an unrelated program already listening on the configured port
+/// as a running `stt-server-next` instance.
 async fn health_ok(host: &str, port: u16) -> bool {
     let url = format!("http://{host}:{port}/health");
     let client = match reqwest::Client::builder()
@@ -194,7 +198,16 @@ async fn health_ok(host: &str, port: u16) -> bool {
         Ok(client) => client,
         Err(_) => return false,
     };
-    matches!(client.get(&url).send().await, Ok(response) if response.status().is_success())
+    let Ok(response) = client.get(&url).send().await else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    let Ok(body) = response.json::<serde_json::Value>().await else {
+        return false;
+    };
+    body.get("service").and_then(|v| v.as_str()) == Some(stt_server_next::api::SERVICE_ID)
 }
 
 // ---------------------------------------------------------------------------
@@ -435,5 +448,35 @@ mod recovery_tests {
         assert!(dir.join("server.json").exists());
         drop(lock);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// L2: `start`/`status` must not mistake an unrelated program answering
+    /// "200 OK" on the configured port for this server. Spins up a plain
+    /// axum router (no `service` field) on an ephemeral port and confirms
+    /// `health_ok` reports it as *not* this server, then confirms a real
+    /// `/health` handler with the right `service` field does pass.
+    #[tokio::test]
+    async fn health_ok_requires_service_identity_not_just_200() {
+        let impostor = axum::Router::new().route(
+            "/health",
+            axum::routing::get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, impostor).await.unwrap();
+        });
+        assert!(!health_ok("127.0.0.1", port).await);
+        server.abort();
+
+        let real =
+            axum::Router::new().route("/health", axum::routing::get(stt_server_next::api::health));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, real).await.unwrap();
+        });
+        assert!(health_ok("127.0.0.1", port).await);
+        server.abort();
     }
 }

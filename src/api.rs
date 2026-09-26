@@ -318,8 +318,14 @@ fn cors_layer(origins: &[String]) -> CorsLayer {
         ])
 }
 
+/// The value `service.rs`/`server.rs` compare against so `start`/`status`
+/// never mistake an unrelated program answering "200 OK" on the configured
+/// port for this server (independent review L2): a `service` field identity
+/// check, not just a successful status code.
+pub const SERVICE_ID: &str = "stt-server-next";
+
 pub async fn health() -> Json<Value> {
-    Json(json!({"status": "ok"}))
+    Json(json!({"status": "ok", "service": SERVICE_ID}))
 }
 
 pub async fn readiness(

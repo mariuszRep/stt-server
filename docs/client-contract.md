@@ -29,7 +29,10 @@ Steps:
 1. Spawn the process with the desired `--port`/`--data-dir` (and optionally
    `--host` for LAN mode, see 3 below).
 2. Poll `GET http://<host>:<port>/health` until it returns `200 {"status":
-   "ok"}`. `/health` needs no token and is the only route that doesn't.
+   "ok", "service": "stt-server-next"}`. `/health` needs no token and is the
+   only route that doesn't; check the `service` field, not just the status
+   code, so an unrelated program already listening on that port is never
+   mistaken for the server having started (see 7).
 3. Read the bearer token from `<data-dir>\auth.token` (plain text, written
    once by the server on first start at that data dir; stable across
    restarts at the same data dir).
@@ -112,6 +115,23 @@ where to drop files should read `GET /v1/local/config`'s
   (`api::run_http_full`'s LAN guard) and prints a warning that every route
   except `/health` now requires the token. A client offering LAN mode should
   surface that same warning and never disable the token for a LAN bind.
+- **CORS default reviewed (2026-09-26):** `*` is kept as the default. It is
+  safe against the LAN threat this server actually faces -- auth is a bearer
+  header the browser can't attach on its own and a web page has no way to
+  read `auth.token` off disk, so an allowed origin still can't call an
+  authenticated route without the operator handing it the token some other
+  way. The residual risk is that any web page can probe `GET /health` (the
+  one unauthenticated route) and learn a server exists on that port; this is
+  accepted for now given the intended local/LAN clients (an Electron/Tauri
+  app and `stt-sdk`, neither of which is a same-origin-policy-restricted
+  browser tab) but should be revisited before the repo goes public. No
+  change made; this note is the recorded review.
+- **No idle timeout.** Unlike the old `stt`/faster-whisper CLI's
+  `--idle-timeout-secs`, `stt-server-next` never shuts itself down for lack
+  of requests. An app-owned launch (1.1) that used to rely on an idle timeout
+  as a safety net must instead explicitly stop the server (`POST
+  /v1/local/shutdown` or killing the child) -- the server will otherwise run
+  indefinitely once started, in both app-owned and standalone mode.
 
 ## 4. Model-centric flow (replaces provider lifecycle)
 
@@ -149,7 +169,15 @@ or descriptors.
   false}`).
 - **Remove:** `DELETE /v1/local/models/{id}` -- removes the managed-store
   file (drop-in/`user_folder` models keep their file on disk:
-  `{"removed": true, "file_deleted": false}`).
+  `{"removed": true, "file_deleted": false}`). For a drop-in model this only
+  deletes the `installed` row, not the user's file (`CONVENTIONS.md`: refresh
+  and removal never delete a user's file). There is no dismissed/ignore list:
+  the file still sits in the drop-in folder, so the **next**
+  `POST /v1/local/models/refresh` re-hashes and re-registers it, and it
+  reappears in `GET /v1/local/models` as installed again. `removed: true`
+  means "unregistered now," not "will never come back." A client that wants
+  removal to stick must tell the operator to move or delete the file itself;
+  the server has no separate dismiss action.
 - **Refresh (drop-in scan):** `POST /v1/local/models/refresh` -> `202
   {"operation_id", "state": "queued"}`, polled the same way as
   install/verify.
@@ -195,6 +223,32 @@ rejected with `422 unsupported_capability` (see the error table in 6).
 
 Any other field name is rejected as `422 unsupported_capability` before any
 model-aware planning happens; a field sent twice is `400 duplicate_field`.
+
+### Format and size limits (reviewed 2026-09-26)
+
+- `file` must be a WAV container (`src/audio.rs::decode_wav`): mono or
+  stereo, 8-192 kHz, 16/24-bit PCM or 32-bit float. No other container or
+  codec is accepted -- **do not claim full OpenAI audio-endpoint format
+  compatibility** (OpenAI also accepts mp3/mp4/mpeg/mpga/m4a/ogg/webm); a
+  client that needs one of those must transcode to WAV itself before
+  uploading.
+- `POST /v1/audio/transcriptions`/`translations` bodies are capped at 40 MiB
+  (`api.rs`'s `DefaultBodyLimit`, also reported as `max_audio_bytes` from
+  `GET /v1/local/config`) -- about 21 minutes of 16 kHz mono 16-bit PCM.
+  Oversize bodies get `413 audio_too_long`.
+- Reviewed against the intended local/LAN clients (Whisper Vibes desktop app,
+  `stt-sdk`): both send short dictation-length WAV clips well under 40 MiB,
+  so the limit is kept as-is. Streaming upload/transcription is out of the
+  approved product scope (`CONVENTIONS.md`), so raising the cap to support
+  arbitrarily long single uploads is not planned; a client with a longer
+  recording should chunk it into multiple requests rather than expect a
+  larger limit here. Any future change to the WAV-only/40 MiB bounds (e.g. to
+  support a new client's format or duration) needs its own compatibility
+  check against every client that depends on this contract, recorded in this
+  file and the change's goal log -- it is not a drop-in change.
+- `POST /v1/local/models/import` (a locally supplied GGUF, not audio) has its
+  own, much larger limit (3 GiB) since it streams a model file, not a
+  request body meant to be quick.
 
 ### Response (`json`/default)
 
@@ -248,28 +302,49 @@ Every non-2xx JSON error:
 { "error": { "code": "unsupported_capability", "message": "...",
              "details": { "...": "..." } } }
 ```
-(`details` omitted when absent.) Codes observed in this codebase, by status:
+(`details` omitted when absent.) This is the full catalog found in the
+source (`src/api.rs`, `src/audio.rs`, `src/auth.rs`, `src/catalog.rs`,
+`src/download.rs`, `src/errors.rs`, `src/import.rs`, `src/operations.rs`,
+`src/run_plan.rs`, `src/verify.rs`), by status, pinned by router tests
+(`src/api.rs` test module):
 
 | Status | Codes |
 |---|---|
-| 400 | `missing_file`, `duplicate_field`, `invalid_multipart`, `invalid_temperature`, `invalid_bind_host`, `invalid_bind_port`, `invalid_cors_origins`, `invalid_queue_max_waiting`, `invalid_queue_wait_timeout_ms`, `invalid_inference_timeout_ms`, `invalid_user_models_dir`, `invalid_model`, `invalid_quant`, `invalid_backend` |
+| 400 | `missing_file`, `missing_model`, `duplicate_field`, `unexpected_field`, `invalid_multipart`, `invalid_body`, `invalid_audio`, `unsupported_audio`, `audio_too_short`, `invalid_temperature`, `invalid_bind_host`, `invalid_bind_port`, `invalid_cors_origins`, `invalid_queue_max_waiting`, `invalid_queue_wait_timeout_ms`, `invalid_inference_timeout_ms`, `invalid_user_models_dir`, `invalid_model`, `invalid_quant`, `invalid_backend` |
 | 401 | `unauthorized` |
-| 404 | `model_not_found` |
-| 409 | `already_installed`, `operation_conflict` |
+| 403 | `loopback_only` (`/v1/local/shutdown` from a non-loopback caller) |
+| 404 | `model_not_found`, `operation_not_found`, `model_not_installed` (verify, and remove of a never-installed id) |
+| 409 | `already_installed`, `operation_conflict`, `operation_finished` (cancelling a terminal operation), `model_in_use` (removing the selected model), `model_not_installed` (select, before install), **`needs_verification`** (select, before verify/refresh -- see 4), `model_load_failed`, `model_not_active` (a transcription request while nothing is loaded but the server is otherwise ready), `unowned_model_path` (refusing to remove a file outside the managed store) |
 | 413 | `audio_too_long` (payload too large) |
-| 422 | `unsupported_capability`, `engine_unsupported`, `engine_rejected_option` |
-| 500 | internal errors (message only; not meant to be pattern-matched) |
-| 503 | `server_not_ready` (no model loaded), `not_ready`, `engine_busy` |
-| 507 | out-of-memory (insufficient storage) |
+| 422 | `unsupported_capability`, `engine_unsupported`, `engine_rejected_option`, `prompt_too_long`, `size_mismatch` (import exceeds catalog size), `hash_mismatch` (import/verify SHA-256 or size mismatch) |
+| 429 | `queue_full` |
+| 500 | `internal_error`, `inference_failed` (message only; not meant to be pattern-matched) |
+| 503 | `server_not_ready` (no model loaded; includes an `operation_id` in `details` when an install/verify that would fix this is already running), `not_ready`, `engine_busy`, `queue_timeout` |
+| 504 | `inference_timeout` |
+| 507 | `insufficient_memory` (insufficient storage) |
 
-`missing_model` (400) no longer occurs -- see 5.
+`missing_model` (400) means "no `model` field and no `file` field either" at
+the *import* endpoint (`POST /v1/local/models/import`, "send model before
+file") -- unrelated to transcription's "missing model" question, which no
+longer exists there; see 5.
+
+A long-running operation's own terminal state (`GET /v1/local/operations/
+{id}`, state `failed`) carries a separate, narrower `error_code` for
+operation-specific failures that are never top-level HTTP errors because
+the request that started them already returned `202`:
+`insufficient_disk_space`, `stalled` (no bytes for 60s), `source_unavailable`,
+`hash_mismatch`, `cancelled`. Poll the operation rather than expecting these
+on the initiating response.
 
 ## 7. Health-card data sources
 
 A client's health/status card should combine, all authenticated except the
 first:
 
-- `GET /health` -- liveness only, `{"status": "ok"}`, no token needed.
+- `GET /health` -- liveness only, `{"status": "ok", "service":
+  "stt-server-next"}`, no token needed. `start`/`status` (1.2) check the
+  `service` field, not just the 200 status, so an unrelated program answering
+  on the configured port is never mistaken for this server.
 - `GET /readiness` -- `200 {"status": "ready", "model": id, "backend":
   {...}}` when a model is loaded, else `503 {"status": "not_ready",
   "reason": "..."}`.

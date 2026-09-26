@@ -106,9 +106,40 @@ pub fn default_user_models_dir() -> Option<PathBuf> {
     })
 }
 
+/// Restrict `auth.token` to the current user account, whatever the data
+/// folder's inherited ACLs are (M6: a custom `--data-dir`, e.g. on a
+/// non-system drive, may otherwise inherit a broader ACL than
+/// `%LOCALAPPDATA%` normally has, and a token reachable by another local
+/// account matters because a token-holder has LAN reach). Applied on every
+/// open, not just creation, so an existing install self-heals. Skipped in
+/// service mode: `service::install` already applies the SYSTEM/Administrators/
+/// installing-user ACL appropriate for a LocalSystem-run service, and running
+/// this as `SYSTEM` (the service's own account) would instead strip that
+/// down to `SYSTEM`-only and lock the installing user out.
+#[cfg(windows)]
+fn restrict_token_file_acl(path: &Path) -> Result<(), Box<dyn Error>> {
+    let owner = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+        (Ok(domain), Ok(user)) => format!("{domain}\\{user}"),
+        _ => std::env::var("USERNAME")?,
+    };
+    let status = std::process::Command::new("icacls")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r", &format!("{owner}:R")])
+        .status()?;
+    if !status.success() {
+        return Err(format!("Could not protect ACL on {}", path.display()).into());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn restrict_token_file_acl(_path: &Path) -> Result<(), Box<dyn Error>> {
+    Ok(())
+}
+
 pub fn token_file(dir: &Path) -> Result<String, Box<dyn Error>> {
     let path = dir.join("auth.token");
-    match OpenOptions::new().write(true).create_new(true).open(&path) {
+    let result = match OpenOptions::new().write(true).create_new(true).open(&path) {
         Ok(mut file) => {
             let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
             file.write_all(token.as_bytes())?;
@@ -118,7 +149,7 @@ pub fn token_file(dir: &Path) -> Result<String, Box<dyn Error>> {
             let mut token = String::new();
             OpenOptions::new()
                 .read(true)
-                .open(path)?
+                .open(&path)?
                 .read_to_string(&mut token)?;
             if token.len() != 64 {
                 return Err("Invalid token file".into());
@@ -126,7 +157,11 @@ pub fn token_file(dir: &Path) -> Result<String, Box<dyn Error>> {
             Ok(token)
         }
         Err(error) => Err(error.into()),
+    };
+    if result.is_ok() && !is_service_mode() {
+        restrict_token_file_acl(&path)?;
     }
+    result
 }
 
 /// Reconcile a single `user_folder` (drop-in) row at startup: rule 5 from the
@@ -624,6 +659,44 @@ mod recovery_tests {
         drop(reopened);
         drop(lock);
         assert!(artifact.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// M6: `auth.token` must be restricted to the current user regardless of
+    /// the data folder's own (possibly inherited, possibly broad) ACLs --
+    /// this is the scenario a custom `--data-dir` on a non-system drive can
+    /// hit. `token_file` applies an explicit, non-inherited ACL on every
+    /// open (not just creation), so this also covers an existing install
+    /// that predates the fix.
+    #[test]
+    fn token_file_acl_is_restricted_to_current_user_only() {
+        let dir = std::env::temp_dir().join(format!("stt-token-acl-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        token_file(&dir).unwrap();
+        let path = dir.join("auth.token");
+        let output = std::process::Command::new("icacls")
+            .arg(&path)
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&output.stdout).to_lowercase();
+        assert!(
+            !listing.contains("everyone") && !listing.contains("\\users:"),
+            "expected no broad grant, got: {listing}"
+        );
+        let user = std::env::var("USERNAME").unwrap().to_lowercase();
+        assert!(
+            listing.contains(&user),
+            "expected the current user to be granted access, got: {listing}"
+        );
+        // Re-opening (existing file) self-heals the same way, not just at
+        // creation.
+        token_file(&dir).unwrap();
+        let output = std::process::Command::new("icacls")
+            .arg(&path)
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&output.stdout).to_lowercase();
+        assert!(listing.contains(&user));
         fs::remove_dir_all(dir).unwrap();
     }
 }

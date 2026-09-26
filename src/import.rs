@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::{
     extract::{Multipart, State},
@@ -16,6 +17,7 @@ use uuid::Uuid;
 use crate::app::App;
 use crate::auth::authorized;
 use crate::catalog::{catalog_model, CatalogFile};
+use crate::download::should_flush_progress;
 use crate::errors::{internal, ApiError, ApiResult};
 use crate::operations::update_operation;
 use crate::store::{installed_path, promote_verified_model_with_source, SOURCE_IMPORT};
@@ -161,6 +163,13 @@ pub async fn import_model(
                 let mut output = tokio::fs::File::create(&stage).await.map_err(internal)?;
                 let mut digest = Sha256::new();
                 let mut size = 0_u64;
+                // Throttled the same way as `download.rs`'s streaming loop
+                // (M3): writing progress to SQLite on every multipart chunk
+                // takes the global `app.db` mutex hundreds of thousands of
+                // times for a multi-GB import, stalling every other
+                // request -- including transcription -- that also needs it.
+                let mut last_flush = Instant::now();
+                let mut bytes_since_flush = 0_u64;
                 while let Some(chunk) = field.chunk().await.map_err(|error| {
                     ApiError::new(
                         StatusCode::BAD_REQUEST,
@@ -184,11 +193,17 @@ pub async fn import_model(
                         ));
                     }
                     digest.update(&chunk);
+                    bytes_since_flush += chunk.len() as u64;
                     output.write_all(&chunk).await.map_err(internal)?;
-                    update_operation(&app, &op, "running", None, size)?;
+                    if should_flush_progress(last_flush.elapsed(), bytes_since_flush, false) {
+                        update_operation(&app, &op, "running", None, size)?;
+                        last_flush = Instant::now();
+                        bytes_since_flush = 0;
+                    }
                 }
                 output.sync_all().await.map_err(internal)?;
                 drop(output);
+                update_operation(&app, &op, "running", None, size)?;
                 let actual = format!("{:x}", digest.finalize());
                 let matched = match &preselected {
                     Some(file) => {
@@ -265,8 +280,107 @@ pub async fn import_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::router;
     use crate::app::open_app_at;
+    use crate::catalog::CatalogModel;
     use crate::operations::operation_state;
+    use axum::body::Body;
+    use axum::http::Request;
+    use sha2::Sha256;
+    use tower::ServiceExt;
+
+    fn fake_model(bytes: &[u8]) -> CatalogModel {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        serde_json::from_value(json!({
+            "id": "org/fake-import-model", "revision": "abc123", "slug": "fake-import-model",
+            "name": "Fake", "architecture": "whisper", "family": "whisper", "license": "mit",
+            "languages": ["en"],
+            "capabilities": {"streaming": false, "translate": false, "lang_detect": false, "timestamps": "none"},
+            "speed_score": null, "accuracy_score": null,
+            "files": [{
+                "filename": "model.gguf", "quant": "Q4_K_M",
+                "size_bytes": bytes.len(), "sha256": format!("{:x}", hasher.finalize()),
+            }],
+            "default_quant": "Q4_K_M", "recommended": false, "recommended_rank": null
+        }))
+        .unwrap()
+    }
+
+    fn import_body(boundary: &str, model: &str, file_bytes: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"model\"\r\n\r\n");
+        body.extend_from_slice(model.as_bytes());
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"file\"; filename=\"model.gguf\"\r\n",
+        );
+        body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+        body.extend_from_slice(file_bytes);
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        body
+    }
+
+    /// M3: import progress is throttled (`should_flush_progress`, shared
+    /// with `download.rs`) instead of writing SQLite on every multipart
+    /// chunk. This exercises the whole streaming-then-force-flush path end
+    /// to end and pins the outcome that matters to a client polling
+    /// `GET /v1/local/operations/{id}`: the operation ends `completed` with
+    /// `progress_bytes` equal to the full file size, not just whatever the
+    /// last throttled write happened to catch.
+    #[tokio::test]
+    async fn import_completes_with_full_progress_recorded() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let mut app = open_app_at(path.clone()).unwrap();
+        let file_bytes = vec![0x42u8; 5_000];
+        let model = fake_model(&file_bytes);
+        Arc::get_mut(&mut app)
+            .expect("sole owner before first clone")
+            .catalog
+            .push(model);
+        let token = app.token.clone();
+        let router = router(app.clone());
+        let boundary = "X-BOUNDARY";
+        let body = import_body(boundary, "fake-import-model", &file_bytes);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/local/models/import")
+            .header("authorization", format!("Bearer {token}"))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let op = body["operation_id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            operation_state(&app, &op).unwrap().as_deref(),
+            Some("completed")
+        );
+        let progress: i64 = app
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT progress_bytes FROM operations WHERE id=?1",
+                params![op],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(progress as u64, file_bytes.len() as u64);
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
 
     #[test]
     fn interrupted_import_is_failed_and_quarantined() {
