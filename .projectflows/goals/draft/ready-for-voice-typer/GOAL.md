@@ -8,7 +8,7 @@ scope: stt-server-next only
 attempt: 0
 max_attempts: 8
 last_result: none
-next_action: Review with the user, then move to ready.
+next_action: Track the four focused ready goals, then complete clean-machine, CPU-only, service, LAN, fault and release acceptance before moving this umbrella goal to ready.
 success_criteria:
   - A user can keep the server up to date from public releases without losing models or settings, and a failed update rolls back automatically.
   - The server installs and runs correctly on a clean Windows machine, on a machine without a GPU or Vulkan, and when upgrading from an earlier version.
@@ -32,7 +32,7 @@ and proof.
 
 - **Updates.** The server checks public releases, downloads a newer version only when asked,
   confirms the download is genuine, replaces itself, and restarts. If the new version does not
-  start, the previous version comes back automatically. Models, settings, and history survive.
+  start, the previous version comes back automatically. Models, settings, and operation history survive.
 - **Where it runs.** It must work on a fresh Windows install, on machines with no usable GPU
   (falling back to CPU without failing), and when upgrading over an older version.
 - **Resilience.** A crash, reboot, power loss, interrupted download, or full disk must never
@@ -45,6 +45,26 @@ and proof.
   disagree most.
 - **Trustworthy releases.** What users download is byte-for-byte what was tested. Releases are
   made deliberately, never automatically on merge.
+
+## Current status and remaining acceptance gates (2026-09-26)
+
+- The safe-stop/startup/model-file recovery goal is done locally, with 173 tests and a real start/restart/stop check. Its source and evidence are still uncommitted in this repository; review and commit them first. Older installed models need one explicit verification to establish their recorded fingerprint.
+- Focused ready goals: safe-self-update; model-management-cli; handy-gguf-parity-evidence; management-contract-hardening. None has started.
+- Prove a fresh Windows installation and CPU-only startup without a usable GPU or Vulkan loader. Check supported CPU instruction sets and additional GPU/driver combinations.
+- Rehearse a real Windows Service install, run, restart and uninstall, including the user drop-in folder.
+- Test authenticated LAN use from another device. Confirm unauthenticated requests cannot reach protected routes and token-file permissions are restrictive in both service and user mode, including custom data folders.
+- Exercise power loss/interrupted work, full disk, database migration and old-version rollback. A newer schema must not silently be accepted by an older executable.
+- Complete the management API contract: select-needs-verification returns 409; document the error catalog and absence of an idle timeout. Protect user-mode tokens and verify process identity on the configured port. Throttle large-import progress writes and clarify drop-in removal/refresh.
+- Build dispatch-only candidate/release automation and rehearse promotion of the exact tested binary. The repository is still private, so public self-update verification remains an external gate.
+- Record a human-checked accuracy verdict and a model/quantisation coverage matrix before claiming full Handy GGUF functional parity.
+
+## Focused goals
+
+- `ready/safe-self-update` — chosen update, verification and automatic rollback.
+- `ready/model-management-cli` — existing model-management API through a usable CLI.
+- `ready/handy-gguf-parity-evidence` — model/function matrix and human-checked speech evidence.
+- `ready/management-contract-hardening` — token permissions, import responsiveness, identity and API contract.
+- `done/safe-stop-startup-model-recovery` — implemented locally; commit remains.
 
 ## Out of scope
 
@@ -64,6 +84,7 @@ None yet.
 ## Verification Log
 
 2026-09-26: Drafted from the migration plan (phases 2 and 5, server side).
+2026-09-26: Reconciled with the recovery goal and independent review; focused ready goals created. No remaining acceptance gate was marked passed without new evidence.
 
 ## Final Outcome
 
