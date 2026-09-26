@@ -803,13 +803,11 @@ async fn parse_transcription_multipart(mut multipart: Multipart) -> ApiResult<Tr
     let file = file.ok_or_else(|| {
         ApiError::new(StatusCode::BAD_REQUEST, "missing_file", "file is required")
     })?;
-    let model = model.ok_or_else(|| {
-        ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "missing_model",
-            "model is required",
-        )
-    })?;
+    // A request with no `model` field at all is treated as `model=default`:
+    // OpenAI-compatible clients generally send it, but this server's own SDK
+    // client often omits it, and `default` already means "whichever model is
+    // currently selected" everywhere else `model` is accepted.
+    let model = model.unwrap_or_else(|| "default".to_owned());
     let temperature = match temperature_raw {
         Some(raw) => Some(raw.parse::<f32>().map_err(|_| {
             ApiError::new(
@@ -1609,6 +1607,40 @@ mod router_tests {
         let request = Request::builder()
             .method("POST")
             .uri("/v1/audio/translations")
+            .header("authorization", format!("Bearer {token}"))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "server_not_ready");
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn transcriptions_without_model_field_defaults_to_default_model() {
+        // A request with no `model` field at all used to be a 400
+        // `missing_model`. It's now treated as `model=default`: reaching the
+        // loaded-model check (503 `server_not_ready`, no model loaded in this
+        // test) proves the multipart parse no longer rejects it.
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let router = router(app.clone());
+        let boundary = "X-BOUNDARY";
+        let body = multipart_body(boundary, &[], &sample_wav_bytes());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
             .header("authorization", format!("Bearer {token}"))
             .header(
                 "content-type",
