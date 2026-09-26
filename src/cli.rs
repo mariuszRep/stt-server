@@ -19,6 +19,18 @@ USAGE:
     stt-server-next autostart disable
     stt-server-next autostart status
     stt-server-next service install|uninstall|run
+    stt-server-next health [--json] [--data-dir <path>]
+    stt-server-next models list [--json] [--data-dir <path>]
+    stt-server-next models recommended [--json] [--data-dir <path>]
+    stt-server-next models selected [--json] [--data-dir <path>]
+    stt-server-next models install <id> [--wait] [--json] [--data-dir <path>]
+    stt-server-next models import <path> --model <id> [--quant <q>] [--wait] [--json] [--data-dir <path>]
+    stt-server-next models verify <id> [--wait] [--json] [--data-dir <path>]
+    stt-server-next models cancel <operation_id> [--data-dir <path>]
+    stt-server-next models select <id> [--json] [--data-dir <path>]
+    stt-server-next models unload [--json] [--data-dir <path>]
+    stt-server-next models remove <id> [--json] [--data-dir <path>]
+    stt-server-next models refresh [--wait] [--json] [--data-dir <path>]
     stt-server-next --help
 
 FLAGS:
@@ -28,6 +40,11 @@ FLAGS:
     --queue-max-waiting <n>
     --queue-wait-timeout-ms <n>
     --inference-timeout-ms <n>
+
+The `models`/`health` commands talk to an already-running server over its
+existing authenticated local API (same discovery/token as `stop`/`status`);
+they do not start or manage the process themselves. `--wait` polls the
+returned operation until it reaches a terminal state, printing progress.
 ";
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -69,7 +86,71 @@ pub enum Command {
         flags: RunFlags,
     },
     Service(ServiceAction),
+    Health {
+        json: bool,
+        data_dir: Option<PathBuf>,
+    },
+    Models(ModelsCommand),
     Help,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModelsCommand {
+    List {
+        json: bool,
+        data_dir: Option<PathBuf>,
+    },
+    Recommended {
+        json: bool,
+        data_dir: Option<PathBuf>,
+    },
+    Selected {
+        json: bool,
+        data_dir: Option<PathBuf>,
+    },
+    Install {
+        id: String,
+        wait: bool,
+        json: bool,
+        data_dir: Option<PathBuf>,
+    },
+    Import {
+        path: PathBuf,
+        model: String,
+        quant: Option<String>,
+        wait: bool,
+        json: bool,
+        data_dir: Option<PathBuf>,
+    },
+    Verify {
+        id: String,
+        wait: bool,
+        json: bool,
+        data_dir: Option<PathBuf>,
+    },
+    Cancel {
+        operation_id: String,
+        data_dir: Option<PathBuf>,
+    },
+    Select {
+        id: String,
+        json: bool,
+        data_dir: Option<PathBuf>,
+    },
+    Unload {
+        json: bool,
+        data_dir: Option<PathBuf>,
+    },
+    Remove {
+        id: String,
+        json: bool,
+        data_dir: Option<PathBuf>,
+    },
+    Refresh {
+        wait: bool,
+        json: bool,
+        data_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -169,6 +250,116 @@ fn parse_data_dir_only(args: &[String]) -> Result<Option<PathBuf>, CliError> {
     Ok(data_dir)
 }
 
+/// `--json`/`--wait`/`--data-dir`, no positional argument (e.g. `models
+/// refresh`).
+fn parse_json_wait_data_dir(args: &[String]) -> Result<(bool, bool, Option<PathBuf>), CliError> {
+    let mut json = false;
+    let mut wait = false;
+    let mut data_dir = None;
+    let mut iter = args.iter();
+    while let Some(flag) = iter.next() {
+        match flag.as_str() {
+            "--json" => json = true,
+            "--wait" => wait = true,
+            "--data-dir" => data_dir = Some(PathBuf::from(next_value(&mut iter, flag)?)),
+            other => return Err(CliError::usage(format!("unknown flag: {other}"))),
+        }
+    }
+    Ok((json, wait, data_dir))
+}
+
+/// A required leading `<id>` positional, followed by `--json`/`--wait`/
+/// `--data-dir` (e.g. `models install <id>`).
+fn parse_id_json_wait_data_dir(
+    args: &[String],
+    command: &str,
+) -> Result<(String, bool, bool, Option<PathBuf>), CliError> {
+    let mut iter = args.iter();
+    let id = iter
+        .next()
+        .filter(|value| !value.starts_with("--"))
+        .cloned()
+        .ok_or_else(|| CliError::usage(format!("{command} requires an <id>")))?;
+    let mut json = false;
+    let mut wait = false;
+    let mut data_dir = None;
+    while let Some(flag) = iter.next() {
+        match flag.as_str() {
+            "--json" => json = true,
+            "--wait" => wait = true,
+            "--data-dir" => data_dir = Some(PathBuf::from(next_value(&mut iter, flag)?)),
+            other => return Err(CliError::usage(format!("unknown flag: {other}"))),
+        }
+    }
+    Ok((id, json, wait, data_dir))
+}
+
+/// A required leading `<id>` positional, followed by `--json`/`--data-dir`
+/// only (no `--wait`; e.g. `models select <id>`/`models remove <id>`).
+fn parse_id_json_data_dir(
+    args: &[String],
+    command: &str,
+) -> Result<(String, bool, Option<PathBuf>), CliError> {
+    let (id, json, wait, data_dir) = parse_id_json_wait_data_dir(args, command)?;
+    if wait {
+        return Err(CliError::usage(format!("{command} does not accept --wait")));
+    }
+    Ok((id, json, data_dir))
+}
+
+/// A required leading `<operation_id>` positional plus `--data-dir` only
+/// (`models cancel <operation_id>`).
+fn parse_operation_id_data_dir(args: &[String]) -> Result<(String, Option<PathBuf>), CliError> {
+    let mut iter = args.iter();
+    let operation_id = iter
+        .next()
+        .filter(|value| !value.starts_with("--"))
+        .cloned()
+        .ok_or_else(|| CliError::usage("models cancel requires an <operation_id>"))?;
+    let mut data_dir = None;
+    while let Some(flag) = iter.next() {
+        match flag.as_str() {
+            "--data-dir" => data_dir = Some(PathBuf::from(next_value(&mut iter, flag)?)),
+            other => return Err(CliError::usage(format!("unknown flag: {other}"))),
+        }
+    }
+    Ok((operation_id, data_dir))
+}
+
+/// `(path, model, quant, wait, json, data_dir)` -- see [`parse_import_flags`].
+type ImportFlags = (PathBuf, String, Option<String>, bool, bool, Option<PathBuf>);
+
+/// `models import <path> --model <id> [--quant <q>] [--wait] [--json]
+/// [--data-dir <path>]`. The API's import endpoint (`src/import.rs`) needs
+/// the target catalog model id before it will accept the file, so unlike
+/// the other model subcommands this one has a required `--model` flag in
+/// addition to its `<path>` positional.
+fn parse_import_flags(args: &[String]) -> Result<ImportFlags, CliError> {
+    let mut iter = args.iter();
+    let path = iter
+        .next()
+        .filter(|value| !value.starts_with("--"))
+        .cloned()
+        .ok_or_else(|| CliError::usage("models import requires a <path>"))?;
+    let mut model = None;
+    let mut quant = None;
+    let mut json = false;
+    let mut wait = false;
+    let mut data_dir = None;
+    while let Some(flag) = iter.next() {
+        match flag.as_str() {
+            "--model" => model = Some(next_value(&mut iter, flag)?),
+            "--quant" => quant = Some(next_value(&mut iter, flag)?),
+            "--json" => json = true,
+            "--wait" => wait = true,
+            "--data-dir" => data_dir = Some(PathBuf::from(next_value(&mut iter, flag)?)),
+            other => return Err(CliError::usage(format!("unknown flag: {other}"))),
+        }
+    }
+    let model = model.ok_or_else(|| CliError::usage("models import requires --model <id>"))?;
+    Ok((PathBuf::from(path), model, quant, wait, json, data_dir))
+}
+
 fn parse_no_flags(args: &[String], command: &str) -> Result<(), CliError> {
     if let Some(first) = args.first() {
         return Err(CliError::usage(format!(
@@ -263,6 +454,104 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
         "uninstall" => {
             parse_no_flags(&args[1..], "uninstall")?;
             Ok(Command::Service(ServiceAction::Uninstall))
+        }
+        "health" => {
+            let (json, data_dir) = parse_status_flags(&args[1..])?;
+            Ok(Command::Health { json, data_dir })
+        }
+        "models" => {
+            let sub = args.get(1).ok_or_else(|| {
+                CliError::usage(
+                    "models requires a subcommand: list|recommended|selected|install|import|verify|cancel|select|unload|remove|refresh",
+                )
+            })?;
+            let rest = &args[2..];
+            match sub.as_str() {
+                "list" => {
+                    let (json, data_dir) = parse_status_flags(rest)?;
+                    Ok(Command::Models(ModelsCommand::List { json, data_dir }))
+                }
+                "recommended" => {
+                    let (json, data_dir) = parse_status_flags(rest)?;
+                    Ok(Command::Models(ModelsCommand::Recommended {
+                        json,
+                        data_dir,
+                    }))
+                }
+                "selected" => {
+                    let (json, data_dir) = parse_status_flags(rest)?;
+                    Ok(Command::Models(ModelsCommand::Selected { json, data_dir }))
+                }
+                "unload" => {
+                    let (json, data_dir) = parse_status_flags(rest)?;
+                    Ok(Command::Models(ModelsCommand::Unload { json, data_dir }))
+                }
+                "refresh" => {
+                    let (json, wait, data_dir) = parse_json_wait_data_dir(rest)?;
+                    Ok(Command::Models(ModelsCommand::Refresh {
+                        wait,
+                        json,
+                        data_dir,
+                    }))
+                }
+                "install" => {
+                    let (id, json, wait, data_dir) =
+                        parse_id_json_wait_data_dir(rest, "models install")?;
+                    Ok(Command::Models(ModelsCommand::Install {
+                        id,
+                        wait,
+                        json,
+                        data_dir,
+                    }))
+                }
+                "verify" => {
+                    let (id, json, wait, data_dir) =
+                        parse_id_json_wait_data_dir(rest, "models verify")?;
+                    Ok(Command::Models(ModelsCommand::Verify {
+                        id,
+                        wait,
+                        json,
+                        data_dir,
+                    }))
+                }
+                "select" => {
+                    let (id, json, data_dir) = parse_id_json_data_dir(rest, "models select")?;
+                    Ok(Command::Models(ModelsCommand::Select {
+                        id,
+                        json,
+                        data_dir,
+                    }))
+                }
+                "remove" => {
+                    let (id, json, data_dir) = parse_id_json_data_dir(rest, "models remove")?;
+                    Ok(Command::Models(ModelsCommand::Remove {
+                        id,
+                        json,
+                        data_dir,
+                    }))
+                }
+                "cancel" => {
+                    let (operation_id, data_dir) = parse_operation_id_data_dir(rest)?;
+                    Ok(Command::Models(ModelsCommand::Cancel {
+                        operation_id,
+                        data_dir,
+                    }))
+                }
+                "import" => {
+                    let (path, model, quant, wait, json, data_dir) = parse_import_flags(rest)?;
+                    Ok(Command::Models(ModelsCommand::Import {
+                        path,
+                        model,
+                        quant,
+                        wait,
+                        json,
+                        data_dir,
+                    }))
+                }
+                other => Err(CliError::usage(format!(
+                    "unknown models subcommand: {other}"
+                ))),
+            }
         }
         other => Err(CliError::usage(format!("unknown command: {other}"))),
     }
@@ -452,5 +741,221 @@ mod tests {
     #[test]
     fn rejects_missing_flag_value() {
         assert!(parse(&args(&["run", "--port"])).is_err());
+    }
+
+    #[test]
+    fn health_defaults_to_non_json_and_accepts_json_and_data_dir() {
+        assert_eq!(
+            parse(&args(&["health"])).unwrap(),
+            Command::Health {
+                json: false,
+                data_dir: None
+            }
+        );
+        assert_eq!(
+            parse(&args(&["health", "--json", "--data-dir", "C:\\d"])).unwrap(),
+            Command::Health {
+                json: true,
+                data_dir: Some(PathBuf::from("C:\\d"))
+            }
+        );
+        assert!(parse(&args(&["health", "--bogus"])).is_err());
+    }
+
+    #[test]
+    fn models_requires_subcommand() {
+        let error = parse(&args(&["models"])).unwrap_err();
+        assert_eq!(error.exit_code, 2);
+        let error = parse(&args(&["models", "bogus"])).unwrap_err();
+        assert_eq!(error.exit_code, 2);
+    }
+
+    #[test]
+    fn models_list_recommended_selected_unload_parse_json_and_data_dir() {
+        for sub in ["list", "recommended", "selected", "unload"] {
+            let cmd = parse(&args(&["models", sub])).unwrap();
+            let (json, data_dir) = match &cmd {
+                Command::Models(ModelsCommand::List { json, data_dir }) => (*json, data_dir),
+                Command::Models(ModelsCommand::Recommended { json, data_dir }) => (*json, data_dir),
+                Command::Models(ModelsCommand::Selected { json, data_dir }) => (*json, data_dir),
+                Command::Models(ModelsCommand::Unload { json, data_dir }) => (*json, data_dir),
+                _ => panic!("unexpected command for {sub}"),
+            };
+            assert!(!json);
+            assert_eq!(data_dir, &None);
+
+            let cmd = parse(&args(&["models", sub, "--json", "--data-dir", "C:\\d"])).unwrap();
+            let (json, data_dir) = match &cmd {
+                Command::Models(ModelsCommand::List { json, data_dir }) => (*json, data_dir),
+                Command::Models(ModelsCommand::Recommended { json, data_dir }) => (*json, data_dir),
+                Command::Models(ModelsCommand::Selected { json, data_dir }) => (*json, data_dir),
+                Command::Models(ModelsCommand::Unload { json, data_dir }) => (*json, data_dir),
+                _ => panic!("unexpected command for {sub}"),
+            };
+            assert!(json);
+            assert_eq!(data_dir, &Some(PathBuf::from("C:\\d")));
+
+            assert!(parse(&args(&["models", sub, "--bogus"])).is_err());
+        }
+    }
+
+    #[test]
+    fn models_refresh_parses_wait_json_data_dir() {
+        assert_eq!(
+            parse(&args(&["models", "refresh"])).unwrap(),
+            Command::Models(ModelsCommand::Refresh {
+                wait: false,
+                json: false,
+                data_dir: None
+            })
+        );
+        assert_eq!(
+            parse(&args(&["models", "refresh", "--wait", "--json"])).unwrap(),
+            Command::Models(ModelsCommand::Refresh {
+                wait: true,
+                json: true,
+                data_dir: None
+            })
+        );
+    }
+
+    #[test]
+    fn models_install_requires_id_and_parses_wait_json_data_dir() {
+        assert!(parse(&args(&["models", "install"])).is_err());
+        assert!(parse(&args(&["models", "install", "--wait"])).is_err());
+        assert_eq!(
+            parse(&args(&["models", "install", "tiny-en"])).unwrap(),
+            Command::Models(ModelsCommand::Install {
+                id: "tiny-en".to_owned(),
+                wait: false,
+                json: false,
+                data_dir: None
+            })
+        );
+        assert_eq!(
+            parse(&args(&[
+                "models",
+                "install",
+                "tiny-en",
+                "--wait",
+                "--json",
+                "--data-dir",
+                "C:\\d"
+            ]))
+            .unwrap(),
+            Command::Models(ModelsCommand::Install {
+                id: "tiny-en".to_owned(),
+                wait: true,
+                json: true,
+                data_dir: Some(PathBuf::from("C:\\d"))
+            })
+        );
+    }
+
+    #[test]
+    fn models_verify_requires_id_and_parses_wait_json_data_dir() {
+        assert!(parse(&args(&["models", "verify"])).is_err());
+        assert_eq!(
+            parse(&args(&["models", "verify", "tiny-en", "--wait"])).unwrap(),
+            Command::Models(ModelsCommand::Verify {
+                id: "tiny-en".to_owned(),
+                wait: true,
+                json: false,
+                data_dir: None
+            })
+        );
+    }
+
+    #[test]
+    fn models_select_and_remove_require_id_and_reject_wait() {
+        assert!(parse(&args(&["models", "select"])).is_err());
+        assert!(parse(&args(&["models", "select", "tiny-en", "--wait"])).is_err());
+        assert_eq!(
+            parse(&args(&["models", "select", "tiny-en", "--json"])).unwrap(),
+            Command::Models(ModelsCommand::Select {
+                id: "tiny-en".to_owned(),
+                json: true,
+                data_dir: None
+            })
+        );
+        assert!(parse(&args(&["models", "remove"])).is_err());
+        assert!(parse(&args(&["models", "remove", "tiny-en", "--wait"])).is_err());
+        assert_eq!(
+            parse(&args(&["models", "remove", "tiny-en"])).unwrap(),
+            Command::Models(ModelsCommand::Remove {
+                id: "tiny-en".to_owned(),
+                json: false,
+                data_dir: None
+            })
+        );
+    }
+
+    #[test]
+    fn models_cancel_requires_operation_id_and_has_no_json_or_wait() {
+        assert!(parse(&args(&["models", "cancel"])).is_err());
+        assert!(parse(&args(&["models", "cancel", "op-1", "--json"])).is_err());
+        assert!(parse(&args(&["models", "cancel", "op-1", "--wait"])).is_err());
+        assert_eq!(
+            parse(&args(&["models", "cancel", "op-1"])).unwrap(),
+            Command::Models(ModelsCommand::Cancel {
+                operation_id: "op-1".to_owned(),
+                data_dir: None
+            })
+        );
+        assert_eq!(
+            parse(&args(&["models", "cancel", "op-1", "--data-dir", "C:\\d"])).unwrap(),
+            Command::Models(ModelsCommand::Cancel {
+                operation_id: "op-1".to_owned(),
+                data_dir: Some(PathBuf::from("C:\\d"))
+            })
+        );
+    }
+
+    #[test]
+    fn models_import_requires_path_and_model_flag() {
+        assert!(parse(&args(&["models", "import"])).is_err());
+        assert!(parse(&args(&["models", "import", "C:\\m.gguf"])).is_err());
+        assert_eq!(
+            parse(&args(&[
+                "models",
+                "import",
+                "C:\\m.gguf",
+                "--model",
+                "tiny-en"
+            ]))
+            .unwrap(),
+            Command::Models(ModelsCommand::Import {
+                path: PathBuf::from("C:\\m.gguf"),
+                model: "tiny-en".to_owned(),
+                quant: None,
+                wait: false,
+                json: false,
+                data_dir: None
+            })
+        );
+        assert_eq!(
+            parse(&args(&[
+                "models",
+                "import",
+                "C:\\m.gguf",
+                "--model",
+                "tiny-en",
+                "--quant",
+                "q5_1",
+                "--wait",
+                "--json",
+                "--data-dir",
+                "C:\\d"
+            ]))
+            .unwrap(),
+            Command::Models(ModelsCommand::Import {
+                path: PathBuf::from("C:\\m.gguf"),
+                model: "tiny-en".to_owned(),
+                quant: Some("q5_1".to_owned()),
+                wait: true,
+                json: true,
+                data_dir: Some(PathBuf::from("C:\\d"))
+            })
+        );
     }
 }

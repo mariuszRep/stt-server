@@ -196,6 +196,18 @@ stt-server-next autostart enable [flags]   per-user "start with Windows" (no adm
 stt-server-next autostart disable
 stt-server-next autostart status
 stt-server-next service install|uninstall|run   existing Windows Service host
+stt-server-next health [--json] [--data-dir <path>]
+stt-server-next models list [--json] [--data-dir <path>]
+stt-server-next models recommended [--json] [--data-dir <path>]
+stt-server-next models selected [--json] [--data-dir <path>]
+stt-server-next models install <id> [--wait] [--json] [--data-dir <path>]
+stt-server-next models import <path> --model <id> [--quant <q>] [--wait] [--json] [--data-dir <path>]
+stt-server-next models verify <id> [--wait] [--json] [--data-dir <path>]
+stt-server-next models cancel <operation_id> [--data-dir <path>]
+stt-server-next models select <id> [--json] [--data-dir <path>]
+stt-server-next models unload [--json] [--data-dir <path>]
+stt-server-next models remove <id> [--json] [--data-dir <path>]
+stt-server-next models refresh [--wait] [--json] [--data-dir <path>]
 ```
 
 `run`/`start`/`restart`/`autostart enable` share: `--port <n>` (default 54321), `--host <addr>`
@@ -238,6 +250,32 @@ given `--port`/`--host`); `disable` removes it; `status` reports the stored comm
 "disabled". Implemented with the built-in `reg.exe` (the same pattern `service.rs` already uses
 for `icacls`), so no new registry-access dependency was added. Windows-only; other platforms
 report "not supported" and exit 2.
+
+**`models`/`health`**: thin CLI wrappers over an already-*running* server's existing
+authenticated API (`docs/client-contract.md` sections 4/4.1/7) -- they discover the server and
+read its token exactly like `stop`/`status` do, and never start it or duplicate any business
+rule.
+
+- `models list`/`recommended`/`selected` are read-only `GET`s (catalog + installed state,
+  the curated recommendation order, and the currently loaded model's capability matrix).
+- `models install <id>`/`models verify <id>`/`models refresh` start a long-running operation
+  and print its `operation_id`/`state`; add `--wait` to poll `GET /v1/local/operations/{id}`
+  every 500ms, printing byte/item progress, until it reaches `completed`/`failed`/`cancelled`.
+  `models cancel <operation_id>` aborts one. `models refresh --wait` additionally reports each
+  drop-in file's outcome (registered/duplicate/changed/removed, or a retryable failure reason).
+- `models import <path> --model <id> [--quant <q>]` uploads a local GGUF file as
+  `multipart/form-data` (`model` field, optional `quant`, then the file) to
+  `POST /v1/local/models/import`, then behaves like `install`/`verify` above.
+- `models select <id>` loads a model (`409 needs_verification` prints a hint to verify or
+  refresh first); `models unload` deselects the current one; `models remove <id>` unregisters a
+  managed or drop-in model (a drop-in file's disk copy is never deleted -- the next `refresh`
+  re-registers it, matching `CONVENTIONS.md`'s "refresh and removal never delete a user's file").
+- `health` combines `/health`, `/readiness`, `/v1/local/models/selected` and `/v1/local/system`
+  into one report and exits non-zero when `/readiness` itself isn't `ready`.
+- Every subcommand accepts `--data-dir` and `--json` (raw server JSON, for automation); without
+  `--json` output is a short human-readable rendering. An absent/dead server or a `{"error":
+  {"code","message"}}` response from the API prints a clear message to stderr (or, under
+  `--json`, the error body) and exits non-zero -- these commands never crash on a down server.
 
 ## Local build
 

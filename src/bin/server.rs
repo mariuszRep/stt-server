@@ -2,8 +2,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use stt_server_next::app::{self, BindOverrides, DEFAULT_BIND_HOST, DEFAULT_BIND_PORT};
-use stt_server_next::cli::{self, AutostartAction, Command, RunFlags, ServiceAction};
+use stt_server_next::cli::{
+    self, AutostartAction, Command, ModelsCommand, RunFlags, ServiceAction,
+};
 use stt_server_next::discovery;
+use stt_server_next::model_cli::{self, ConnectError};
 
 fn effective_data_dir(flags: &RunFlags) -> PathBuf {
     flags.data_dir.clone().unwrap_or_else(app::data_dir)
@@ -50,6 +53,10 @@ async fn dispatch(command: Command) -> i32 {
         }
         Command::Autostart { action, flags } => cmd_autostart(action, flags),
         Command::Service(action) => cmd_service(action),
+        Command::Health { json, data_dir } => {
+            cmd_health(effective_data_dir_opt(&data_dir), json).await
+        }
+        Command::Models(models_command) => cmd_models(models_command).await,
     }
 }
 
@@ -423,6 +430,457 @@ fn cmd_service(_action: ServiceAction) -> i32 {
     2
 }
 
+// ---------------------------------------------------------------------------
+// health: combines /health, /readiness, selected model and system info
+// (docs/client-contract.md section 7) against the running server's
+// authenticated API.
+// ---------------------------------------------------------------------------
+
+async fn cmd_health(data_dir: PathBuf, json: bool) -> i32 {
+    let conn = match model_cli::connect(&data_dir).await {
+        Ok(conn) => conn,
+        Err(error) => return report_connect_error(&error, json),
+    };
+    let health = model_cli::call(&conn, reqwest::Method::GET, "/health", None).await;
+    let readiness = model_cli::call(&conn, reqwest::Method::GET, "/readiness", None).await;
+    let selected = model_cli::call(
+        &conn,
+        reqwest::Method::GET,
+        "/v1/local/models/selected",
+        None,
+    )
+    .await;
+    let system = model_cli::call(&conn, reqwest::Method::GET, "/v1/local/system", None).await;
+
+    let outcomes = [&health, &readiness, &selected, &system];
+    if outcomes.iter().any(|result| result.is_err()) {
+        eprintln!("error: one or more health-card requests failed");
+        for (name, result) in [
+            ("health", &health),
+            ("readiness", &readiness),
+            ("selected", &selected),
+            ("system", &system),
+        ] {
+            if let Err(error) = result {
+                eprintln!("  {name}: {error}");
+            }
+        }
+        return 1;
+    }
+    let health = health.unwrap();
+    let readiness = readiness.unwrap();
+    let selected = selected.unwrap();
+    let system = system.unwrap();
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "health": health.body,
+                "readiness": readiness.body,
+                "selected": selected.body,
+                "system": system.body,
+            })
+        );
+    } else {
+        println!(
+            "health: {}",
+            health
+                .body
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+        );
+        println!(
+            "readiness: {}",
+            readiness
+                .body
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+        );
+        match selected.body.get("model") {
+            Some(serde_json::Value::String(id)) => println!("selected model: {id}"),
+            _ => println!("selected model: none"),
+        }
+        if let Some(backend) = system.body.get("backend") {
+            println!("backend: {backend}");
+        }
+        if let Some(reason) = readiness.body.get("reason").and_then(|v| v.as_str()) {
+            println!("not ready: {reason}");
+        }
+    }
+    // Non-zero exit whenever readiness itself reported failure, so scripts
+    // can branch on exit code without parsing JSON.
+    if readiness.is_error() {
+        1
+    } else {
+        0
+    }
+}
+
+fn report_connect_error(error: &ConnectError, json: bool) -> i32 {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"error": {"code": "server_unavailable", "message": error.to_string()}})
+        );
+    } else {
+        eprintln!("error: {error}");
+    }
+    1
+}
+
+// ---------------------------------------------------------------------------
+// models: thin wrappers over the running server's model-management API
+// (src/api.rs, src/import.rs, src/operations.rs). No business logic lives
+// here -- every command is a direct HTTP call plus rendering.
+// ---------------------------------------------------------------------------
+
+async fn cmd_models(command: ModelsCommand) -> i32 {
+    match command {
+        ModelsCommand::List { json, data_dir } => {
+            simple_get(data_dir, "/v1/local/models", json).await
+        }
+        ModelsCommand::Recommended { json, data_dir } => {
+            simple_get(data_dir, "/v1/local/recommendations", json).await
+        }
+        ModelsCommand::Selected { json, data_dir } => {
+            simple_get(data_dir, "/v1/local/models/selected", json).await
+        }
+        ModelsCommand::Unload { json, data_dir } => {
+            simple_call(
+                data_dir,
+                reqwest::Method::DELETE,
+                "/v1/local/models/selected",
+                None,
+                json,
+            )
+            .await
+        }
+        ModelsCommand::Select { id, json, data_dir } => {
+            simple_call(
+                data_dir,
+                reqwest::Method::POST,
+                &format!("/v1/local/models/{id}/select"),
+                None,
+                json,
+            )
+            .await
+        }
+        ModelsCommand::Remove { id, json, data_dir } => {
+            simple_call(
+                data_dir,
+                reqwest::Method::DELETE,
+                &format!("/v1/local/models/{id}"),
+                None,
+                json,
+            )
+            .await
+        }
+        ModelsCommand::Cancel {
+            operation_id,
+            data_dir,
+        } => {
+            simple_call(
+                data_dir,
+                reqwest::Method::POST,
+                &format!("/v1/local/operations/{operation_id}/cancel"),
+                None,
+                false,
+            )
+            .await
+        }
+        ModelsCommand::Install {
+            id,
+            wait,
+            json,
+            data_dir,
+        } => {
+            operation_call(
+                effective_data_dir_opt(&data_dir),
+                reqwest::Method::POST,
+                &format!("/v1/local/models/{id}/install"),
+                None,
+                wait,
+                json,
+            )
+            .await
+        }
+        ModelsCommand::Verify {
+            id,
+            wait,
+            json,
+            data_dir,
+        } => {
+            operation_call(
+                effective_data_dir_opt(&data_dir),
+                reqwest::Method::POST,
+                &format!("/v1/local/models/{id}/verify"),
+                None,
+                wait,
+                json,
+            )
+            .await
+        }
+        ModelsCommand::Refresh {
+            wait,
+            json,
+            data_dir,
+        } => {
+            let dir = effective_data_dir_opt(&data_dir);
+            let conn = match model_cli::connect(&dir).await {
+                Ok(conn) => conn,
+                Err(error) => return report_connect_error(&error, json),
+            };
+            let outcome = match model_cli::call(
+                &conn,
+                reqwest::Method::POST,
+                "/v1/local/models/refresh",
+                None,
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return 1;
+                }
+            };
+            if outcome.is_error() {
+                return report_api_error(&outcome, json);
+            }
+            if !wait {
+                return report_operation_started(&outcome.body, json);
+            }
+            let operation_id = outcome
+                .body
+                .get("operation_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            match model_cli::poll_operation(&conn, &operation_id, json).await {
+                Ok(result) => report_refresh_result(&result, json),
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    1
+                }
+            }
+        }
+        ModelsCommand::Import {
+            path,
+            model,
+            quant,
+            wait,
+            json,
+            data_dir,
+        } => {
+            let dir = effective_data_dir_opt(&data_dir);
+            let conn = match model_cli::connect(&dir).await {
+                Ok(conn) => conn,
+                Err(error) => return report_connect_error(&error, json),
+            };
+            let outcome =
+                match model_cli::import_model(&conn, &path, &model, quant.as_deref()).await {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        return 1;
+                    }
+                };
+            if outcome.is_error() {
+                return report_api_error(&outcome, json);
+            }
+            if !wait {
+                return report_operation_started(&outcome.body, json);
+            }
+            let operation_id = outcome
+                .body
+                .get("operation_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            match model_cli::poll_operation(&conn, &operation_id, json).await {
+                Ok(result) => report_terminal_operation(&result, json),
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    1
+                }
+            }
+        }
+    }
+}
+
+async fn simple_get(data_dir: Option<PathBuf>, path: &str, json: bool) -> i32 {
+    simple_call(data_dir, reqwest::Method::GET, path, None, json).await
+}
+
+async fn simple_call(
+    data_dir: Option<PathBuf>,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+    json: bool,
+) -> i32 {
+    let dir = effective_data_dir_opt(&data_dir);
+    let conn = match model_cli::connect(&dir).await {
+        Ok(conn) => conn,
+        Err(error) => return report_connect_error(&error, json),
+    };
+    let outcome = match model_cli::call(&conn, method, path, body).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+    if outcome.is_error() {
+        return report_api_error(&outcome, json);
+    }
+    if json {
+        println!("{}", outcome.body);
+    } else {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&outcome.body).unwrap_or_default()
+        );
+    }
+    0
+}
+
+/// Shared by `install`/`verify`: fire the mutating POST, then either report
+/// the immediate `operation_id`/`state`, or poll it to a terminal state
+/// under `--wait`.
+async fn operation_call(
+    data_dir: PathBuf,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+    wait: bool,
+    json: bool,
+) -> i32 {
+    let conn = match model_cli::connect(&data_dir).await {
+        Ok(conn) => conn,
+        Err(error) => return report_connect_error(&error, json),
+    };
+    let outcome = match model_cli::call(&conn, method, path, body).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+    if outcome.is_error() {
+        return report_api_error(&outcome, json);
+    }
+    if !wait {
+        return report_operation_started(&outcome.body, json);
+    }
+    let operation_id = outcome
+        .body
+        .get("operation_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    match model_cli::poll_operation(&conn, &operation_id, json).await {
+        Ok(result) => report_terminal_operation(&result, json),
+        Err(error) => {
+            eprintln!("error: {error}");
+            1
+        }
+    }
+}
+
+fn report_api_error(outcome: &model_cli::ApiOutcome, json: bool) -> i32 {
+    if json {
+        println!("{}", outcome.body);
+    } else {
+        eprintln!("error: {}", model_cli::format_error(outcome));
+    }
+    1
+}
+
+fn report_operation_started(body: &serde_json::Value, json: bool) -> i32 {
+    if json {
+        println!("{body}");
+    } else {
+        let operation_id = body
+            .get("operation_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let state = body.get("state").and_then(|v| v.as_str()).unwrap_or("?");
+        println!("operation_id: {operation_id}");
+        println!("state: {state}");
+    }
+    0
+}
+
+fn report_terminal_operation(body: &serde_json::Value, json: bool) -> i32 {
+    let state = body.get("state").and_then(|v| v.as_str()).unwrap_or("?");
+    if json {
+        println!("{body}");
+    } else {
+        println!("final state: {state}");
+        if let Some(error) = body.get("error").and_then(|v| v.as_str()) {
+            println!("error: {error}");
+        }
+    }
+    if state == "completed" {
+        0
+    } else {
+        1
+    }
+}
+
+fn report_refresh_result(body: &serde_json::Value, json: bool) -> i32 {
+    let state = body.get("state").and_then(|v| v.as_str()).unwrap_or("?");
+    if json {
+        println!("{body}");
+        return if state == "completed" { 0 } else { 1 };
+    }
+    println!("final state: {state}");
+    if let Some(error) = body.get("error").and_then(|v| v.as_str()) {
+        println!("error: {error}");
+    }
+    if let Some(result) = body.get("result") {
+        for (label, key) in [
+            ("registered", "registered"),
+            ("duplicates", "duplicates"),
+            ("removed", "removed"),
+            ("changed", "changed"),
+        ] {
+            if let Some(items) = result.get(key).and_then(|v| v.as_array()) {
+                if !items.is_empty() {
+                    println!("{label}: {}", items.len());
+                }
+            }
+        }
+        if let Some(unsupported) = result.get("unsupported").and_then(|v| v.as_array()) {
+            for entry in unsupported {
+                let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+                let reason = entry.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
+                let retryable = entry
+                    .get("retryable")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                println!(
+                    "failed: {path}: {reason} ({})",
+                    if retryable {
+                        "retryable"
+                    } else {
+                        "not retryable"
+                    }
+                );
+            }
+        }
+    }
+    if state == "completed" {
+        0
+    } else {
+        1
+    }
+}
+
 #[cfg(test)]
 mod recovery_tests {
     use super::*;
@@ -478,5 +936,154 @@ mod recovery_tests {
         });
         assert!(health_ok("127.0.0.1", port).await);
         server.abort();
+    }
+}
+
+/// Exercises the new `models`/`health` CLI commands against a real,
+/// locally-spawned server instance -- an isolated `--data-dir` and a spare
+/// port (54400+), never the user's real data folder -- the same harness
+/// shape `recovery_tests` above uses for `cmd_stop`. The `App` is dropped
+/// (via aborting the serving task) before the temp dir is removed, per
+/// `AGENTS.md`'s Windows file-lock rule.
+#[cfg(test)]
+mod models_cli_tests {
+    use super::*;
+    use stt_server_next::cli::ModelsCommand;
+
+    struct TestServer {
+        data_dir: PathBuf,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.task.abort();
+            let _ = std::fs::remove_dir_all(&self.data_dir);
+        }
+    }
+
+    async fn spawn_test_server(port: u16) -> TestServer {
+        let data_dir = std::env::temp_dir().join(format!(
+            "stt-models-cli-test-{}-{}",
+            port,
+            uuid::Uuid::new_v4()
+        ));
+        let dir_for_task = data_dir.clone();
+        let task = tokio::spawn(async move {
+            let overrides = app::BindOverrides {
+                host: Some("127.0.0.1".to_owned()),
+                port: Some(port),
+            };
+            let _ = stt_server_next::api::run_http_full(
+                dir_for_task,
+                Default::default(),
+                overrides,
+                std::future::pending::<()>(),
+            )
+            .await;
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while discovery::read_server_json(&data_dir).is_none() {
+            if std::time::Instant::now() >= deadline {
+                panic!("test server did not start within 10s");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        while !health_ok("127.0.0.1", port).await {
+            if std::time::Instant::now() >= deadline {
+                panic!("test server never answered /health");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        TestServer { data_dir, task }
+    }
+
+    #[tokio::test]
+    async fn health_command_reports_running_server() {
+        let server = spawn_test_server(54410).await;
+        let code = cmd_health(server.data_dir.clone(), true).await;
+        // No model is loaded in a fresh data dir, so /readiness is 503 and
+        // the command's exit code should reflect that honestly.
+        assert_eq!(code, 1);
+    }
+
+    #[tokio::test]
+    async fn health_command_reports_absent_server_clearly() {
+        let dir = std::env::temp_dir().join(format!("stt-health-absent-{}", uuid::Uuid::new_v4()));
+        let code = cmd_health(dir.clone(), false).await;
+        assert_eq!(code, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn models_list_and_recommended_succeed_against_running_server() {
+        let server = spawn_test_server(54411).await;
+        let code = cmd_models(ModelsCommand::List {
+            json: true,
+            data_dir: Some(server.data_dir.clone()),
+        })
+        .await;
+        assert_eq!(code, 0);
+        let code = cmd_models(ModelsCommand::Recommended {
+            json: true,
+            data_dir: Some(server.data_dir.clone()),
+        })
+        .await;
+        assert_eq!(code, 0);
+        let code = cmd_models(ModelsCommand::Selected {
+            json: true,
+            data_dir: Some(server.data_dir.clone()),
+        })
+        .await;
+        assert_eq!(code, 0);
+    }
+
+    #[tokio::test]
+    async fn models_command_against_absent_server_fails_clearly_not_crash() {
+        let dir = std::env::temp_dir().join(format!("stt-models-absent-{}", uuid::Uuid::new_v4()));
+        let code = cmd_models(ModelsCommand::List {
+            json: false,
+            data_dir: Some(dir.clone()),
+        })
+        .await;
+        assert_eq!(code, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn models_select_unknown_model_reports_api_error_not_crash() {
+        let server = spawn_test_server(54412).await;
+        let code = cmd_models(ModelsCommand::Select {
+            id: "no-such-model".to_owned(),
+            json: true,
+            data_dir: Some(server.data_dir.clone()),
+        })
+        .await;
+        assert_eq!(code, 1);
+    }
+
+    #[tokio::test]
+    async fn models_cancel_unknown_operation_reports_not_found() {
+        let server = spawn_test_server(54413).await;
+        let code = cmd_models(ModelsCommand::Cancel {
+            operation_id: "does-not-exist".to_owned(),
+            data_dir: Some(server.data_dir.clone()),
+        })
+        .await;
+        assert_eq!(code, 1);
+    }
+
+    #[tokio::test]
+    async fn models_refresh_completes_against_an_empty_drop_in_folder() {
+        let server = spawn_test_server(54414).await;
+        let code = cmd_models(ModelsCommand::Refresh {
+            wait: true,
+            json: true,
+            data_dir: Some(server.data_dir.clone()),
+        })
+        .await;
+        // Empty (unconfigured) drop-in folder scans to zero results and
+        // completes successfully.
+        assert_eq!(code, 0);
     }
 }
