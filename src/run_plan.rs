@@ -289,7 +289,7 @@ pub fn plan(
         language_hint_applied,
         language_hint_provided,
         applied_language,
-        mut language_evidence_hint,
+        language_evidence_hint,
     ) = resolve_language(request.language.as_deref(), caps);
 
     // --- prompt ---------------------------------------------------------
@@ -407,7 +407,12 @@ pub fn plan(
             let source_is_english = applied_language.as_deref() == Some("en")
                 || (caps.loaded.languages.len() == 1 && caps.loaded.languages[0] == "en");
             if source_is_english {
-                language_evidence_hint = Some("translated_to_english".to_string());
+                // Transcribing instead of translating is correct here (the
+                // source is already English), but the *evidence* for why is
+                // whatever `resolve_language` already determined: an explicit
+                // `en` hint is `user_selected`, and a single-language `en`
+                // model with no hint is `model_constrained`. Neither case is
+                // actually "translated to English" — nothing was translated.
                 (PlannedTask::Transcribe, None)
             } else {
                 (PlannedTask::Translate, Some("en".to_string()))
@@ -747,10 +752,10 @@ mod tests {
         let p = plan(&r, &whisper_caps(), Endpoint::Translations, None).unwrap();
         assert_eq!(p.task, PlannedTask::Transcribe);
         assert_eq!(p.target_language, None);
-        assert_eq!(
-            p.language_evidence_hint.as_deref(),
-            Some("translated_to_english")
-        );
+        // The source is English so transcribing (not translating) is
+        // correct, but the hint was explicit -- the evidence must say so,
+        // not the stale "translated_to_english" (nothing was translated).
+        assert_eq!(p.language_evidence_hint.as_deref(), Some("user_selected"));
     }
 
     #[test]
@@ -758,6 +763,12 @@ mod tests {
         let r = req();
         let p = plan(&r, &single_lang_en_caps(), Endpoint::Translations, None).unwrap();
         assert_eq!(p.task, PlannedTask::Transcribe);
+        // No hint was given; a single-language `en` model forced English --
+        // that's model_constrained, not translated_to_english.
+        assert_eq!(
+            p.language_evidence_hint.as_deref(),
+            Some("model_constrained")
+        );
     }
 
     #[test]
