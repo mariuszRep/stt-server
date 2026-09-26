@@ -65,6 +65,13 @@ pub struct LoadedCaps {
     /// `null`) so a future engine version that does expose one only needs a
     /// change in `from_model`, not in the plan/enforcement logic below.
     pub prompt_max_tokens: Option<usize>,
+    /// Bug 1: set once an actual run against this loaded model rejected its
+    /// own advertised `max_timestamp_kind` as unsupported at the engine
+    /// level. Once set, the effective view stops claiming
+    /// `timestamp_granularity` as supported for this loaded model — the
+    /// claim has been observed to be wrong, even though the model itself
+    /// reported it at load time.
+    pub timestamp_granularity_rejected: bool,
 }
 
 impl LoadedCaps {
@@ -96,6 +103,7 @@ impl LoadedCaps {
             )),
             // See the field doc: no engine API in 0.2.3 publishes this.
             prompt_max_tokens: None,
+            timestamp_granularity_rejected: false,
         }
     }
 }
@@ -214,6 +222,15 @@ impl EffectiveCaps {
         )
     }
 
+    /// Bug 1: record that a real run rejected this loaded model's advertised
+    /// timestamp granularity. Update the cached `EffectiveCaps` under the
+    /// same brief lock that guards `App::loaded`, so later requests against
+    /// this same loaded model stop being told `timestamp_granularity` is
+    /// supported.
+    pub fn mark_timestamp_granularity_rejected(&mut self) {
+        self.loaded.timestamp_granularity_rejected = true;
+    }
+
     /// Serialize the full effective capability matrix, in the same shape
     /// family as `catalog_view`, plus `catalog_mismatch` against a catalog
     /// entry when one is supplied by the caller (see [`catalog_mismatch`]).
@@ -301,13 +318,24 @@ impl EffectiveCaps {
             scope: None,
             extra: json!({ "target_languages": ["en"] }),
         };
-        let timestamp_granularity = ControlCapability {
-            status: Status::Supported,
-            reason: None,
-            evidence: "loaded_model",
-            mechanism: None,
-            scope: None,
-            extra: json!({ "max": self.max_timestamp_granularity().as_str() }),
+        let timestamp_granularity = if self.loaded.timestamp_granularity_rejected {
+            ControlCapability {
+                status: Status::Unsupported,
+                reason: Some("run_rejected"),
+                evidence: "run_rejected",
+                mechanism: None,
+                scope: None,
+                extra: json!({ "max": self.max_timestamp_granularity().as_str() }),
+            }
+        } else {
+            ControlCapability {
+                status: Status::Supported,
+                reason: None,
+                evidence: "loaded_model",
+                mechanism: None,
+                scope: None,
+                extra: json!({ "max": self.max_timestamp_granularity().as_str() }),
+            }
         };
         let streaming = ControlCapability {
             status: Status::Unsupported,
@@ -390,6 +418,7 @@ mod tests {
             feature_initial_prompt_flag: true,
             whisper_ext_accepted: Some(true),
             prompt_max_tokens: None,
+            timestamp_granularity_rejected: false,
         }
     }
 
@@ -404,6 +433,7 @@ mod tests {
             feature_initial_prompt_flag: false,
             whisper_ext_accepted: None,
             prompt_max_tokens: None,
+            timestamp_granularity_rejected: false,
         }
     }
 

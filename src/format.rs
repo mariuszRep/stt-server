@@ -62,9 +62,17 @@ pub struct DiagnosticsExtra {
     pub decode_ms: f32,
     pub truncated: bool,
     pub prompt_applied: bool,
-    pub language_hint_applied: bool,
+    /// `Some(applied)` when the request included a language hint at all
+    /// (Bug 2); `None` when no hint was sent, so the key is omitted from
+    /// `x_diagnostics` entirely rather than reported as a misleading
+    /// `false`.
+    pub language_hint_applied: Option<bool>,
     pub applied_language: Option<String>,
     pub language_evidence: LanguageEvidence,
+    /// Bug 1: set when a defaulted `verbose_json` timestamp request was
+    /// retried without timestamps because the engine rejected the model's
+    /// own advertised granularity.
+    pub timestamps_unavailable: bool,
 }
 
 fn diagnostics_json(extra: &DiagnosticsExtra) -> Value {
@@ -76,7 +84,6 @@ fn diagnostics_json(extra: &DiagnosticsExtra) -> Value {
         "backend": extra.backend,
         "fallback_reason": extra.fallback_reason,
         "language_evidence": extra.language_evidence.as_str(),
-        "language_hint_applied": extra.language_hint_applied,
         "prompt_applied": extra.prompt_applied,
         "engine_timings": {
             "mel_ms": extra.mel_ms,
@@ -84,11 +91,17 @@ fn diagnostics_json(extra: &DiagnosticsExtra) -> Value {
             "decode_ms": extra.decode_ms,
         },
     });
+    if let Some(applied) = extra.language_hint_applied {
+        v["language_hint_applied"] = json!(applied);
+    }
     if let Some(language) = &extra.applied_language {
         v["applied_language"] = json!(language);
     }
     if extra.truncated {
         v["truncated"] = json!(true);
+    }
+    if extra.timestamps_unavailable {
+        v["timestamps_unavailable"] = json!(true);
     }
     v
 }
@@ -190,9 +203,10 @@ mod tests {
             decode_ms: 3.0,
             truncated: false,
             prompt_applied: false,
-            language_hint_applied: false,
+            language_hint_applied: None,
             applied_language: None,
             language_evidence: LanguageEvidence::Unknown,
+            timestamps_unavailable: false,
         }
     }
 
@@ -206,8 +220,10 @@ mod tests {
             timestamps,
             response_format,
             language_hint_applied: false,
+            language_hint_provided: false,
             applied_language: None,
             language_evidence_hint: None,
+            timestamps_explicit: false,
         }
     }
 
@@ -329,6 +345,62 @@ mod tests {
         let out2 = format_response(&t, &p, 16_000, &e);
         match out2 {
             Formatted::Json(v) => assert_eq!(v["x_diagnostics"]["truncated"], true),
+            _ => panic!("expected json"),
+        }
+    }
+
+    #[test]
+    fn language_hint_applied_key_omitted_when_no_hint_was_sent() {
+        let t = Transcript::default();
+        let p = plan(ResponseFormat::Json, TimestampGranularity::None);
+        let out = format_response(&t, &p, 16_000, &extra());
+        match out {
+            Formatted::Json(v) => {
+                assert!(v["x_diagnostics"].get("language_hint_applied").is_none())
+            }
+            _ => panic!("expected json"),
+        }
+    }
+
+    #[test]
+    fn language_hint_applied_key_present_true_or_false_when_hint_was_sent() {
+        let t = Transcript::default();
+        let p = plan(ResponseFormat::Json, TimestampGranularity::None);
+
+        let mut e_false = extra();
+        e_false.language_hint_applied = Some(false);
+        let out = format_response(&t, &p, 16_000, &e_false);
+        match out {
+            Formatted::Json(v) => assert_eq!(v["x_diagnostics"]["language_hint_applied"], false),
+            _ => panic!("expected json"),
+        }
+
+        let mut e_true = extra();
+        e_true.language_hint_applied = Some(true);
+        let out2 = format_response(&t, &p, 16_000, &e_true);
+        match out2 {
+            Formatted::Json(v) => assert_eq!(v["x_diagnostics"]["language_hint_applied"], true),
+            _ => panic!("expected json"),
+        }
+    }
+
+    #[test]
+    fn timestamps_unavailable_flag_only_present_when_true() {
+        let t = Transcript::default();
+        let p = plan(ResponseFormat::VerboseJson, TimestampGranularity::None);
+        let out = format_response(&t, &p, 16_000, &extra());
+        match out {
+            Formatted::Json(v) => {
+                assert!(v["x_diagnostics"].get("timestamps_unavailable").is_none())
+            }
+            _ => panic!("expected json"),
+        }
+
+        let mut e = extra();
+        e.timestamps_unavailable = true;
+        let out2 = format_response(&t, &p, 16_000, &e);
+        match out2 {
+            Formatted::Json(v) => assert_eq!(v["x_diagnostics"]["timestamps_unavailable"], true),
             _ => panic!("expected json"),
         }
     }

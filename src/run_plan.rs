@@ -88,6 +88,13 @@ pub struct Plan {
     /// (`true`), or the language was decided by the Handy fallback / no hint
     /// was given at all (`false`).
     pub language_hint_applied: bool,
+    /// Whether the request actually included a non-empty, non-`auto`
+    /// `language` hint at all (Bug 2). Distinct from `language_hint_applied`:
+    /// that field says whether the hint (if any) was honored; this one says
+    /// whether there was a hint to begin with, so the caller can omit
+    /// `x_diagnostics.language_hint_applied` entirely when no hint was sent,
+    /// rather than reporting a misleading `false`.
+    pub language_hint_provided: bool,
     /// The language this plan will actually use, for diagnostics: `None`
     /// means autodetect (no hint given and the model does language
     /// detection). Always `Some` when `language` is `Some`, and also `Some`
@@ -95,6 +102,12 @@ pub struct Plan {
     /// concrete language.
     pub applied_language: Option<String>,
     pub language_evidence_hint: Option<String>,
+    /// Whether `timestamps` was picked by an explicit
+    /// `timestamp_granularities` request (`true`) or defaulted for
+    /// `verbose_json` because none was given (`false`). Used by Bug 1's
+    /// retry decision: only a defaulted choice may be silently downgraded
+    /// when the engine rejects it; an explicit request keeps failing.
+    pub timestamps_explicit: bool,
 }
 
 impl Plan {
@@ -225,7 +238,7 @@ fn fallback_language(supported: &[String], supports_language_detection: bool) ->
 fn resolve_language(
     requested: Option<&str>,
     caps: &EffectiveCaps,
-) -> (Option<String>, bool, Option<String>, Option<String>) {
+) -> (Option<String>, bool, bool, Option<String>, Option<String>) {
     let supported = &caps.loaded.languages;
     let has_hint = requested
         .map(|raw| {
@@ -240,6 +253,7 @@ fn resolve_language(
             return (
                 Some(matched.clone()),
                 true,
+                true,
                 Some(matched),
                 Some("user_selected".to_string()),
             );
@@ -248,10 +262,11 @@ fn resolve_language(
 
     // No hint, or a hint that didn't match anything the model supports.
     match fallback_language(supported, caps.loaded.supports_language_detect) {
-        None => (None, false, None, None),
+        None => (None, false, has_hint, None, None),
         Some(lang) => (
             Some(lang.clone()),
             false,
+            has_hint,
             Some(lang),
             Some("model_constrained".to_string()),
         ),
@@ -269,8 +284,13 @@ pub fn plan(
     tokenize: Option<&Tokenizer>,
 ) -> Result<Plan, ApiError> {
     // --- language -----------------------------------------------------
-    let (language_hint, language_hint_applied, applied_language, mut language_evidence_hint) =
-        resolve_language(request.language.as_deref(), caps);
+    let (
+        language_hint,
+        language_hint_applied,
+        language_hint_provided,
+        applied_language,
+        mut language_evidence_hint,
+    ) = resolve_language(request.language.as_deref(), caps);
 
     // --- prompt ---------------------------------------------------------
     let has_prompt = request
@@ -347,7 +367,11 @@ pub fn plan(
 
     // --- timestamps ---------------------------------------------------------
     let word_requested = request.timestamp_granularities.iter().any(|g| g == "word");
-    let timestamps = match response_format {
+    let segment_requested = request
+        .timestamp_granularities
+        .iter()
+        .any(|g| g == "segment");
+    let (timestamps, timestamps_explicit) = match response_format {
         ResponseFormat::VerboseJson => {
             if word_requested {
                 if !caps.supports_word_timestamps() {
@@ -357,12 +381,16 @@ pub fn plan(
                         "This model does not support word-level timestamps",
                     ));
                 }
-                TimestampGranularity::Word
+                (TimestampGranularity::Word, true)
+            } else if segment_requested {
+                (TimestampGranularity::Segment, true)
             } else {
-                TimestampGranularity::Segment
+                // Not explicitly requested: defaulted for verbose_json. Bug
+                // 1's retry may still silently downgrade this one.
+                (TimestampGranularity::Segment, false)
             }
         }
-        ResponseFormat::Json | ResponseFormat::Text => TimestampGranularity::None,
+        ResponseFormat::Json | ResponseFormat::Text => (TimestampGranularity::None, false),
     };
 
     // --- task / translation --------------------------------------------------
@@ -396,9 +424,34 @@ pub fn plan(
         timestamps,
         response_format,
         language_hint_applied,
+        language_hint_provided,
         applied_language,
         language_evidence_hint,
+        timestamps_explicit,
     })
+}
+
+/// Bug 1's retry decision, kept pure and unit-tested on its own: should a
+/// failed run be retried once with `TimestampKind::None`? Only when all of
+/// these hold:
+/// - the response format is `verbose_json` (only it ever asks for segment
+///   timestamps),
+/// - the timestamp kind actually run was `Segment`,
+/// - that choice was defaulted, not explicitly requested via
+///   `timestamp_granularities` (an explicit request keeps failing — no
+///   silent downgrade of an explicit ask), and
+/// - the engine's failure was `engine_unsupported` (an `Unsupported` run
+///   error), not some other failure this retry wouldn't fix.
+pub fn should_retry_without_timestamps(
+    response_format: ResponseFormat,
+    timestamps: TimestampGranularity,
+    timestamps_explicit: bool,
+    error_code: &str,
+) -> bool {
+    response_format == ResponseFormat::VerboseJson
+        && timestamps == TimestampGranularity::Segment
+        && !timestamps_explicit
+        && error_code == "engine_unsupported"
 }
 
 #[cfg(test)]
@@ -417,6 +470,7 @@ mod tests {
             feature_initial_prompt_flag: true,
             whisper_ext_accepted: Some(true),
             prompt_max_tokens: None,
+            timestamp_granularity_rejected: false,
         })
     }
 
@@ -431,6 +485,7 @@ mod tests {
             feature_initial_prompt_flag: false,
             whisper_ext_accepted: None,
             prompt_max_tokens: None,
+            timestamp_granularity_rejected: false,
         })
     }
 
@@ -445,6 +500,7 @@ mod tests {
             feature_initial_prompt_flag: false,
             whisper_ext_accepted: None,
             prompt_max_tokens: None,
+            timestamp_granularity_rejected: false,
         })
     }
 
@@ -746,6 +802,98 @@ mod tests {
         let r = req();
         let p = plan(&r, &whisper_caps(), Endpoint::Transcriptions, None).unwrap();
         assert_eq!(p.timestamps, TimestampGranularity::None);
+    }
+
+    // --- language_hint_provided (Bug 2) ---------------------------------------
+
+    #[test]
+    fn language_hint_provided_false_when_no_language_sent() {
+        let r = req();
+        let p = plan(&r, &whisper_caps(), Endpoint::Transcriptions, None).unwrap();
+        assert!(!p.language_hint_provided);
+    }
+
+    #[test]
+    fn language_hint_provided_false_for_auto_or_empty() {
+        let mut r = req();
+        r.language = Some("auto".to_string());
+        let p = plan(&r, &whisper_caps(), Endpoint::Transcriptions, None).unwrap();
+        assert!(!p.language_hint_provided);
+
+        let mut r2 = req();
+        r2.language = Some("".to_string());
+        let p2 = plan(&r2, &whisper_caps(), Endpoint::Transcriptions, None).unwrap();
+        assert!(!p2.language_hint_provided);
+    }
+
+    #[test]
+    fn language_hint_provided_true_when_matched() {
+        let mut r = req();
+        r.language = Some("en".to_string());
+        let p = plan(&r, &whisper_caps(), Endpoint::Transcriptions, None).unwrap();
+        assert!(p.language_hint_provided);
+        assert!(p.language_hint_applied);
+    }
+
+    #[test]
+    fn language_hint_provided_true_but_applied_false_when_unmatched() {
+        let mut r = req();
+        r.language = Some("xx".to_string());
+        let p = plan(&r, &whisper_caps(), Endpoint::Transcriptions, None).unwrap();
+        assert!(p.language_hint_provided);
+        assert!(!p.language_hint_applied);
+    }
+
+    // --- should_retry_without_timestamps (Bug 1) ------------------------------
+
+    #[test]
+    fn retries_defaulted_segment_timestamps_on_engine_unsupported() {
+        assert!(should_retry_without_timestamps(
+            ResponseFormat::VerboseJson,
+            TimestampGranularity::Segment,
+            false,
+            "engine_unsupported",
+        ));
+    }
+
+    #[test]
+    fn does_not_retry_when_timestamps_were_explicit() {
+        assert!(!should_retry_without_timestamps(
+            ResponseFormat::VerboseJson,
+            TimestampGranularity::Segment,
+            true,
+            "engine_unsupported",
+        ));
+    }
+
+    #[test]
+    fn does_not_retry_for_non_verbose_json() {
+        assert!(!should_retry_without_timestamps(
+            ResponseFormat::Json,
+            TimestampGranularity::Segment,
+            false,
+            "engine_unsupported",
+        ));
+    }
+
+    #[test]
+    fn does_not_retry_for_word_timestamps() {
+        assert!(!should_retry_without_timestamps(
+            ResponseFormat::VerboseJson,
+            TimestampGranularity::Word,
+            false,
+            "engine_unsupported",
+        ));
+    }
+
+    #[test]
+    fn does_not_retry_for_other_error_codes() {
+        assert!(!should_retry_without_timestamps(
+            ResponseFormat::VerboseJson,
+            TimestampGranularity::Segment,
+            false,
+            "engine_rejected_option",
+        ));
     }
 
     // --- response_format --------------------------------------------------

@@ -874,35 +874,90 @@ async fn transcribe_or_translate(
     let cancellation = CancelToken::new();
     let _cancel_on_disconnect = CancelWhenDropped(cancellation.clone());
     let run_options = plan.to_run_options();
+    // Bug 1: only a *defaulted* verbose_json segment-timestamp choice may be
+    // silently downgraded when the engine rejects it — never an explicit
+    // `timestamp_granularities` request. Decided once, up front, from the
+    // plan alone (the pure `should_retry_without_timestamps`); actually
+    // exercised below only if the run comes back `Unsupported`.
+    let retry_eligible = crate::run_plan::should_retry_without_timestamps(
+        plan.response_format,
+        plan.timestamps,
+        plan.timestamps_explicit,
+        "engine_unsupported",
+    );
     let inference_started = Instant::now();
     let worker = tokio::task::spawn_blocking(
-        move || -> transcribe_cpp::Result<transcribe_cpp::Transcript> {
+        move || -> transcribe_cpp::Result<(transcribe_cpp::Transcript, bool)> {
             let _permit = permit;
             let mut session = model.session()?;
             session.set_cancel_token(&cancellation);
-            session.run(&pcm, &run_options)
+            match session.run(&pcm, &run_options) {
+                Err(transcribe_cpp::Error::Unsupported(message)) if retry_eligible => {
+                    // Retry once, in the same queue slot (no re-queue): same
+                    // model, same session/permit hold, `TimestampKind::None`
+                    // in place of the rejected default.
+                    let mut retry_options = run_options.clone();
+                    retry_options.timestamps = transcribe_cpp::TimestampKind::None;
+                    let mut retry_session = match model.session() {
+                        Ok(s) => s,
+                        Err(_) => return Err(transcribe_cpp::Error::Unsupported(message)),
+                    };
+                    retry_session.set_cancel_token(&cancellation);
+                    match retry_session.run(&pcm, &retry_options) {
+                        Ok(transcript) => Ok((transcript, true)),
+                        Err(_) => Err(transcribe_cpp::Error::Unsupported(message)),
+                    }
+                }
+                Ok(transcript) => Ok((transcript, false)),
+                Err(other) => Err(other),
+            }
         },
     );
-    let run_result = match limits.inference_timeout_ms {
-        Some(timeout_ms) => tokio::time::timeout(Duration::from_millis(timeout_ms), worker)
-            .await
-            .map_err(|_| {
-                ApiError::new(
-                    StatusCode::GATEWAY_TIMEOUT,
-                    "inference_timeout",
-                    format!("Inference exceeded the {timeout_ms}ms limit"),
-                )
-            })?
-            .map_err(internal)?,
-        None => worker.await.map_err(internal)?,
-    };
+    let run_result: transcribe_cpp::Result<(transcribe_cpp::Transcript, bool)> =
+        match limits.inference_timeout_ms {
+            Some(timeout_ms) => tokio::time::timeout(Duration::from_millis(timeout_ms), worker)
+                .await
+                .map_err(|_| {
+                    ApiError::new(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "inference_timeout",
+                        format!("Inference exceeded the {timeout_ms}ms limit"),
+                    )
+                })?
+                .map_err(internal)?,
+            None => worker.await.map_err(internal)?,
+        };
     let inference_ms = inference_started.elapsed().as_millis() as u64;
+
+    let mut timestamps_unavailable = false;
+    let run_result: transcribe_cpp::Result<transcribe_cpp::Transcript> = match run_result {
+        Ok((transcript, retried)) => {
+            timestamps_unavailable = retried;
+            Ok(transcript)
+        }
+        Err(error) => Err(error),
+    };
 
     let (transcript, truncated) = match classify_run_result(run_result) {
         RunOutcome::Success(transcript) => (transcript, false),
         RunOutcome::Truncated(transcript) => (transcript, true),
         RunOutcome::Failed(error) => return Err(error),
     };
+
+    if timestamps_unavailable {
+        // Bug 1: the engine has now demonstrably rejected this loaded
+        // model's own advertised timestamp granularity. Update the cached
+        // effective caps under the same brief lock that guards `App::loaded`
+        // so later requests against this same loaded model stop being told
+        // `timestamp_granularity` is supported.
+        if let Ok(mut active) = app.loaded.lock() {
+            if let Some(loaded) = active.as_mut() {
+                if loaded.id == active_id {
+                    loaded.caps.mark_timestamp_granularity_rejected();
+                }
+            }
+        }
+    }
 
     let language_evidence = LanguageEvidence::resolve(
         plan.language_evidence_hint.as_deref(),
@@ -920,9 +975,12 @@ async fn transcribe_or_translate(
         decode_ms: transcript.timings.decode_ms,
         truncated,
         prompt_applied: plan.initial_prompt.is_some(),
-        language_hint_applied: plan.language_hint_applied,
+        language_hint_applied: plan
+            .language_hint_provided
+            .then_some(plan.language_hint_applied),
         applied_language: plan.applied_language.clone(),
         language_evidence,
+        timestamps_unavailable,
     };
 
     let formatted = format_response(&transcript, &plan, samples, &extra);
