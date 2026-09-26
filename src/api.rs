@@ -340,6 +340,26 @@ pub async fn readiness(
     }
 }
 
+/// `GET /v1/local/system`: OS/CPU/memory/GPU/process/server info for the
+/// client's hardware/health card. See `crate::sysinfo` for field semantics
+/// and what's omitted when unobtainable.
+pub async fn system_info(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    authorized(&headers, &app)?;
+    let snapshot = tokio::task::spawn_blocking(crate::sysinfo::probe)
+        .await
+        .map_err(internal)?;
+    let server = crate::sysinfo::ServerSection {
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        host: app.bind_host.clone(),
+        port: app.bind_port,
+        data_dir: app.data_dir.display().to_string(),
+    };
+    Ok(Json(crate::sysinfo::to_json(&snapshot, &server)))
+}
+
 pub async fn recommendations(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -1091,6 +1111,7 @@ pub fn router(app: Arc<App>) -> Router {
             "/v1/audio/translations",
             post(translations).layer(DefaultBodyLimit::max(40 * 1024 * 1024)),
         )
+        .route("/v1/local/system", get(system_info))
         .route("/v1/local/recommendations", get(recommendations))
         .route("/v1/local/config", get(get_config).patch(patch_config))
         .route("/v1/local/shutdown", post(shutdown_endpoint))

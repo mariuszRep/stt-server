@@ -21,4 +21,5 @@ pub mod run_plan;
 #[cfg(windows)]
 pub mod service;
 pub mod store;
+pub mod sysinfo;
 pub mod verify;

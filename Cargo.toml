@@ -26,6 +26,19 @@ tower-http = { version = "=0.7.1", features = ["cors"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "=0.8.1"
+# Already a transitive dependency (via tokio) at 0.61.2; pinned exactly and
+# taken on directly, with only the feature sets `GET /v1/local/system` needs
+# (registry reads for OS/CPU name, GlobalMemoryStatusEx for RAM,
+# GetLogicalProcessorInformation for physical core count, and
+# GetProcessMemoryInfo for this process's working-set size), so no new
+# transitive surface is added.
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+] }
 
 [dev-dependencies]
 tower = { version = "=0.5.3", features = ["util"] }
