@@ -33,8 +33,10 @@ use crate::store::{self, now_ms, SOURCE_CATALOG_DOWNLOAD, SOURCE_IMPORT, SOURCE_
 use crate::verify::sha256_file;
 
 /// Error code recorded on the operation when no `user_models_dir` is
-/// configured and none can be defaulted (service mode with no default; see
-/// `app::default_user_models_dir`).
+/// configured and none can be defaulted (only possible if `LOCALAPPDATA`
+/// itself is unset in a per-user install; see `app::default_user_models_dir`,
+/// which otherwise always defaults inside this install's single data
+/// folder, for either scope).
 pub const ERROR_CODE_USER_MODELS_DIR_NOT_CONFIGURED: &str = "user_models_dir_not_configured";
 
 fn file_mtime_ms(path: &Path) -> Option<i64> {

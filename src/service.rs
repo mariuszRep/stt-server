@@ -25,7 +25,7 @@ use windows_service::{
 };
 
 use crate::api::run_http;
-use crate::app::{data_dir, token_file};
+use crate::app::{data_dir, machine_wide_data_dir, machine_wide_program_dir, token_file};
 
 const NAME: &str = "OpenVibeSttNext";
 define_windows_service!(ffi_service_main, service_main);
@@ -93,11 +93,20 @@ fn run_service() -> Result<(), Box<dyn Error>> {
 }
 
 fn install_dir() -> PathBuf {
-    std::env::var_os("ProgramFiles")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"))
-        .join("OpenVibeAI")
-        .join("STT Server Next")
+    machine_wide_program_dir()
+}
+
+/// Best-effort admin check, in the same no-dependency spirit as the
+/// `icacls`/`reg` calls already used here: `net session` only succeeds when
+/// run elevated. Used to give `service install` a clear refusal instead of a
+/// raw "access denied" partway through creating `%ProgramFiles%`/
+/// `%ProgramData%` folders.
+fn is_elevated() -> bool {
+    Command::new("net")
+        .args(["session"])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 fn owner_name() -> Result<String, Box<dyn Error>> {
@@ -116,40 +125,31 @@ fn icacls(path: &Path, rules: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Record the installing user's drop-in `user_models_dir` (user decision
-/// 2026-09-25): the service runs as LocalSystem, which has no useful
-/// per-user `LOCALAPPDATA`, so the folder must be captured now, while
-/// `install()` still runs as the interactive installing user. Creates the
-/// folder if missing (never changes its ACLs -- it's the user's own profile
-/// directory) and writes the setting directly into `state.db`, running the
-/// same migrations `App::open` would run so a fresh install already has the
-/// v4 schema. Best-effort: `LOCALAPPDATA` being unset (unusual, but not
-/// fatal) just leaves the setting unset, matching a service-mode start with
-/// no configured drop folder (`user_models_dir_not_configured` on refresh).
-fn record_installing_user_models_dir(data: &Path) -> Result<(), Box<dyn Error>> {
-    let Some(base) = std::env::var_os("LOCALAPPDATA") else {
-        return Ok(());
-    };
-    let dir = PathBuf::from(base)
-        .join("OpenVibeAI")
-        .join("STT Server")
-        .join("models");
-    fs::create_dir_all(&dir)?;
-    let catalog: crate::catalog::Catalog =
-        serde_json::from_str(include_str!("../catalog/handy-2026-08-17.json"))?;
-    let mut db = rusqlite::Connection::open(data.join("state.db"))?;
-    crate::store::migrate(&mut db, &catalog.models, data)?;
-    db.execute(
-        "INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        rusqlite::params![
-            crate::store::SETTING_USER_MODELS_DIR,
-            dir.to_string_lossy().as_ref()
-        ],
-    )?;
-    Ok(())
+/// `service install` only makes sense for a machine-wide install (the
+/// service always runs as LocalSystem, serving every user of the machine),
+/// and setting one up requires writing into `%ProgramFiles%`/`%ProgramData%`,
+/// which requires an elevated (Administrator) prompt. Refusing up front, with
+/// a clear message, is simpler and less confusing than letting a per-user,
+/// non-elevated invocation fail partway through with a raw "access denied"
+/// from `fs::create_dir_all`/`icacls`. Choice made here: elevation is used as
+/// the proxy for "performing a machine-wide install" rather than re-deriving
+/// scope from the current (pre-install) executable location, since a
+/// per-user install is never elevated and a machine-wide install always must
+/// be, at install time.
+fn require_elevated_for_install() -> Result<(), Box<dyn Error>> {
+    if is_elevated() {
+        Ok(())
+    } else {
+        Err(
+            "service install is only for a machine-wide install: run it from an elevated \
+             (Administrator) prompt. A per-user install uses `autostart enable` instead."
+                .into(),
+        )
+    }
 }
 
 pub fn install() -> Result<(), Box<dyn Error>> {
+    require_elevated_for_install()?;
     let install_dir = install_dir();
     fs::create_dir_all(&install_dir)?;
     let binary = install_dir.join("stt-server-next.exe");
@@ -157,11 +157,11 @@ pub fn install() -> Result<(), Box<dyn Error>> {
     if source != binary {
         fs::copy(source, &binary)?;
     }
-    let data = std::env::var_os("PROGRAMDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-        .join("OpenVibeAI")
-        .join("STT Server Next");
+    // Marks this folder as a machine-wide install for `app::install_scope`,
+    // so the binary is still recognized after being moved/copied elsewhere
+    // (e.g. by an installer that stages it under a different path first).
+    fs::write(install_dir.join(".machine-wide-install"), b"")?;
+    let data = machine_wide_data_dir();
     fs::create_dir_all(&data)?;
     let token_path = data.join("auth.token");
     let owner = owner_name()?;
@@ -186,7 +186,6 @@ pub fn install() -> Result<(), Box<dyn Error>> {
             format!("{owner}:R"),
         ],
     )?;
-    record_installing_user_models_dir(&data)?;
     let manager = ServiceManager::local_computer(
         None::<&str>,
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
@@ -258,4 +257,33 @@ pub fn uninstall() -> Result<(), Box<dyn Error>> {
     }
     println!("Removed {NAME}; model and state data preserved");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `service install` must refuse with a clear message unless it is
+    /// performing a machine-wide install, and (per the choice documented on
+    /// `require_elevated_for_install`) that is decided by elevation: a normal,
+    /// non-elevated test run is exactly the per-user case, so this asserts a
+    /// refusal there while still passing if the suite is ever run elevated.
+    #[test]
+    fn service_install_refuses_unless_elevated() {
+        let result = require_elevated_for_install();
+        if is_elevated() {
+            assert!(result.is_ok());
+        } else {
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains("machine-wide"),
+                "expected a machine-wide-install refusal, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn install_dir_is_the_unified_machine_wide_program_dir() {
+        assert_eq!(install_dir(), machine_wide_program_dir());
+    }
 }

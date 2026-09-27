@@ -67,43 +67,173 @@ pub fn is_service_mode() -> bool {
     std::env::args().nth(1).as_deref() == Some("service")
 }
 
-pub fn data_dir() -> PathBuf {
-    if is_service_mode() {
-        return std::env::var_os("PROGRAMDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-            .join("OpenVibeAI")
-            .join("STT Server Next");
-    }
-    std::env::var_os("STT_NEXT_DATA_DIR")
+/// Which install this process belongs to. See [`install_scope`] for how it
+/// is decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallScope {
+    /// Default: no admin required. Data lives under the running user's
+    /// `%LOCALAPPDATA%`.
+    PerUser,
+    /// Program under `%ProgramFiles%`, data under `%ProgramData%`, shared by
+    /// every user of the machine. Only a machine-wide install offers the
+    /// Windows Service.
+    MachineWide,
+}
+
+fn program_files_dir() -> PathBuf {
+    std::env::var_os("ProgramFiles")
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("LOCALAPPDATA").map(|base| PathBuf::from(base).join("STT Server Next"))
-        })
-        .unwrap_or_else(|| PathBuf::from(".stt-server-next"))
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"))
+}
+
+fn programdata_dir() -> PathBuf {
+    std::env::var_os("PROGRAMDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+}
+
+/// `%ProgramFiles%\OpenVibeAI\STT Server`: where a machine-wide install's
+/// executable lives.
+pub fn machine_wide_program_dir() -> PathBuf {
+    program_files_dir().join("OpenVibeAI").join("STT Server")
+}
+
+/// `%ProgramData%\OpenVibeAI\STT Server`: a machine-wide install's single
+/// data folder.
+pub fn machine_wide_data_dir() -> PathBuf {
+    programdata_dir().join("OpenVibeAI").join("STT Server")
+}
+
+/// The old (pre-unification) machine-wide data folder name, kept only so an
+/// existing install can be migrated forward; see [`migrate_dir_once`].
+fn machine_wide_old_data_dir() -> PathBuf {
+    programdata_dir().join("OpenVibeAI").join("STT Server Next")
+}
+
+/// `%LOCALAPPDATA%\OpenVibeAI\STT Server`: a per-user install's single data
+/// folder. `None` only when `LOCALAPPDATA` itself is unset (not expected on
+/// real Windows).
+fn per_user_data_dir_opt() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|base| PathBuf::from(base).join("OpenVibeAI").join("STT Server"))
+}
+
+/// The old (pre-unification) per-user data folder name -- it was missing the
+/// `OpenVibeAI` publisher folder entirely. Kept only for migration.
+fn per_user_old_data_dir_opt() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|base| PathBuf::from(base).join("STT Server Next"))
+}
+
+/// Decide the install scope for `exe_dir` (the directory containing the
+/// running executable, or `None` if it could not be determined): machine-wide
+/// if it is the machine-wide program folder, or a marker file
+/// (`.machine-wide-install`) written there at install time is present
+/// (covers a copied/renamed exe still belonging to that install); per-user
+/// otherwise. Kept separate from [`install_scope`] so scope resolution is
+/// testable without depending on `std::env::current_exe`.
+pub fn install_scope_for(exe_dir: Option<&Path>) -> InstallScope {
+    let Some(dir) = exe_dir else {
+        return InstallScope::PerUser;
+    };
+    // Compared lexically (case-insensitively, as Windows paths are), not via
+    // `fs::canonicalize`: this must work without touching disk or requiring
+    // the machine-wide program folder to exist, e.g. in tests.
+    let is_machine_wide_dir = dir
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&machine_wide_program_dir().to_string_lossy());
+    if is_machine_wide_dir || dir.join(".machine-wide-install").exists() {
+        InstallScope::MachineWide
+    } else {
+        InstallScope::PerUser
+    }
+}
+
+/// Decide this process's install scope from its own executable path.
+///
+/// Choice made here (simple and deterministic, per the goal): scope is
+/// derived purely from *where this executable is*, never from how it was
+/// launched -- so `run`/`start`/`stop`/`status`/`models`/`update`/`autostart`
+/// and the Windows Service (which always runs the machine-wide copy) all
+/// agree on one scope, and therefore one data folder, without needing to
+/// pass scope around explicitly.
+pub fn install_scope() -> InstallScope {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.to_path_buf()));
+    install_scope_for(exe_dir.as_deref())
+}
+
+/// Move `old_dir` to `new_dir` if `new_dir` doesn't exist yet but `old_dir`
+/// does (a pre-unification install under the old folder name). Never deletes
+/// anything: if the rename fails (e.g. a file inside is open), the old
+/// directory is left in place and used as-is rather than losing data or
+/// silently starting a second, empty data folder.
+fn migrate_dir_once(new_dir: &Path, old_dir: &Path) -> PathBuf {
+    if new_dir.exists() || !old_dir.exists() {
+        return new_dir.to_path_buf();
+    }
+    if let Some(parent) = new_dir.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return old_dir.to_path_buf();
+        }
+    }
+    match fs::rename(old_dir, new_dir) {
+        Ok(()) => {
+            eprintln!(
+                "migrated data folder {} -> {}",
+                old_dir.display(),
+                new_dir.display()
+            );
+            new_dir.to_path_buf()
+        }
+        Err(error) => {
+            eprintln!(
+                "could not migrate data folder {} -> {} ({error}); continuing to use {}",
+                old_dir.display(),
+                new_dir.display(),
+                old_dir.display()
+            );
+            old_dir.to_path_buf()
+        }
+    }
+}
+
+/// This install's single data folder: every mode (run/start/stop/status/
+/// models/update CLI, autostart, service) resolves to the same path for a
+/// given scope. `STT_NEXT_DATA_DIR` always overrides, taking precedence over
+/// scope resolution entirely.
+pub fn data_dir() -> PathBuf {
+    if let Some(over) = std::env::var_os("STT_NEXT_DATA_DIR") {
+        return PathBuf::from(over);
+    }
+    match install_scope() {
+        InstallScope::MachineWide => {
+            migrate_dir_once(&machine_wide_data_dir(), &machine_wide_old_data_dir())
+        }
+        InstallScope::PerUser => match per_user_data_dir_opt() {
+            Some(new_dir) => match per_user_old_data_dir_opt() {
+                Some(old_dir) => migrate_dir_once(&new_dir, &old_dir),
+                None => new_dir,
+            },
+            None => PathBuf::from(".stt-server-next"),
+        },
+    }
 }
 
 /// Default drop-in `user_models_dir` when the setting has never been written
-/// (user decision 2026-09-25): `%LOCALAPPDATA%\OpenVibeAI\STT Server\models`
-/// of the installing/running user, in *normal* (non-service) runs only. A
-/// LocalSystem service run has no useful per-user `LOCALAPPDATA`, so there is
-/// no default in service mode; `service::install` instead records the
-/// installing user's path explicitly as the `user_models_dir` setting.
-/// `STT_NEXT_USER_MODELS_DIR_DEFAULT` overrides this for tests, mirroring
-/// `STT_NEXT_DATA_DIR`'s role for the data directory.
+/// (user decision 2026-09-25): inside this install's single data folder, at
+/// `<data dir>\models` -- the same folder the managed store uses, so a user
+/// can drop files in next to ones already downloaded/imported. Per-user this
+/// is `%LOCALAPPDATA%\OpenVibeAI\STT Server\models`; machine-wide this is
+/// `%ProgramData%\OpenVibeAI\STT Server\models`, shared by every user of the
+/// machine rather than tied to whichever user happened to install the
+/// service. `STT_NEXT_USER_MODELS_DIR_DEFAULT` overrides this for tests,
+/// mirroring `STT_NEXT_DATA_DIR`'s role for the data directory.
 pub fn default_user_models_dir() -> Option<PathBuf> {
     if let Some(over) = std::env::var_os("STT_NEXT_USER_MODELS_DIR_DEFAULT") {
         return Some(PathBuf::from(over));
     }
-    if is_service_mode() {
-        return None;
-    }
-    std::env::var_os("LOCALAPPDATA").map(|base| {
-        PathBuf::from(base)
-            .join("OpenVibeAI")
-            .join("STT Server")
-            .join("models")
-    })
+    Some(data_dir().join("models"))
 }
 
 /// Restrict `auth.token` to the current user account, whatever the data
@@ -421,6 +551,130 @@ pub fn open_app_at_full(
         bind_port,
         shutdown: Mutex::new(None),
     }))
+}
+
+#[cfg(test)]
+mod install_scope_tests {
+    use super::*;
+
+    #[test]
+    fn no_exe_dir_is_per_user() {
+        assert_eq!(install_scope_for(None), InstallScope::PerUser);
+    }
+
+    #[test]
+    fn arbitrary_dir_without_marker_is_per_user() {
+        let dir = std::env::temp_dir().join(format!("stt-scope-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        assert_eq!(install_scope_for(Some(&dir)), InstallScope::PerUser);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The marker file is what lets a machine-wide install still be
+    /// recognized even if its executable is not literally sitting in
+    /// `machine_wide_program_dir()` (e.g. under a test's own temp dir).
+    #[test]
+    fn marker_file_makes_a_dir_machine_wide() {
+        let dir = std::env::temp_dir().join(format!("stt-scope-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".machine-wide-install"), b"").unwrap();
+        assert_eq!(install_scope_for(Some(&dir)), InstallScope::MachineWide);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn machine_wide_program_dir_itself_is_machine_wide() {
+        // No filesystem access needed: the machine-wide program folder is
+        // matched lexically, not via `fs::canonicalize`, so this holds even
+        // when that folder doesn't exist on the test machine (or the test
+        // isn't running elevated).
+        let dir = machine_wide_program_dir();
+        assert_eq!(install_scope_for(Some(&dir)), InstallScope::MachineWide);
+    }
+
+    /// Every mode of one install must resolve to the same data folder.
+    /// `data_dir()` itself reads the real `install_scope()`/env, so this
+    /// exercises the same underlying folder choice each mode goes through,
+    /// pinned to the two scopes directly rather than depending on process
+    /// launch args.
+    #[test]
+    fn per_user_and_machine_wide_scopes_resolve_to_distinct_stable_folders() {
+        let per_user = per_user_data_dir_opt().unwrap();
+        let machine_wide = machine_wide_data_dir();
+        assert_ne!(per_user, machine_wide);
+        assert!(per_user.ends_with("STT Server"));
+        assert!(machine_wide.ends_with("STT Server"));
+        assert!(per_user.to_string_lossy().contains("OpenVibeAI"));
+        assert!(machine_wide.to_string_lossy().contains("OpenVibeAI"));
+        // Calling twice must be stable (no per-call randomness/side effects).
+        assert_eq!(per_user, per_user_data_dir_opt().unwrap());
+        assert_eq!(machine_wide, machine_wide_data_dir());
+    }
+
+    /// Not run through `data_dir()`/env overrides directly (both are process-
+    /// global and this suite runs tests in parallel); instead pins the
+    /// invariant `default_user_models_dir` relies on: the drop-in default is
+    /// always `<this install's data folder>/models`, for either scope.
+    #[test]
+    fn default_user_models_dir_nests_under_each_scopes_data_dir() {
+        assert!(machine_wide_data_dir()
+            .join("models")
+            .starts_with(machine_wide_data_dir()));
+        assert!(per_user_data_dir_opt()
+            .unwrap()
+            .join("models")
+            .starts_with(per_user_data_dir_opt().unwrap()));
+    }
+
+    #[test]
+    fn migrate_dir_once_moves_old_into_new_without_deleting_contents() {
+        let root = std::env::temp_dir().join(format!("stt-migrate-test-{}", Uuid::new_v4()));
+        let old_dir = root.join("old").join("STT Server Next");
+        let new_dir = root.join("new").join("STT Server");
+        fs::create_dir_all(old_dir.join("models")).unwrap();
+        fs::write(old_dir.join("models").join("a.gguf"), b"model bytes").unwrap();
+
+        let resolved = migrate_dir_once(&new_dir, &old_dir);
+
+        assert_eq!(resolved, new_dir);
+        assert!(!old_dir.exists(), "old folder must be moved, not copied");
+        assert!(new_dir.join("models").join("a.gguf").exists());
+        assert_eq!(
+            fs::read(new_dir.join("models").join("a.gguf")).unwrap(),
+            b"model bytes"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn migrate_dir_once_leaves_new_dir_alone_when_it_already_exists() {
+        let root = std::env::temp_dir().join(format!("stt-migrate-test-{}", Uuid::new_v4()));
+        let old_dir = root.join("old");
+        let new_dir = root.join("new");
+        fs::create_dir_all(old_dir.join("models")).unwrap();
+        fs::write(old_dir.join("models").join("old.gguf"), b"old").unwrap();
+        fs::create_dir_all(new_dir.join("models")).unwrap();
+        fs::write(new_dir.join("models").join("new.gguf"), b"new").unwrap();
+
+        let resolved = migrate_dir_once(&new_dir, &old_dir);
+
+        assert_eq!(resolved, new_dir);
+        // Neither an existing new install's data nor an old one still on
+        // disk is ever deleted; the old folder is simply left untouched.
+        assert!(old_dir.join("models").join("old.gguf").exists());
+        assert!(new_dir.join("models").join("new.gguf").exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn migrate_dir_once_is_a_noop_when_neither_dir_exists() {
+        let root = std::env::temp_dir().join(format!("stt-migrate-test-{}", Uuid::new_v4()));
+        let old_dir = root.join("old");
+        let new_dir = root.join("new");
+        assert_eq!(migrate_dir_once(&new_dir, &old_dir), new_dir);
+        assert!(!old_dir.exists());
+        assert!(!new_dir.exists());
+    }
 }
 
 #[cfg(test)]

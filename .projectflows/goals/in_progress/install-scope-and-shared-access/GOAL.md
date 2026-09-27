@@ -2,13 +2,13 @@
 name: install-scope-and-shared-access
 title: Install Scope, One Data Folder, and Safe Shared Access
 description: Make every way of running the server use one data folder per install, support per-user and machine-wide installs side by side, and let shared servers be used safely by other users, the local network, and Tailscale.
-status: ready
+status: in_progress
 type: feature
 scope: stt-server-next only
-attempt: 0
+attempt: 1
 max_attempts: 8
-last_result: none
-next_action: Implement in slices: install scope and data folder; port fallback and discovery; access levels; network modes including Tailscale; version reporting and model import.
+last_result: partial
+next_action: Slice 1 (install scope and data folder; service only in machine-wide) done. Remaining slices: port fallback and discovery; access levels; network modes including Tailscale; version reporting and model import.
 success_criteria:
   - Each install has exactly one data folder, and the app, CLI, start-with-Windows and service all use it; a model is never stored twice within one install.
   - A per-user install needs no admin; a machine-wide install needs admin once and serves every user on the PC.
@@ -106,3 +106,5 @@ multi-user PCs, access levels, network safety and Tailscale.
 ## Final Outcome
 
 Not started.
+
+2026-09-27: Slice 1 (install scope, one data folder, service only machine-wide) implemented. Orchestrator gates: fmt clean, clippy clean, cargo test 213 lib + 10 bin passed. Scope follows the exe location (machine-wide program folder or marker file); service install refuses unless elevated; old folder names are renamed, never deleted. Real service install not yet rehearsed.

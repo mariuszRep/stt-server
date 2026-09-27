@@ -66,17 +66,15 @@ or `catalog_download` (everything else).
 ## Drop-in models and refresh
 
 A user may copy `.gguf` files directly into a user-writable folder instead of using
-install/import. The folder is `%LOCALAPPDATA%\OpenVibeAI\STT Server\models` of the user who is
-running the server (Local, not Roaming, so multi-gigabyte files are never synced with a roaming
-profile). It is the `user_models_dir` setting: visible on `GET /v1/local/config` (defaulted when
-unset, in a normal non-service run, to the path above) and settable via `PATCH /v1/local/config`
-with `{"user_models_dir": "<absolute path>"}`; a relative or nonexistent path returns 400
-`invalid_user_models_dir`. In service mode there is no default (`LocalSystem` has no useful
-`LOCALAPPDATA`), so an unconfigured folder makes refresh fail with `error_code:
-"user_models_dir_not_configured"`; `service::install` records the installing user's folder
-explicitly (creating it if missing, without touching its ACLs) so a fresh service install already
-has one configured. The protected `ProgramData` store still holds downloaded/imported models,
-state, and the token; only this folder is user-writable.
+install/import. The folder defaults to `<data dir>\models` of this install's single data folder
+(see "Install scope and data folder" above) -- `%LOCALAPPDATA%\OpenVibeAI\STT Server\models`
+per-user, `%ProgramData%\OpenVibeAI\STT Server\models` machine-wide (shared by every user of the
+machine, not tied to whichever user happened to run `service install`), the same folder the
+managed store itself uses (Local, not Roaming, so multi-gigabyte files are never synced with a
+roaming profile). It is the `user_models_dir` setting: visible on `GET /v1/local/config` (defaulted
+when unset to the path above) and settable via `PATCH /v1/local/config` with
+`{"user_models_dir": "<absolute path>"}`; a relative or nonexistent path returns 400
+`invalid_user_models_dir`.
 
 `POST /v1/local/models/refresh` is a durable operation (`kind: "refresh"`, 202 + operation ID,
 observable and cancellable like install/import/verify) that non-recursively scans the drop folder
@@ -321,11 +319,36 @@ cargo run --release --bin stt-proof -- "C:\path\to\model.gguf" "C:\path\to\sampl
 
 Set `STT_NEXT_DATA_DIR` to a test directory and run `stt-server-next.exe start` (or plain `run`
 for the foreground default) for a local instance on `127.0.0.1:54321`; see "CLI" above for the
-full command surface. `service install` and `service uninstall` (aliases: `install`/`uninstall`)
-register or remove the Windows Service with elevation. Installation copies the same executable
-under `%ProgramFiles%\\OpenVibeAI\\STT Server Next` and keeps state, models, and a protected
-token under `%ProgramData%\\OpenVibeAI\\STT Server Next`. Uninstall
-preserves data. The server attempts Vulkan, falls back to CPU if it cannot load, and reports the
+full command surface.
+
+### Install scope and data folder
+
+Every install has exactly one data folder, and every mode of that install -- `run`/`start`/
+`stop`/`status`/`models`/`update`, `autostart`, and the Windows Service -- resolves to it, so a
+model is never stored twice. `--data-dir`/`STT_NEXT_DATA_DIR` always overrides this resolution.
+
+- **Per-user (default, no admin):** data under `%LOCALAPPDATA%\OpenVibeAI\STT Server`. Use
+  `autostart enable` for "start with Windows".
+- **Machine-wide:** program under `%ProgramFiles%\OpenVibeAI\STT Server`, data under
+  `%ProgramData%\OpenVibeAI\STT Server`, shared by every user of the machine. Only a machine-wide
+  install offers the Windows Service.
+
+Scope is decided from where the running executable lives, not from how it was launched: a process
+running from the machine-wide program folder (or carrying the `.machine-wide-install` marker
+`service install` writes there) is machine-wide; everything else is per-user. `service install`
+(alias: `install`) refuses with a clear error unless run from an elevated (Administrator) prompt,
+since that is what setting up a machine-wide install requires; `service uninstall` (alias:
+`uninstall`) removes the service and executable but preserves data. The drop-in models folder
+(below) is likewise inside that single data folder for either scope: per-user under
+`%LOCALAPPDATA%\...`, machine-wide under `%ProgramData%\...`, rather than tied to whichever user
+happened to install the service.
+
+An install that predates this unification is migrated forward automatically and non-destructively:
+if the old folder name (`...\STT Server Next`) is the only one present, it is moved (not copied) to
+the new name the first time this version opens it; if a rename isn't possible (e.g. a file inside
+is open), the old folder is used as-is rather than losing data or starting a second, empty one.
+
+The server attempts Vulkan, falls back to CPU if it cannot load, and reports the
 observed backend and reason. The package contains no separate inference DLL, although the
 machine's Vulkan loader/driver remains a dependency. The audited static-CRT build does not
 import `MSVCP140.dll` or `VCRUNTIME140.dll`.
