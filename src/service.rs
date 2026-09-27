@@ -247,6 +247,22 @@ pub fn install() -> Result<(), Box<dyn Error>> {
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 
+/// Builds a hidden `cmd` that removes `dir`, retrying for ~10 s so it still
+/// succeeds while the process holding the exe finishes exiting. `raw_arg`
+/// keeps the quotes intact: cmd.exe does not understand Rust's \" escaping.
+fn delayed_remove_dir(dir: &Path) -> Command {
+    let dir = dir.display();
+    let script = format!(
+        "\"for /l %i in (1,1,10) do @(if exist \"{dir}\" (ping -n 2 127.0.0.1 >nul & rmdir /s /q \"{dir}\"))\""
+    );
+    let mut command = Command::new("cmd");
+    command
+        .arg("/C")
+        .raw_arg(script)
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+    command
+}
+
 pub fn uninstall() -> Result<(), Box<dyn Error>> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service = manager.open_service(
@@ -270,14 +286,7 @@ pub fn uninstall() -> Result<(), Box<dyn Error>> {
         .unwrap_or(false);
     if running_from_install {
         // A running exe cannot delete itself; remove the folder once this process has exited.
-        let script = format!(
-            "ping -n 3 127.0.0.1 >nul & rmdir /s /q \"{}\"",
-            dir.display()
-        );
-        Command::new("cmd")
-            .args(["/C", &script])
-            .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
-            .spawn()?;
+        delayed_remove_dir(&dir).spawn()?;
     } else if dir.exists() {
         fs::remove_dir_all(&dir)?;
     }
@@ -288,6 +297,18 @@ pub fn uninstall() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delayed_remove_dir_handles_paths_with_spaces() {
+        let dir = std::env::temp_dir()
+            .join(format!("stt-service-test-{}", std::process::id()))
+            .join("STT Server");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("stt-server-next.exe"), b"x").unwrap();
+        let status = delayed_remove_dir(&dir).status().unwrap();
+        assert!(status.success());
+        assert!(!dir.exists());
+    }
 
     /// `service install` must refuse with a clear message unless it is
     /// performing a machine-wide install, and (per the choice documented on
