@@ -29,10 +29,12 @@ Steps:
 1. Spawn the process with the desired `--port`/`--data-dir` (and optionally
    `--host` for LAN mode, see 3 below).
 2. Poll `GET http://<host>:<port>/health` until it returns `200 {"status":
-   "ok", "service": "stt-server-next"}`. `/health` needs no token and is the
-   only route that doesn't; check the `service` field, not just the status
-   code, so an unrelated program already listening on that port is never
-   mistaken for the server having started (see 7).
+   "ok", "service": "stt-server-next", "version": "0.1.0", "api_level": 1,
+   "network": {...}}`. `/health` needs no token and is the only route that
+   doesn't; check the `service` field, not just the status code, so an
+   unrelated program already listening on that port is never mistaken for
+   the server having started (see 7). See section 1.4 for `version`/
+   `api_level`.
 3. Read the bearer token from `<data-dir>\auth.token` (plain text, written
    once by the server on first start at that data dir; stable across
    restarts at the same data dir).
@@ -95,6 +97,39 @@ after any fallback, and every CLI command in `src/bin/server.rs` (`status`, `sto
 does the same when confirming the detached child came up, since the port it resolves internally
 may differ from what the parent process assumed.
 
+### 1.4 Versions and moving between scopes
+
+`GET /health` (unauthenticated, per 1.1 step 2) and `GET /v1/local/system`'s `server` section both
+report `version` (this build's `CARGO_PKG_VERSION`, a semver string) and `api_level` (an integer
+constant, starting at `1`, defined as `api::API_LEVEL`). `api_level` is bumped only when a client
+must change something to keep working against this server -- a breaking request/response shape
+change, a route removed, a new field a client must now send. It is **not** bumped for an additive,
+backward-compatible change (a new optional field, a new route, a new optional capability) -- those
+never require an old client to change, so they don't need a new level.
+
+A client that requires a minimum `api_level` should read it from `/health` before relying on any
+other route (it's checkable before a token is even available, unlike every other route) and either
+refuse to proceed or warn the user that the server is too old, rather than calling routes that may
+not behave as the client expects. `stt-server-next health` and `status --json` print the same two
+fields for CLI/script use; `status --json`'s `api_level` comes from `server.json` (written at
+server startup) and defaults to `0` on a `server.json` written by a version of this server that
+predates the field -- treat `0` the same as "older than any level you require."
+
+**Moving models between scopes**: when a machine-wide install is set up on a PC where a user
+already has models installed under their own per-user install, an admin can import those models
+into the machine-wide install instead of downloading them again --
+`POST /v1/local/models/import-user` (admin only; see section 3's route table), or the CLI
+`stt-server-next models import-user [--from <per-user data dir>] [--wait]`. `--from` defaults to
+the invoking OS user's own per-user data folder. Every `.gguf` under `<from>\models` is hashed and
+matched against the catalog (the same check `POST /v1/local/models/refresh` uses for drop-in
+files) before being copied into this install's managed store and re-verified in place; a file
+already installed here, or one that doesn't match any catalog entry, is reported and left alone.
+The source install is never modified or deleted -- the user's own copy stays exactly as it was
+unless they remove it themselves. The response and behavior mirror install/import/refresh: `202
+{"operation_id","state":"queued"}`, polled via `GET /v1/local/operations/{id}` to a terminal state,
+with a `result` object of `{"imported":[{"model"}], "skipped":[{"model","reason"}],
+"unsupported":[{"path"|"model","reason"}]}` once `completed`.
+
 ## 2. Data directory defaults and the drop-in folder
 
 From `crate::app::data_dir()`:
@@ -142,7 +177,7 @@ where to drop files should read `GET /v1/local/config`'s
   |---|---|
   | Unauthenticated | `GET /health` |
   | User (admin token also works) | `GET /readiness`, `GET /v1/models`, `GET /v1/local/models`, `GET /v1/local/models/selected`, `GET /v1/local/system`, `GET /v1/local/recommendations`, `GET /v1/local/operations/{id}`, `POST /v1/audio/transcriptions`, `POST /v1/audio/translations` |
-  | Admin only | `GET`/`PATCH /v1/local/config`, `POST /v1/local/models/{id}/install`, `POST /v1/local/models/{id}/verify`, `POST /v1/local/models/{id}/select` (and `/load`), `DELETE /v1/local/models/selected` (unload), `DELETE /v1/local/models/{id}` (remove), `POST /v1/local/models/refresh` (drop-in refresh), `POST /v1/local/models/import`, `POST /v1/local/operations/{id}/cancel`, `POST /v1/local/shutdown` |
+  | Admin only | `GET`/`PATCH /v1/local/config`, `POST /v1/local/models/{id}/install`, `POST /v1/local/models/{id}/verify`, `POST /v1/local/models/{id}/select` (and `/load`), `DELETE /v1/local/models/selected` (unload), `DELETE /v1/local/models/{id}` (remove), `POST /v1/local/models/refresh` (drop-in refresh), `POST /v1/local/models/import`, `POST /v1/local/models/import-user` (copy another install's models in; see section 1.4), `POST /v1/local/operations/{id}/cancel`, `POST /v1/local/shutdown` |
 
   The CLI (`stt-server-next models ...`, `status`, `stop`, `update`, ...)
   reads `auth.token` when it can, falling back to `user.token` only when

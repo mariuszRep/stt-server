@@ -225,3 +225,54 @@ Updated `README.md` (new "Network modes" paragraph, `--network` flag, advanced-o
 justification, `network_not_private`/`invalid_network_mode` added to the error table, `/health`'s
 `network` object documented in section 7). Not committed per instruction. Remaining slices: version
 reporting and model import.
+
+2026-09-27: Final slice ("Versions and moving between scopes") implemented.
+
+- **Version and API level**: `api::API_LEVEL` (currently `1`) is a documented constant, bumped
+  only for a breaking client-facing change, never for an additive one. `GET /health`
+  (unauthenticated) now reports `version` (`CARGO_PKG_VERSION`) and `api_level` alongside the
+  existing `status`/`service`/`network` fields; `GET /v1/local/system`'s `server` section reports
+  the same two. `server.json` (`discovery::ServerInfo`) gained an `api_level` field (`#[serde(default)]`
+  so an old file without it still parses, reading back as `0`); `stt-server-next status` and
+  `stt-server-next health` both print version/api_level (JSON and human output). `status --json`'s
+  `api_level` is therefore this build's constant if the running server wrote it, or `0` for a
+  `server.json` from before this change.
+- **`models import-user`** (admin-only, `src/import_user.rs`, new module): CLI
+  `stt-server-next models import-user [--from <dir>] [--wait] [--json] [--data-dir <path>]` and
+  `POST /v1/local/models/import-user` `{"from": path}` (from defaults server-side to
+  `app::per_user_data_dir()`, the invoking OS user's own per-user data folder). Deliberately does
+  *not* open the source's `state.db`: since the managed store and the drop-in folder already share
+  one models folder per install (`<data dir>/models`), it scans `<from>/models/*.gguf`, hashes each
+  file off the async runtime, and matches it against the catalog with the same
+  `catalog::catalog_match_by_hash` the drop-in refresh (`dropin.rs`) already uses for exactly this
+  kind of untrusted-file verification -- simpler and more robust than depending on another
+  process's SQLite file/schema/locking. A match not already installed here is copied to staging,
+  re-hashed (verifies the *copy*, not just trust in the source), and promoted via the existing
+  `store::promote_verified_model_with_source` with a new `source: "import_user"`; a hash mismatch
+  after copying quarantines the copy (never the source); a file matching no catalog entry, or a
+  model already installed, is reported and left untouched. The source install's files and database
+  are never written to. Runs as a durable operation (`kind: "import_user"`, `progress_items`/
+  `total_items`, and a `result: {"imported","skipped","unsupported"}` JSON blob on completion),
+  polled/cancelled the same way as `refresh`/`install`/`verify`; `--wait` prints a per-model
+  imported/skipped/failed line, mirroring `models refresh --wait`.
+- Tests added (`src/import_user.rs`, 4; `src/api.rs`, 1; `src/cli.rs`, 1): `/health` reports
+  `version`/`api_level`; import-user copies two catalog-matched files and verifies both, a second
+  run against the same source skips both as `already_installed`, source files are byte-identical
+  after the copy; a file matching no catalog entry is reported `unsupported` and left in place
+  (never copied, never quarantined -- it was never matched); a missing source `models` folder
+  completes with nothing imported (same "missing dir = empty" rule as `refresh`); a user-token
+  caller gets `403 admin_required`; CLI parses `models import-user` with/without `--from` and
+  rejects an unknown flag.
+- Updated `README.md` (`/health`'s new fields under "Current API", the `models import-user` CLI
+  entry) and `docs/client-contract.md` (new "1.4 Versions and moving between scopes" section,
+  `POST /v1/local/models/import-user` added to the admin-only route table).
+- Gates: `cargo fmt --check` clean, `cargo clippy --all-targets -- -D warnings` clean, `cargo test`
+  271 lib + 11 bin passed (282 total, 0 failed). Not committed per instruction.
+
+Every success criterion in this goal's slices (install scope/one data folder, several users on one
+PC, access levels, network modes including Tailscale, versions and moving models between scopes)
+now has an implementation and passing tests. Status stays `in_progress`: the real multi-user and
+clean-VM rehearsals called for in the goal (a genuine second Windows account exercising a
+machine-wide install's `user.token`, a real `models import-user` run between a per-user account's
+real models and a machine-wide service install, and the clean-VM service install/uninstall
+recheck noted above) have not been done.

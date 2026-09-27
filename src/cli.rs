@@ -26,6 +26,8 @@ USAGE:
     stt-server-next models selected [--json] [--data-dir <path>]
     stt-server-next models install <id> [--wait] [--json] [--data-dir <path>]
     stt-server-next models import <path> --model <id> [--quant <q>] [--wait] [--json] [--data-dir <path>]
+    stt-server-next models import-user [--from <per-user data dir>] [--wait] [--json] [--data-dir <path>]
+                                      admin-only: copy another install's models into this one
     stt-server-next models verify <id> [--wait] [--json] [--data-dir <path>]
     stt-server-next models cancel <operation_id> [--data-dir <path>]
     stt-server-next models select <id> [--json] [--data-dir <path>]
@@ -177,6 +179,12 @@ pub enum ModelsCommand {
         data_dir: Option<PathBuf>,
     },
     Refresh {
+        wait: bool,
+        json: bool,
+        data_dir: Option<PathBuf>,
+    },
+    ImportUser {
+        from: Option<PathBuf>,
         wait: bool,
         json: bool,
         data_dir: Option<PathBuf>,
@@ -398,6 +406,29 @@ fn parse_import_flags(args: &[String]) -> Result<ImportFlags, CliError> {
     Ok((PathBuf::from(path), model, quant, wait, json, data_dir))
 }
 
+/// `--from`/`--json`/`--wait`/`--data-dir`, no required positional (`models
+/// import-user`; `--from` defaults server-side to the invoking user's own
+/// per-user data folder when omitted).
+type ImportUserFlags = (Option<PathBuf>, bool, bool, Option<PathBuf>);
+
+fn parse_import_user_flags(args: &[String]) -> Result<ImportUserFlags, CliError> {
+    let mut from = None;
+    let mut json = false;
+    let mut wait = false;
+    let mut data_dir = None;
+    let mut iter = args.iter();
+    while let Some(flag) = iter.next() {
+        match flag.as_str() {
+            "--from" => from = Some(PathBuf::from(next_value(&mut iter, flag)?)),
+            "--json" => json = true,
+            "--wait" => wait = true,
+            "--data-dir" => data_dir = Some(PathBuf::from(next_value(&mut iter, flag)?)),
+            other => return Err(CliError::usage(format!("unknown flag: {other}"))),
+        }
+    }
+    Ok((from, wait, json, data_dir))
+}
+
 fn parse_no_flags(args: &[String], command: &str) -> Result<(), CliError> {
     if let Some(first) = args.first() {
         return Err(CliError::usage(format!(
@@ -501,7 +532,7 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
         "models" => {
             let sub = args.get(1).ok_or_else(|| {
                 CliError::usage(
-                    "models requires a subcommand: list|recommended|selected|install|import|verify|cancel|select|unload|remove|refresh",
+                    "models requires a subcommand: list|recommended|selected|install|import|import-user|verify|cancel|select|unload|remove|refresh",
                 )
             })?;
             let rest = &args[2..];
@@ -582,6 +613,15 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
                         path,
                         model,
                         quant,
+                        wait,
+                        json,
+                        data_dir,
+                    }))
+                }
+                "import-user" => {
+                    let (from, wait, json, data_dir) = parse_import_user_flags(rest)?;
+                    Ok(Command::Models(ModelsCommand::ImportUser {
+                        from,
                         wait,
                         json,
                         data_dir,
@@ -1110,5 +1150,38 @@ mod tests {
                 data_dir: Some(PathBuf::from("C:\\d"))
             })
         );
+    }
+
+    #[test]
+    fn models_import_user_defaults_from_to_none_and_parses_flags() {
+        assert_eq!(
+            parse(&args(&["models", "import-user"])).unwrap(),
+            Command::Models(ModelsCommand::ImportUser {
+                from: None,
+                wait: false,
+                json: false,
+                data_dir: None,
+            })
+        );
+        assert_eq!(
+            parse(&args(&[
+                "models",
+                "import-user",
+                "--from",
+                "C:\\source",
+                "--wait",
+                "--json",
+                "--data-dir",
+                "C:\\d"
+            ]))
+            .unwrap(),
+            Command::Models(ModelsCommand::ImportUser {
+                from: Some(PathBuf::from("C:\\source")),
+                wait: true,
+                json: true,
+                data_dir: Some(PathBuf::from("C:\\d")),
+            })
+        );
+        assert!(parse(&args(&["models", "import-user", "--bogus"])).is_err());
     }
 }

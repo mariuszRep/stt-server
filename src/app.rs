@@ -151,6 +151,15 @@ fn per_user_data_dir_opt() -> Option<PathBuf> {
         .map(|base| PathBuf::from(base).join("OpenVibeAI").join("STT Server"))
 }
 
+/// Public accessor for `models import-user`'s default `--from`: the
+/// invoking OS user's own per-user data folder, regardless of this
+/// process's own [`install_scope`] (a machine-wide install's admin runs
+/// `import-user` to pull *from* a per-user folder into its own machine-wide
+/// one). `None` only when `LOCALAPPDATA` itself is unset.
+pub fn per_user_data_dir() -> Option<PathBuf> {
+    per_user_data_dir_opt()
+}
+
 /// The old (pre-unification) per-user data folder name -- it was missing the
 /// `OpenVibeAI` publisher folder entirely. Kept only for migration.
 fn per_user_old_data_dir_opt() -> Option<PathBuf> {

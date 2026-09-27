@@ -15,6 +15,7 @@ pub mod errors;
 pub mod format;
 pub mod gguf_probe;
 pub mod import;
+pub mod import_user;
 pub mod model_cli;
 pub mod network;
 pub mod operations;

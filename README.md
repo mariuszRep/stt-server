@@ -12,7 +12,15 @@ model, and diagnostics report the backend actually used and any CPU fallback rea
 
 ## Current API
 
-`GET /health` is unauthenticated. Other routes require a bearer token. The server implements
+`GET /health` is unauthenticated and reports `{"status","service","version","api_level","network"}`
+-- `version` is this build's `CARGO_PKG_VERSION`, and `api_level` is an integer, starting at 1,
+bumped only when a client must change to keep working (a breaking shape change, a removed route, a
+new required field -- never for an additive, backward-compatible one). A client should refuse or
+warn when the server's `api_level` is lower than the level it requires; `stt-server-next health`
+and `status` also print both fields (`status --json`'s `server.json`-derived `api_level` defaults
+to `0` for a `server.json` written before this field existed, meaning "older than any level a
+client requires"). `GET /v1/local/system`'s `server` section reports the same two fields.
+Other routes require a bearer token. The server implements
 `GET /readiness`, `GET /v1/models`, and OpenAI-style `POST /v1/audio/transcriptions` and
 `POST /v1/audio/translations` for mono/stereo WAV from 8–192 kHz (16/24-bit PCM or 32-bit float),
 both sharing one pipeline (parse → decode → plan → queue → run → format) and a 40 MiB body limit.
@@ -200,6 +208,7 @@ stt-server-next models recommended [--json] [--data-dir <path>]
 stt-server-next models selected [--json] [--data-dir <path>]
 stt-server-next models install <id> [--wait] [--json] [--data-dir <path>]
 stt-server-next models import <path> --model <id> [--quant <q>] [--wait] [--json] [--data-dir <path>]
+stt-server-next models import-user [--from <per-user data dir>] [--wait] [--json] [--data-dir <path>]
 stt-server-next models verify <id> [--wait] [--json] [--data-dir <path>]
 stt-server-next models cancel <operation_id> [--data-dir <path>]
 stt-server-next models select <id> [--json] [--data-dir <path>]
@@ -308,6 +317,16 @@ rule.
 - `models import <path> --model <id> [--quant <q>]` uploads a local GGUF file as
   `multipart/form-data` (`model` field, optional `quant`, then the file) to
   `POST /v1/local/models/import`, then behaves like `install`/`verify` above.
+- `models import-user [--from <dir>]` (admin only) copies GGUFs from another install's models
+  folder into this one -- the machine-wide-install-on-a-PC-with-existing-per-user-models case: an
+  admin setting up a shared server can pull in models a user already downloaded instead of
+  downloading again. `--from` defaults to the invoking OS user's own per-user data folder
+  (`%LOCALAPPDATA%\OpenVibeAI\STT Server`); it also works per-user -> per-user with an explicit
+  `--from`. Every file under `<from>\models` is hashed and matched against the catalog (the same
+  check `models refresh` uses for drop-in files) *before* being copied and re-verified in place --
+  a file that doesn't match any catalog entry, or one already installed here, is reported and left
+  alone; the source is never modified or deleted either way. `--wait` reports each model's
+  imported/skipped/failed outcome, like `models refresh` does for drop-in files.
 - `models select <id>` loads a model (`409 needs_verification` prints a hint to verify or
   refresh first); `models unload` deselects the current one; `models remove <id>` unregisters a
   managed or drop-in model (a drop-in file's disk copy is never deleted -- the next `refresh`

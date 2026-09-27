@@ -585,6 +585,7 @@ async fn cmd_status(data_dir: PathBuf, json: bool) -> i32 {
                 "port": info.port,
                 "data_dir": data_dir.display().to_string(),
                 "version": info.version,
+                "api_level": info.api_level,
             })
         );
     } else {
@@ -595,6 +596,7 @@ async fn cmd_status(data_dir: PathBuf, json: bool) -> i32 {
             info.port,
             data_dir.display()
         );
+        println!("version: {} (api_level {})", info.version, info.api_level);
     }
     0
 }
@@ -767,6 +769,11 @@ async fn cmd_health(data_dir: PathBuf, json: bool) -> i32 {
                 .and_then(|v| v.as_str())
                 .unwrap_or("?")
         );
+        let version = health.body.get("version").and_then(|v| v.as_str());
+        let api_level = health.body.get("api_level").and_then(|v| v.as_u64());
+        if let (Some(version), Some(api_level)) = (version, api_level) {
+            println!("version: {version} (api_level {api_level})");
+        }
         match selected.body.get("model") {
             Some(serde_json::Value::String(id)) => println!("selected model: {id}"),
             _ => println!("selected model: none"),
@@ -976,6 +983,54 @@ async fn cmd_models(command: ModelsCommand) -> i32 {
                 }
             }
         }
+        ModelsCommand::ImportUser {
+            from,
+            wait,
+            json,
+            data_dir,
+        } => {
+            let dir = effective_data_dir_opt(&data_dir);
+            let conn = match model_cli::connect(&dir).await {
+                Ok(conn) => conn,
+                Err(error) => return report_connect_error(&error, json),
+            };
+            let body = serde_json::json!({
+                "from": from.map(|path| path.display().to_string()),
+            });
+            let outcome = match model_cli::call(
+                &conn,
+                reqwest::Method::POST,
+                "/v1/local/models/import-user",
+                Some(body),
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return 1;
+                }
+            };
+            if outcome.is_error() {
+                return report_api_error(&outcome, json);
+            }
+            if !wait {
+                return report_operation_started(&outcome.body, json);
+            }
+            let operation_id = outcome
+                .body
+                .get("operation_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            match model_cli::poll_operation(&conn, &operation_id, json).await {
+                Ok(result) => report_import_user_result(&result, json),
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    1
+                }
+            }
+        }
     }
 }
 
@@ -1139,6 +1194,52 @@ fn report_refresh_result(body: &serde_json::Value, json: bool) -> i32 {
                         "not retryable"
                     }
                 );
+            }
+        }
+    }
+    if state == "completed" {
+        0
+    } else {
+        1
+    }
+}
+
+/// Renders `models import-user`'s terminal operation body: per-model
+/// success/skip/failure, mirroring `report_refresh_result`'s shape for the
+/// drop-in scan.
+fn report_import_user_result(body: &serde_json::Value, json: bool) -> i32 {
+    let state = body.get("state").and_then(|v| v.as_str()).unwrap_or("?");
+    if json {
+        println!("{body}");
+        return if state == "completed" { 0 } else { 1 };
+    }
+    println!("final state: {state}");
+    if let Some(error) = body.get("error").and_then(|v| v.as_str()) {
+        println!("error: {error}");
+    }
+    if let Some(result) = body.get("result") {
+        if let Some(imported) = result.get("imported").and_then(|v| v.as_array()) {
+            for entry in imported {
+                let model = entry.get("model").and_then(|v| v.as_str()).unwrap_or("?");
+                println!("imported: {model}");
+            }
+        }
+        if let Some(skipped) = result.get("skipped").and_then(|v| v.as_array()) {
+            for entry in skipped {
+                let model = entry.get("model").and_then(|v| v.as_str()).unwrap_or("?");
+                let reason = entry.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
+                println!("skipped: {model} ({reason})");
+            }
+        }
+        if let Some(unsupported) = result.get("unsupported").and_then(|v| v.as_array()) {
+            for entry in unsupported {
+                let what = entry
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| entry.get("path").and_then(|v| v.as_str()))
+                    .unwrap_or("?");
+                let reason = entry.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
+                println!("failed: {what}: {reason}");
             }
         }
     }

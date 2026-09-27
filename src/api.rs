@@ -348,13 +348,28 @@ fn cors_layer(origins: &[String]) -> CorsLayer {
 /// check, not just a successful status code.
 pub const SERVICE_ID: &str = "stt-server-next";
 
+/// Bumped whenever a client must change to keep working against this
+/// server -- a breaking request/response shape change, a route removed, a
+/// new required field, etc. Never bumped for additive, backward-compatible
+/// changes (a new optional field, a new route). Clients read this from
+/// `/health` (unauthenticated, so it's checkable before a token is even
+/// available) and refuse or warn when it's lower than the level they
+/// require; see `docs/client-contract.md` section 1.4.
+pub const API_LEVEL: u32 = 1;
+
 pub async fn health(State(app): State<Arc<App>>) -> Json<Value> {
     let network = app
         .network_state
         .read()
         .map(|state| state.to_json())
         .unwrap_or_else(|_| json!({"mode": app.network_mode.as_str(), "effective": "local"}));
-    Json(json!({"status": "ok", "service": SERVICE_ID, "network": network}))
+    Json(json!({
+        "status": "ok",
+        "service": SERVICE_ID,
+        "version": env!("CARGO_PKG_VERSION"),
+        "api_level": API_LEVEL,
+        "network": network,
+    }))
 }
 
 pub async fn readiness(
@@ -388,6 +403,7 @@ pub async fn system_info(
         .map_err(internal)?;
     let server = crate::sysinfo::ServerSection {
         version: env!("CARGO_PKG_VERSION").to_owned(),
+        api_level: API_LEVEL,
         host: app.bind_host.clone(),
         port: app.bind_port,
         data_dir: app.data_dir.display().to_string(),
@@ -1162,6 +1178,10 @@ pub fn router(app: Arc<App>) -> Router {
         .route(
             "/v1/local/models/import",
             post(import_model).layer(DefaultBodyLimit::max(3 * 1024 * 1024 * 1024usize)),
+        )
+        .route(
+            "/v1/local/models/import-user",
+            post(crate::import_user::import_user_models),
         )
         .route("/v1/local/operations/{id}", get(operation))
         .route("/v1/local/operations/{id}/cancel", post(cancel_operation))
@@ -2180,6 +2200,28 @@ mod router_tests {
         assert!(caller_is_loopback("[::1]:1".parse().unwrap()));
         assert!(!caller_is_loopback(lan_peer()));
         assert!(!caller_is_loopback("0.0.0.0:1".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn health_reports_version_and_api_level() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let router = router(app.clone());
+        let request = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(body["api_level"], API_LEVEL);
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
     }
 
     #[tokio::test]

@@ -74,6 +74,7 @@ pub struct SystemSnapshot {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServerSection {
     pub version: String,
+    pub api_level: u32,
     pub host: String,
     pub port: u16,
     pub data_dir: String,
@@ -150,6 +151,7 @@ pub fn to_json(snapshot: &SystemSnapshot, server: &ServerSection) -> Value {
         "process": process,
         "server": {
             "version": server.version,
+            "api_level": server.api_level,
             "host": server.host,
             "port": server.port,
             "data_dir": server.data_dir,
@@ -492,6 +494,7 @@ mod tests {
     fn server() -> ServerSection {
         ServerSection {
             version: "0.1.0".to_string(),
+            api_level: 1,
             host: "127.0.0.1".to_string(),
             port: 54321,
             data_dir: "C:\\data".to_string(),

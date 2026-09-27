@@ -17,6 +17,12 @@ pub struct ServerInfo {
     pub host: String,
     pub port: u16,
     pub version: String,
+    /// See `api::API_LEVEL`. Defaults to 0 when reading a `server.json`
+    /// written by a version of this server that predates this field, so an
+    /// old file never fails to parse -- a client should treat 0 the same as
+    /// "older than any level it requires."
+    #[serde(default)]
+    pub api_level: u32,
     pub started_at: i64,
 }
 
@@ -42,6 +48,7 @@ impl ServerInfo {
             host,
             port,
             version: env!("CARGO_PKG_VERSION").to_owned(),
+            api_level: crate::api::API_LEVEL,
             started_at: now_ms(),
         }
     }
