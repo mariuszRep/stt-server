@@ -119,6 +119,58 @@ fn whisper_gate(caps: &LoadedCaps) -> bool {
     caps.whisper_ext_accepted.unwrap_or(true)
 }
 
+// Bug 1's *actual* root cause (verified by reading transcribe-cpp-sys
+// 0.2.3's vendored C++ directly, not by copying Handy's engine dispatch —
+// see the correction below):
+//
+// `transcribe_cpp::Model::capabilities().max_timestamp_kind` is NOT an
+// optimistic self-report. Per architecture:
+// - `arch/{canary,cohere,moonshine,moonshine_streaming,qwen3_asr,voxtral,
+//   sensevoice,funasr_nano}/capabilities.cpp` all hard-code
+//   `TRANSCRIBE_TIMESTAMPS_NONE` as the family default, and
+//   `transcribe-meta.cpp`'s `read_capability_kv` explicitly does NOT
+//   overlay `max_timestamp_kind` from any GGUF KV ("max_timestamp_kind is
+//   NOT read here: converters emit timestamp-capability KVs ... but the
+//   ceiling is variant-specific and applied in each family's load()") for
+//   any of those families, so it stays NONE for the lifetime of the
+//   loaded model. That matches the catalog's own per-model
+//   `capabilities.timestamps` claim for every one of those slugs
+//   (`catalog/handy-2026-08-17.json`: `"none"`).
+// - `arch/granite/model.cpp` (~line 236-250) reads the GGUF's own
+//   `stt.capability.word_timestamps` bool and lowers the family default
+//   `WORD` to `NONE` per-variant *before* `capabilities()` is ever read by
+//   us — so by the time our Rust code sees it, it is already correct
+//   (`granite-speech-4.1-2b-plus` claims `"word"` in the catalog; the
+//   other granite variants claim `"none"`).
+// - `arch/{gigaam,medasr}/capabilities.cpp` set the family default to
+//   `TOKEN` and never lower it — matching the catalog's `"token"` claim
+//   for `gigaam-v3-*`/`medasr`. `transcribe.cpp`'s shared
+//   `validate_run_params_common` (the ranked `NONE(0) < SEGMENT(1) <
+//   WORD(2) < TOKEN(3)` ceiling check every family goes through before
+//   `run()`) genuinely allows a segment/word request there — the
+//   architecture-specific `run()` for these two families just never fills
+//   `transcript.segments`/`words`, only `transcript.tokens` (see
+//   `format::format_response`'s token-fallback synthesis, added
+//   alongside this fix, for the client-visible consequence).
+//
+// **What was actually wrong was entirely on our side**, in
+// `EffectiveCaps::to_json`'s `timestamp_granularity` branch below: it
+// reported `Status::Supported` unconditionally whenever a run hadn't yet
+// been observed to reject it (`timestamp_granularity_rejected == false`)
+// — it never even looked at `self.loaded.max_timestamp_kind`. So a model
+// whose own, accurate, engine-reported ceiling was `None` (canary, cohere,
+// moonshine, voxtral, qwen3_asr, sensevoice, funasr_nano) was still
+// advertised as "supported" until a real request came back
+// `engine_unsupported` and got remembered. A prior revision of this fix
+// papered over that by hard-coding an arch allowlist copied from Handy's
+// own (differently-scoped) engine dispatch — but Handy has no
+// granite/gigaam/medasr code paths at all to copy from, and that allowlist
+// incorrectly reported `gigaam-v3-*`/`medasr`/`granite-*-plus` as
+// timestamp-incapable even though both the engine and the catalog's own
+// claim say they are capable. The correct fix is simply to *use*
+// `self.loaded.max_timestamp_kind`, which is already accurate — see
+// `max_timestamp_granularity` below.
+
 /// One control's status in either view.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -199,7 +251,8 @@ impl EffectiveCaps {
     }
 
     pub fn supports_language_hint(&self) -> bool {
-        !self.loaded.languages.is_empty()
+        // Granite's run() never reads the language parameter; its language list is informational only.
+        self.loaded.arch != "granite" && !self.loaded.languages.is_empty()
     }
 
     pub fn supports_translation(&self) -> bool {
@@ -215,9 +268,19 @@ impl EffectiveCaps {
         self.loaded.max_timestamp_kind
     }
 
+    /// Whether even the cheapest granularity (segment) is honoured. Bug 1:
+    /// this must be checked before planning `Segment` timestamps too, not
+    /// just `Word` — an unchecked segment request was exactly how the
+    /// catalog sweep got a 422 from canary/cohere/Voxtral/Qwen3-ASR/Fun-ASR/
+    /// granite/moonshine/SenseVoice: nothing rejected the request before it
+    /// reached the engine.
+    pub fn supports_segment_timestamps(&self) -> bool {
+        self.max_timestamp_granularity() != TimestampGranularity::None
+    }
+
     pub fn supports_word_timestamps(&self) -> bool {
         matches!(
-            self.loaded.max_timestamp_kind,
+            self.max_timestamp_granularity(),
             TimestampGranularity::Word | TimestampGranularity::Token
         )
     }
@@ -318,6 +381,11 @@ impl EffectiveCaps {
             scope: None,
             extra: json!({ "target_languages": ["en"] }),
         };
+        // Trust `self.loaded.max_timestamp_kind` directly: it is the
+        // engine's own accurate, per-architecture (and, for granite,
+        // per-variant-via-GGUF-KV) ceiling — see the long comment above
+        // `EffectiveCaps::max_timestamp_granularity` for the transcribe-cpp
+        // source evidence. No architecture allowlist needed or wanted here.
         let timestamp_granularity = if self.loaded.timestamp_granularity_rejected {
             ControlCapability {
                 status: Status::Unsupported,
@@ -326,6 +394,15 @@ impl EffectiveCaps {
                 mechanism: None,
                 scope: None,
                 extra: json!({ "max": self.max_timestamp_granularity().as_str() }),
+            }
+        } else if self.max_timestamp_granularity() == TimestampGranularity::None {
+            ControlCapability {
+                status: Status::Unsupported,
+                reason: Some("model_lacks"),
+                evidence: "loaded_model",
+                mechanism: None,
+                scope: None,
+                extra: json!({ "max": TimestampGranularity::None.as_str() }),
             }
         } else {
             ControlCapability {
@@ -487,6 +564,14 @@ mod tests {
     }
 
     #[test]
+    fn granite_never_supports_language_hint() {
+        let mut loaded = loaded_non_whisper();
+        loaded.arch = "granite".to_string();
+        loaded.languages = vec!["en".to_string(), "fr".to_string()];
+        assert!(!EffectiveCaps::new(loaded).supports_language_hint());
+    }
+
+    #[test]
     fn single_language_model_still_supports_language_hint() {
         let caps = EffectiveCaps::new(loaded_non_whisper());
         assert!(caps.supports_language_hint());
@@ -524,9 +609,12 @@ mod tests {
         assert!(mismatches.iter().any(|m| m["control"] == "translation"
             && m["catalog"] == "unsupported"
             && m["effective"] == "supported"));
-        // Catalog claims prompt is unsupported/not_implemented (never claimed
-        // supported by any catalog entry) which is not "unknown", so a
-        // whisper effective view that supports it is also flagged.
-        assert!(mismatches.iter().any(|m| m["control"] == "prompt"));
+        // Catalog's `prompt` for a whisper-architecture model is "unknown"
+        // (unverified -- our own code only wires prompt through the
+        // whisper run extension, so the catalog can't rule it out, but
+        // hasn't verified it either; see `catalog::capability_matrix`).
+        // "unknown" never counts as a mismatch against the effective view's
+        // "supported", by design (an unverified claim isn't a disagreement).
+        assert!(!mismatches.iter().any(|m| m["control"] == "prompt"));
     }
 }

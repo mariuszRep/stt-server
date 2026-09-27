@@ -227,10 +227,36 @@ or descriptors.
   {"operation_id", "state": "queued"}`, polled the same way as
   install/verify.
 
-### 4.1 Selected-model capability matrix and the "omit unless supported" rule
+### 4.1 Catalog view vs. selected (effective) view -- two different answers, on purpose
 
-`GET /v1/local/models/selected`'s `effective_capabilities` (and the
-per-model view in `/v1/local/models`) reports a `ControlCapability` object
+`GET /v1/local/models` (and any per-model view before a model is loaded)
+reports `effective_capabilities` from **catalog/architecture metadata
+alone** -- no engine has looked at the file yet. This is the *catalog view*
+(`catalog::capability_matrix`): a control the catalog's own claim does not
+rule out is `"unknown"` (an unverified claim, e.g. `prompt`/`temperature` on
+a whisper-architecture model, `language_hint` on any multi-language model,
+or `timestamp_granularity` whenever `capabilities.timestamps != "none"` --
+trusted directly, per-model, for every architecture; see the timestamp-gate
+note below for why); a control the catalog metadata itself rules out (e.g.
+`timestamp_granularity` when `capabilities.timestamps == "none"`, or
+`language_hint` on a single-language model) is `"unsupported"`. **Before
+fixing this ledger's Bug 3, every control here hard-coded `"unsupported"`
+regardless of the catalog's own claims -- that was a placeholder, not a
+truthful static answer, and clients must not have relied on it.**
+
+`GET /v1/local/models/selected`'s `effective_capabilities` reports the
+*live* view (`capabilities::EffectiveCaps`), computed from the actually
+loaded `transcribe_cpp::Model` -- this is a verified fact, never `"unknown"`
+for the controls it covers. **Always prefer the selected-model endpoint's
+answer over the catalog view once a model is loaded**; the catalog view
+exists only to let a client show a plausible pre-load capability hint (e.g.
+graying out a control before the user has selected/loaded that model) and
+is not authoritative. A `catalog_mismatch` array on the selected-model
+response calls out any control where the catalog's claim and the live
+answer disagree (excluding catalog `"unknown"`, which never counts as a
+mismatch).
+
+Each entry in either view is a `ControlCapability` object
 per optional control (`prompt`, `temperature`, `language_hint`,
 `word_timestamps`, `translation`, ...):
 
@@ -241,6 +267,50 @@ per optional control (`prompt`, `temperature`, `language_hint`,
   "mechanism": "whisper_initial_prompt" | null,
   "extra": { "...": "..." } }
 ```
+
+**Timestamp gate (Bug 1, corrected):** an earlier revision of this fix
+distrusted `transcribe_cpp::Model::capabilities().max_timestamp_kind` and
+gated `timestamp_granularity` on a `"whisper"`/`"parakeet"`-only allowlist
+copied from Handy's engine dispatch. That allowlist was itself wrong:
+reading transcribe-cpp-sys 0.2.3's vendored C++ directly (not Handy, which
+has no equivalent code paths) shows `max_timestamp_kind` **is** accurate --
+`arch/{canary,cohere,moonshine,moonshine_streaming,qwen3_asr,voxtral,
+sensevoice,funasr_nano}/capabilities.cpp` hard-code family default `NONE`
+and `transcribe-meta.cpp`'s `read_capability_kv` never overlays it from any
+GGUF KV for those families, so it stays `NONE` for the model's lifetime;
+`arch/granite/model.cpp` lowers its `WORD` family default to `NONE`
+per-variant from the GGUF's own `stt.capability.word_timestamps` *before*
+`capabilities()` is ever read by us; `arch/{gigaam,medasr}/capabilities.cpp`
+set `TOKEN` and never lower it. This catalog's own per-model
+`capabilities.timestamps` field already matches every one of those
+architectures' real ceiling (verified by inspection: `"none"` for
+canary/cohere/moonshine*/voxtral/qwen3_asr/sensevoice/funasr_nano, `"word"`
+only for `granite-speech-4.1-2b-plus`, `"token"` for `gigaam-v3-*`/`medasr`).
+The actual bug was in *our* code: `EffectiveCaps::to_json`'s
+`timestamp_granularity` branch reported `"supported"` unconditionally
+whenever no run had yet been observed to reject it, without ever looking at
+`max_timestamp_kind`. The fix removed the allowlist and made that branch
+check `max_timestamp_granularity() != None` directly, and `catalog::
+capability_matrix` trusts the catalog's own `capabilities.timestamps` claim
+the same way it already trusted `translate`/`lang_detect`.
+`response_format=verbose_json` on an architecture whose ceiling is `NONE`
+returns `200` with an empty `segments` array rather than a `422`; an
+*explicit* `timestamp_granularities=segment` or `=word` request on such a
+model is rejected with `422 unsupported_capability` up front instead of
+reaching the engine and coming back as a raw `engine_unsupported` failure.
+
+**Bug 2 (gigaam-v3-*/medasr "200 but no usable timestamps"), corrected:**
+these two families' `run()` (`arch/gigaam/model.cpp`, `arch/medasr/model.cpp`)
+ignores the requested timestamp granularity entirely and always fills only
+`transcript.tokens` (real per-token `t0_ms`/`t1_ms`, computed from the
+decoder's frame index) -- never `transcript.segments` or `.words`, unlike
+parakeet/whisper. Their engine-reported ceiling genuinely is `TOKEN`, so the
+request was never rejected; our own `format::format_response` simply never
+read `transcript.tokens`, so real timing data was silently dropped and the
+response looked like the model produced nothing. Fixed by synthesizing a
+`segments` entry (and, for an explicit word request, `words` rows) from
+`transcript.tokens` whenever `segments`/`words` come back empty but
+`tokens` doesn't.
 
 **Rule (from `CONVENTIONS.md`: "Advertise a control only after verifying
 its model-side effect... Clients omit unsupported or unknown controls

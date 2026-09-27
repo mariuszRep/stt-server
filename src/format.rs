@@ -137,19 +137,50 @@ pub fn format_response(
                 .clone()
                 .or_else(|| transcript.language.clone());
 
-            let segments: Vec<Value> = transcript
-                .segments
-                .iter()
-                .enumerate()
-                .map(|(id, seg)| {
-                    json!({
-                        "id": id,
-                        "start": seg.t0_ms as f64 / 1000.0,
-                        "end": seg.t1_ms as f64 / 1000.0,
-                        "text": seg.text,
+            // Bug 2 root cause (verified against transcribe-cpp-sys 0.2.3's
+            // vendored C++, `arch/gigaam/model.cpp` and `arch/medasr/model.cpp`
+            // `run()`): those two families' `run()` ignores the requested
+            // timestamp granularity entirely and always fills only
+            // `transcript.tokens` (real per-token `t0_ms`/`t1_ms`, computed
+            // from the decoder's frame index), never `transcript.segments`
+            // or `.words` -- unlike parakeet/whisper, which always populate
+            // `segments`. Their catalog/engine-reported ceiling is
+            // genuinely `TOKEN` (see `capabilities::EffectiveCaps::
+            // max_timestamp_granularity`'s doc comment), so a
+            // `verbose_json` request against them is not incapable, it was
+            // just reading the wrong field on our side: `transcript.tokens`
+            // held real timing data that `segments`/`words` being empty
+            // made look like the model produced nothing. Synthesize one
+            // honest segment spanning the decoded tokens rather than report
+            // empty timing for a model that did produce it.
+            let segments: Vec<Value> = if !transcript.segments.is_empty() {
+                transcript
+                    .segments
+                    .iter()
+                    .enumerate()
+                    .map(|(id, seg)| {
+                        json!({
+                            "id": id,
+                            "start": seg.t0_ms as f64 / 1000.0,
+                            "end": seg.t1_ms as f64 / 1000.0,
+                            "text": seg.text,
+                        })
                     })
-                })
-                .collect();
+                    .collect()
+            } else if plan.timestamps != crate::capabilities::TimestampGranularity::None
+                && !transcript.tokens.is_empty()
+            {
+                let start = transcript.tokens.first().unwrap().t0_ms as f64 / 1000.0;
+                let end = transcript.tokens.last().unwrap().t1_ms as f64 / 1000.0;
+                vec![json!({
+                    "id": 0,
+                    "start": start,
+                    "end": end,
+                    "text": transcript.text,
+                })]
+            } else {
+                Vec::new()
+            };
 
             let mut body = json!({
                 "task": match plan.task {
@@ -165,17 +196,38 @@ pub fn format_response(
                 body["language"] = json!(language);
             }
             if plan.timestamps == crate::capabilities::TimestampGranularity::Word {
-                let words: Vec<Value> = transcript
-                    .words
-                    .iter()
-                    .map(|w| {
-                        json!({
-                            "word": w.text,
-                            "start": w.t0_ms as f64 / 1000.0,
-                            "end": w.t1_ms as f64 / 1000.0,
+                let words: Vec<Value> = if !transcript.words.is_empty() {
+                    transcript
+                        .words
+                        .iter()
+                        .map(|w| {
+                            json!({
+                                "word": w.text,
+                                "start": w.t0_ms as f64 / 1000.0,
+                                "end": w.t1_ms as f64 / 1000.0,
+                            })
                         })
-                    })
-                    .collect();
+                        .collect()
+                } else {
+                    // See the `segments` fallback above: gigaam/medasr never
+                    // populate `transcript.words`, only `transcript.tokens`.
+                    // Each token is a real, individually-timed decode unit
+                    // (a CTC/RNN-T subword or wordpiece), so emit it as a
+                    // word row rather than an empty array -- honest,
+                    // finer-grained than a whole-utterance segment, even if
+                    // it is not always a linguistic word.
+                    transcript
+                        .tokens
+                        .iter()
+                        .map(|t| {
+                            json!({
+                                "word": t.text,
+                                "start": t.t0_ms as f64 / 1000.0,
+                                "end": t.t1_ms as f64 / 1000.0,
+                            })
+                        })
+                        .collect()
+                };
                 body["words"] = json!(words);
             }
             Formatted::Json(body)

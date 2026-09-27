@@ -56,7 +56,8 @@ DEFAULT_AUDIO_ROOT = os.path.expandvars(
     r"%APPDATA%\com.voicetyper.desktop\session-audio"
 )
 HEALTH_TIMEOUT_S = 30.0
-INSTALL_TIMEOUT_S = 30 * 60.0  # 30 minutes per model file; HF downloads can be slow
+DEFAULT_DOWNLOAD_TIMEOUT_S = 3600.0  # overridable with --download-timeout
+INSTALL_TIMEOUT_S = DEFAULT_DOWNLOAD_TIMEOUT_S  # set from --download-timeout in main()
 OPERATION_POLL_INTERVAL_S = 1.0
 REQUEST_TIMEOUT_S = 180.0
 CAPABILITY_TIMEOUT_S = 180.0
@@ -556,6 +557,16 @@ def sweep_one(server, model, quant_file, clips, out_f, only_missing_output=True)
         caps = advertised_capabilities(server, model_id)
 
         # --- transcribe sample clips ---
+        # The clip manifest's reference text is always English (make_clips
+        # rejects non-ASCII references), but many catalog models are not
+        # English-capable at all. Scoring those against the English
+        # reference by WER is meaningless -- a correct non-English
+        # transcription of English audio "disagrees" with the reference in
+        # every word, which used to score as "fail" for a model that is
+        # actually working correctly. Score those by non-empty text only,
+        # the same bar `try_capability` already uses.
+        model_langs = model.get("languages") or []
+        model_is_english_capable = not model_langs or "en" in model_langs
         for clip_path, reference in clips:
             t0 = time.monotonic()
             status, parsed, err, wall_ms = http_multipart(
@@ -568,10 +579,10 @@ def sweep_one(server, model, quant_file, clips, out_f, only_missing_output=True)
             hyp = ""
             if isinstance(parsed, dict):
                 hyp = parsed.get("text") or ""
-            w = wer(reference, hyp) if reference else None
+            w = wer(reference, hyp) if (reference and model_is_english_capable) else None
             clip_status = "fail"
             if err is None and status is not None and status < 400 and hyp.strip():
-                clip_status = wer_status(w)
+                clip_status = wer_status(w) if model_is_english_capable else "ok"
             record["clips"].append(
                 {
                     "clip": clip_path.name,
@@ -741,12 +752,19 @@ def main():
     parser.add_argument("--all-quants", action="store_true", help="test every quant, not only each model's default_quant")
     parser.add_argument("--redo", action="store_true", help="re-run entries already in --out")
     parser.add_argument("--log", default=None, help="server stdout/stderr log path (default: <data-dir>/server.log)")
+    parser.add_argument(
+        "--download-timeout", type=float, default=DEFAULT_DOWNLOAD_TIMEOUT_S,
+        help=f"seconds to wait for an install/verify operation (default: {DEFAULT_DOWNLOAD_TIMEOUT_S:.0f})",
+    )
 
     parser.add_argument("--make-clips", action="store_true", help="build a clips dir instead of sweeping")
     parser.add_argument("--from-results", default=None, help="bench_corpus.py results jsonl (for --make-clips)")
     parser.add_argument("--audio-root", default=DEFAULT_AUDIO_ROOT)
 
     args = parser.parse_args()
+
+    global INSTALL_TIMEOUT_S
+    INSTALL_TIMEOUT_S = args.download_timeout
 
     if args.make_clips:
         if not args.from_results or not args.clips_dir:

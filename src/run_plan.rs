@@ -383,11 +383,26 @@ pub fn plan(
                 }
                 (TimestampGranularity::Word, true)
             } else if segment_requested {
+                if !caps.supports_segment_timestamps() {
+                    return Err(ApiError::new(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "unsupported_capability",
+                        "This model does not support timestamps",
+                    ));
+                }
                 (TimestampGranularity::Segment, true)
-            } else {
+            } else if caps.supports_segment_timestamps() {
                 // Not explicitly requested: defaulted for verbose_json. Bug
                 // 1's retry may still silently downgrade this one.
                 (TimestampGranularity::Segment, false)
+            } else {
+                // Model has no working timestamp path at all (see
+                // `EffectiveCaps::supports_segment_timestamps`): fall back to
+                // no timestamps rather than planning a run the engine is
+                // known to reject. `verbose_json` still returns 200 with an
+                // empty `segments` array, honestly reflecting that this
+                // model cannot produce them.
+                (TimestampGranularity::None, false)
             }
         }
         ResponseFormat::Json | ResponseFormat::Text => (TimestampGranularity::None, false),
