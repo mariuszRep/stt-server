@@ -197,7 +197,7 @@ pub fn install() -> Result<(), Box<dyn Error>> {
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
         executable_path: binary,
-        launch_arguments: vec![OsString::from("service")],
+        launch_arguments: vec![OsString::from("service"), OsString::from("run")],
         dependencies: vec![],
         account_name: None,
         account_password: None,

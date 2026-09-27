@@ -449,9 +449,10 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
         // spellings kept working as aliases for `service install`/`service
         // uninstall`.
         "service" => {
-            let sub = args
-                .get(1)
-                .ok_or_else(|| CliError::usage("service requires install|uninstall|run"))?;
+            // Bare `service` is what older installs registered with the SCM; treat it as `service run`.
+            let Some(sub) = args.get(1) else {
+                return Ok(Command::Service(ServiceAction::Run));
+            };
             match sub.as_str() {
                 "install" => {
                     parse_no_flags(&args[2..], "service install")?;
@@ -774,7 +775,10 @@ mod tests {
             parse(&args(&["uninstall"])).unwrap(),
             Command::Service(ServiceAction::Uninstall)
         );
-        assert!(parse(&args(&["service"])).is_err());
+        assert_eq!(
+            parse(&args(&["service"])).unwrap(),
+            Command::Service(ServiceAction::Run)
+        );
         assert!(parse(&args(&["service", "bogus"])).is_err());
     }
 
