@@ -8,7 +8,7 @@ scope: stt-server-next only
 attempt: 1
 max_attempts: 8
 last_result: partial
-next_action: Slice 1 (install scope and data folder; service only in machine-wide) done. Remaining slices: port fallback and discovery; access levels; network modes including Tailscale; version reporting and model import.
+next_action: Slices 1 (install scope and data folder; service only in machine-wide) and 2 (port fallback and discovery) done. Remaining slices: access levels; network modes including Tailscale; version reporting and model import.
 success_criteria:
   - Each install has exactly one data folder, and the app, CLI, start-with-Windows and service all use it; a model is never stored twice within one install.
   - A per-user install needs no admin; a machine-wide install needs admin once and serves every user on the PC.
@@ -108,3 +108,24 @@ multi-user PCs, access levels, network safety and Tailscale.
 Not started.
 
 2026-09-27: Slice 1 (install scope, one data folder, service only machine-wide) implemented. Orchestrator gates: fmt clean, clippy clean, cargo test 213 lib + 10 bin passed. Scope follows the exe location (machine-wide program folder or marker file); service install refuses unless elevated; old folder names are renamed, never deleted. Real service install not yet rehearsed.
+
+2026-09-27: Slice 2 ("Several users on one PC": port fallback and discovery) implemented in
+`src/api.rs::run_http_full` and `src/bin/server.rs`. A per-user install whose port was only
+preferred (default or stored `bind_port` setting, not an explicit `--port`) now falls back to an
+OS-assigned free loopback port on `AddrInUse`, logs the fallback, and updates the in-memory `App`
+so `server.json`, `/health`, and `/v1/local/config` all report the port actually bound. A
+machine-wide install, and any install given an explicit `--port`, fails clearly (`BindFailed`,
+exit code 4) instead of falling back -- machine-wide has priority for the fixed port. `cmd_start`
+no longer assumes the resolved port when confirming the spawned child is healthy or reporting it
+to the caller; it now polls `server.json` the same way `status`/`stop`/`health`/`models *`/
+`update *` already did, so it also picks up a port the child fell back to. The `/health` identity
+check (`service` field, not just HTTP 200) that guards against a foreign process on the port was
+already in place and is exercised again here. Added a CLI-level test,
+`models_cli_tests::status_discovers_a_fallback_port_not_the_busy_preferred_one`, on top of the
+three `api.rs::port_fallback_tests` (fallback on busy port, explicit `--port` busy fails,
+machine-wide busy fails) that were already present from prior work. Updated `README.md`
+("Several users on one PC") and `docs/client-contract.md` (new "1.3 Several users on one PC")
+to document that clients must never assume the default port. Gates: `cargo fmt --check` clean,
+`cargo clippy --all-targets -- -D warnings` clean, `cargo test` 216 lib + 11 bin passed (227
+total). Not committed per instruction. Remaining slices: access levels; network modes including
+Tailscale; version reporting and model import.

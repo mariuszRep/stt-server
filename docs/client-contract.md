@@ -78,6 +78,23 @@ for a client that can shell out instead of reading the file directly:
 -- treat `status --json`'s `running: false` the same as a missing/dead
 `server.json`.)
 
+### 1.3 Several users on one PC: the port in `server.json` may not be the default
+
+A per-user install (data under `%LOCALAPPDATA%`) whose port was only preferred -- the hard
+default or a stored `bind_port` setting, not an explicit `--port` -- falls back to an
+OS-assigned free loopback port if the preferred one is already taken (typically by another
+user's own server, or a machine-wide one). A machine-wide install never falls back: it keeps its
+fixed port and has priority for it, failing clearly if that port is taken. An explicit `--port`
+also never falls back, on either scope.
+
+This means **every** client and CLI command must find the server through `server.json` (1.2) --
+never by assuming `127.0.0.1:54321` -- because a per-user server may be listening on a different,
+OS-chosen port. `run_http_full` (`src/api.rs`) writes `server.json` with the port actually bound,
+after any fallback, and every CLI command in `src/bin/server.rs` (`status`, `stop`, `restart`,
+`health`, `models *`, `update *`) reads it from there rather than hard-coding the default; `start`
+does the same when confirming the detached child came up, since the port it resolves internally
+may differ from what the parent process assumed.
+
 ## 2. Data directory defaults and the drop-in folder
 
 From `crate::app::data_dir()`:

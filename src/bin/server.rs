@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use stt_server_next::app::{self, BindOverrides, DEFAULT_BIND_HOST, DEFAULT_BIND_PORT};
+use stt_server_next::app::{self, BindOverrides, DEFAULT_BIND_HOST};
 use stt_server_next::cli::{
     self, AutostartAction, Command, ModelsCommand, RunFlags, ServiceAction, UpdateCommand,
 };
@@ -305,9 +305,15 @@ async fn cmd_run(flags: RunFlags) -> i32 {
     let data_dir = effective_data_dir(&flags);
     let overrides = bind_overrides(&flags);
     let limits = flags.limits;
-    let result = stt_server_next::api::run_http_full(data_dir, limits, overrides, async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
+    let result = stt_server_next::api::run_http_full(
+        data_dir,
+        limits,
+        overrides,
+        app::install_scope(),
+        async {
+            let _ = tokio::signal::ctrl_c().await;
+        },
+    )
     .await;
     match result {
         Ok(()) => 0,
@@ -332,7 +338,6 @@ async fn cmd_run(flags: RunFlags) -> i32 {
 
 async fn cmd_start(flags: RunFlags) -> i32 {
     let data_dir = effective_data_dir(&flags);
-    let port = flags.port.unwrap_or(DEFAULT_BIND_PORT);
     let host = flags
         .host
         .clone()
@@ -361,8 +366,17 @@ async fn cmd_start(flags: RunFlags) -> i32 {
     let mut args: Vec<String> = vec!["run".to_owned()];
     args.push("--data-dir".to_owned());
     args.push(data_dir.display().to_string());
-    args.push("--port".to_owned());
-    args.push(port.to_string());
+    // Only pass `--port` on to the spawned process when the caller explicitly
+    // asked for one. Passing the resolved default unconditionally would look
+    // identical to an explicit `--port` once it reaches `run`, and would
+    // silently disable this install's port-fallback (see
+    // `api::run_http_full`): a per-user server whose port is merely
+    // preferred (default or stored setting) must still be free to fall back
+    // to another free port when it's taken.
+    if let Some(port) = flags.port {
+        args.push("--port".to_owned());
+        args.push(port.to_string());
+    }
     args.push("--host".to_owned());
     args.push(host.clone());
     if let Some(v) = flags.limits.queue_max_waiting {
@@ -401,15 +415,21 @@ async fn cmd_start(flags: RunFlags) -> i32 {
         }
     };
     // Detach: we do not wait() on the child (it outlives this process).
-    let spawned_pid = child.id();
     std::mem::forget(child);
 
-    let probe = probe_host(&host);
+    // The child resolves its own effective port (explicit --port > stored
+    // setting > default), and may fall back further to a free port if that
+    // one is taken -- so this process cannot assume any particular port and
+    // must discover it the same way every other CLI command does: through
+    // `server.json`, which `run_http_full` writes with the port actually
+    // bound.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
-        if health_ok(&probe, port).await {
-            println!("started: pid {spawned_pid} on {host}:{port}");
-            return 0;
+        if let Some(info) = discovery::read_server_json(&data_dir) {
+            if health_ok(&probe_host(&info.host), info.port).await {
+                println!("started: pid {} on {}:{}", info.pid, info.host, info.port);
+                return 0;
+            }
         }
         if std::time::Instant::now() >= deadline {
             eprintln!("error: server did not become healthy within 30s");
@@ -1215,6 +1235,7 @@ mod models_cli_tests {
                 dir_for_task,
                 Default::default(),
                 overrides,
+                app::InstallScope::PerUser,
                 std::future::pending::<()>(),
             )
             .await;
@@ -1322,5 +1343,80 @@ mod models_cli_tests {
         // Empty (unconfigured) drop-in folder scans to zero results and
         // completes successfully.
         assert_eq!(code, 0);
+    }
+
+    /// `cmd_status` (like every other CLI command) must find the server
+    /// through `server.json` rather than assuming any particular port: this
+    /// spawns a per-user server whose preferred port is already occupied, so
+    /// it falls back to an OS-assigned one (see `api::run_http_full`'s
+    /// `port_fallback_tests`), then checks `status` still reports it as
+    /// running by reading the port that was actually recorded.
+    #[tokio::test]
+    async fn status_discovers_a_fallback_port_not_the_busy_preferred_one() {
+        let busy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let busy_port = busy_listener.local_addr().unwrap().port();
+
+        let data_dir =
+            std::env::temp_dir().join(format!("stt-status-fallback-test-{}", uuid::Uuid::new_v4()));
+        // Persist the busy port as a stored setting (not an explicit
+        // `--port`) so fallback stays eligible: `run_http_full` only falls
+        // back when `bind_overrides.port` is `None`.
+        {
+            let app = app::open_app_at(data_dir.clone()).unwrap();
+            app.db
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO settings(key,value) VALUES(?1,?2)",
+                    rusqlite::params![
+                        stt_server_next::store::SETTING_BIND_PORT,
+                        busy_port.to_string()
+                    ],
+                )
+                .unwrap();
+            drop(app);
+        }
+
+        let dir_for_task = data_dir.clone();
+        let task = tokio::spawn(async move {
+            let overrides = app::BindOverrides {
+                host: Some("127.0.0.1".to_owned()),
+                port: None,
+            };
+            // A machine-wide install would fail clearly instead; PerUser is
+            // what's eligible to fall back here.
+            let _ = stt_server_next::api::run_http_full(
+                dir_for_task,
+                Default::default(),
+                overrides,
+                app::InstallScope::PerUser,
+                std::future::pending::<()>(),
+            )
+            .await;
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let info = loop {
+            if let Some(info) = discovery::read_server_json(&data_dir) {
+                break info;
+            }
+            if std::time::Instant::now() >= deadline {
+                task.abort();
+                let _ = std::fs::remove_dir_all(&data_dir);
+                panic!("server never wrote server.json");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_ne!(
+            info.port, busy_port,
+            "must have fallen back off the busy preferred port"
+        );
+        drop(busy_listener);
+
+        let code = cmd_status(data_dir.clone(), true).await;
+        assert_eq!(code, 0, "status must find the server via server.json");
+
+        task.abort();
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }

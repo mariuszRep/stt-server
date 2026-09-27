@@ -227,7 +227,21 @@ default the same way.
 `<data dir>\server.lock`; a second instance pointed at the same data directory exits immediately
 with a clear error (exit code 3). `status` checks the saved PID and health endpoint. `stop`
 uses the exclusive lock to identify an absent instance and safely clear stale discovery.
-A bind failure (e.g. port already in use) exits with code 4.
+A bind failure (e.g. port already in use) exits with code 4. Every CLI command that talks to a
+running server (`status`/`stop`/`restart`/`health`/`models`/`update`) discovers it through
+`server.json`, never by assuming the default port -- `health`'s `service` field is also checked,
+not just a 200 status, so a foreign process already listening on that port is never mistaken for
+this server (see "Several users on one PC" below).
+
+**Several users on one PC**: a per-user install (data under `%LOCALAPPDATA%`) whose port was not
+given explicitly (no `--port`, whether the effective port came from the hard default or a stored
+`bind_port` setting) falls back to an OS-assigned free loopback port if the preferred one is
+already taken -- typically by another user's server, or a machine-wide one -- and logs the
+fallback; the port actually bound is what `server.json` (and `/health`, `/v1/local/config`)
+report, and that's what every CLI command finds. A machine-wide install always keeps its fixed
+port and has priority for it: if that port is taken, it fails clearly (exit code 4) instead of
+moving. An explicit `--port` also always fails clearly rather than silently falling back to a
+port the caller didn't ask for, on either install scope.
 
 **`start`** spawns the same executable with `run` and the given flags as a detached background
 process (`CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` on Windows), waits up

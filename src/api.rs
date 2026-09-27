@@ -1157,6 +1157,7 @@ pub async fn run_http_with_overrides(
         crate::app::data_dir(),
         cli_overrides,
         crate::app::BindOverrides::default(),
+        crate::app::install_scope(),
         shutdown,
     )
     .await
@@ -1188,10 +1189,21 @@ impl std::error::Error for ServeError {}
 /// guard, writes `server.json`, serves until `shutdown` resolves, then
 /// cleans up the discovery file. Used by both `run` and the detached process
 /// `start` spawns.
+///
+/// Port fallback (several users on one PC, see the `install-scope-and-
+/// shared-access` goal): a per-user install (`scope`) whose port was not
+/// explicitly requested (`bind_overrides.port.is_none()` -- it came from the
+/// default or a stored setting, not `--port`) falls back to an OS-assigned
+/// free loopback port when the preferred one is already taken (typically by
+/// another user's server, or a machine-wide one). A machine-wide install
+/// keeps its fixed port and always fails clearly if it's taken -- it has
+/// priority. An explicit `--port` also always fails clearly rather than
+/// silently moving to a different port the caller didn't ask for.
 pub async fn run_http_full(
     data_dir: std::path::PathBuf,
     cli_overrides: crate::app::RuntimeLimits,
     bind_overrides: crate::app::BindOverrides,
+    scope: crate::app::InstallScope,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), ServeError> {
     // Single-instance guard: held for the process lifetime (the returned
@@ -1199,8 +1211,9 @@ pub async fn run_http_full(
     let _lock =
         crate::discovery::acquire_lock(&data_dir).map_err(|_| ServeError::AlreadyRunning)?;
 
-    let app = crate::app::open_app_at_full(data_dir.clone(), cli_overrides, bind_overrides)
-        .map_err(ServeError::Other)?;
+    let mut app =
+        crate::app::open_app_at_full(data_dir.clone(), cli_overrides, bind_overrides.clone())
+            .map_err(ServeError::Other)?;
 
     // LAN guard: refuse to start on a non-loopback bind unless the token is
     // present and non-empty. `token_file`/`open_app_at_full` already fail if
@@ -1219,13 +1232,44 @@ pub async fn run_http_full(
         );
     }
 
-    let router = router(app.clone());
-    let address: SocketAddr = format!("{}:{}", app.bind_host, app.bind_port)
+    let preferred_address: SocketAddr = format!("{}:{}", app.bind_host, app.bind_port)
         .parse()
         .map_err(|e| ServeError::Other(Box::new(e)))?;
-    let listener = tokio::net::TcpListener::bind(address)
-        .await
-        .map_err(ServeError::BindFailed)?;
+    let listener = match tokio::net::TcpListener::bind(preferred_address).await {
+        Ok(listener) => listener,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::AddrInUse
+                && scope == crate::app::InstallScope::PerUser
+                && bind_overrides.port.is_none() =>
+        {
+            let fallback_address: SocketAddr = format!("{}:0", app.bind_host)
+                .parse()
+                .map_err(|e| ServeError::Other(Box::new(e)))?;
+            let listener = tokio::net::TcpListener::bind(fallback_address)
+                .await
+                .map_err(ServeError::BindFailed)?;
+            let actual_port = listener
+                .local_addr()
+                .map_err(ServeError::BindFailed)?
+                .port();
+            eprintln!(
+                "port {} is already in use; bound a free port instead: {}",
+                app.bind_port, actual_port
+            );
+            // Still the sole owner of this Arc (no clone taken yet), so this
+            // mutates the same App the router below and every request handler
+            // will share -- `/health`, `/v1/local/config`, and `server.json`
+            // all end up reporting the port actually bound, not the one that
+            // was merely preferred.
+            Arc::get_mut(&mut app)
+                .expect("no other Arc<App> clone exists yet")
+                .bind_port = actual_port;
+            listener
+        }
+        Err(error) => return Err(ServeError::BindFailed(error)),
+    };
+    let address = listener.local_addr().map_err(ServeError::BindFailed)?;
+    let router = router(app.clone());
     println!(
         "listening on {address}; token file: {}",
         app.data_dir.join("auth.token").display()
@@ -2114,5 +2158,149 @@ mod router_tests {
         assert_eq!(stored_port, Some(54402));
         drop(app);
         std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+}
+
+/// Port fallback for several users on one PC (see the `install-scope-and-
+/// shared-access` goal, "Several users on one PC"): a per-user server whose
+/// port was only preferred (not given via an explicit `--port`) falls back
+/// to a free loopback port when the preferred one is taken; a machine-wide
+/// server, and any server given an explicit `--port`, always fails clearly
+/// instead.
+#[cfg(test)]
+mod port_fallback_tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn temp_dir() -> std::path::PathBuf {
+        std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("stt-port-fallback-test-{}", Uuid::new_v4()))
+    }
+
+    /// Occupies a loopback port and hands back both the port number and the
+    /// listener (dropping it would free the port again).
+    async fn occupy_a_port() -> (u16, tokio::net::TcpListener) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (port, listener)
+    }
+
+    #[tokio::test]
+    async fn per_user_falls_back_to_a_free_port_when_preferred_one_is_busy() {
+        let (busy_port, _occupying_listener) = occupy_a_port().await;
+        let data_dir = temp_dir();
+
+        // Persist the "preferred" (busy) port as a stored setting -- picked
+        // up the same way a real default/configured port would be -- before
+        // the server ever opens, so it isn't a race with `run_http_full`
+        // reading it at startup. Crucially this is a stored setting, not an
+        // explicit `--port` (`bind_overrides.port` stays `None` below), which
+        // is what makes fallback eligible at all.
+        {
+            let app = crate::app::open_app_at(data_dir.clone()).unwrap();
+            app.db
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO settings(key,value) VALUES(?1,?2)",
+                    params![crate::store::SETTING_BIND_PORT, busy_port.to_string()],
+                )
+                .unwrap();
+            drop(app);
+        }
+
+        let dir = data_dir.clone();
+        let task = tokio::spawn(async move {
+            let _ = run_http_full(
+                dir,
+                Default::default(),
+                crate::app::BindOverrides {
+                    host: Some("127.0.0.1".to_owned()),
+                    port: None,
+                },
+                crate::app::InstallScope::PerUser,
+                std::future::pending::<()>(),
+            )
+            .await;
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let info = loop {
+            if let Some(info) = crate::discovery::read_server_json(&data_dir) {
+                break info;
+            }
+            if std::time::Instant::now() >= deadline {
+                task.abort();
+                panic!("server never wrote server.json");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+
+        assert_ne!(
+            info.port, busy_port,
+            "must not have bound the already-occupied port"
+        );
+        assert!(info.port > 0);
+
+        task.abort();
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn explicit_port_fails_clearly_instead_of_falling_back() {
+        let (busy_port, _occupying_listener) = occupy_a_port().await;
+        let data_dir = temp_dir();
+        let overrides = crate::app::BindOverrides {
+            host: Some("127.0.0.1".to_owned()),
+            port: Some(busy_port),
+        };
+        let result = run_http_full(
+            data_dir.clone(),
+            Default::default(),
+            overrides,
+            crate::app::InstallScope::PerUser,
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert!(matches!(result, Err(ServeError::BindFailed(_))));
+        assert!(crate::discovery::read_server_json(&data_dir).is_none());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn machine_wide_fails_clearly_instead_of_falling_back() {
+        let (busy_port, _occupying_listener) = occupy_a_port().await;
+        let data_dir = temp_dir();
+        let overrides = crate::app::BindOverrides {
+            host: Some("127.0.0.1".to_owned()),
+            // Not an explicit `--port` -- only the scope should be what
+            // stops the fallback here.
+            port: None,
+        };
+        {
+            let app = crate::app::open_app_at(data_dir.clone()).unwrap();
+            app.db
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO settings(key,value) VALUES(?1,?2)",
+                    params![crate::store::SETTING_BIND_PORT, busy_port.to_string()],
+                )
+                .unwrap();
+            drop(app);
+        }
+        let result = run_http_full(
+            data_dir.clone(),
+            Default::default(),
+            overrides,
+            crate::app::InstallScope::MachineWide,
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert!(matches!(result, Err(ServeError::BindFailed(_))));
+        assert!(crate::discovery::read_server_json(&data_dir).is_none());
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }
