@@ -9,7 +9,7 @@ use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 
 use crate::app::App;
-use crate::auth::authorized;
+use crate::auth::{authorize, authorized, AccessLevel};
 use crate::errors::{internal, ApiError, ApiResult};
 use crate::store::now_ms;
 
@@ -83,7 +83,7 @@ pub async fn operation(
     UrlPath(id): UrlPath<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    authorized(&headers, &app)?;
+    authorize(&headers, &app, AccessLevel::User)?;
     let db = app.db.lock().map_err(internal)?;
     let record = db
         .query_row(

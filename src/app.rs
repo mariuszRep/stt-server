@@ -20,6 +20,10 @@ pub struct App {
     pub loaded: Mutex<Option<LoadedModel>>,
     pub data_dir: PathBuf,
     pub token: String,
+    /// User-level token (`user.token`): satisfies `AccessLevel::User` routes
+    /// only. See `crate::auth::AccessLevel` and the "Access levels on a
+    /// shared server" goal.
+    pub user_token: String,
     /// FIFO queue for the single inference slot; see `crate::queue`. Its
     /// waiting-list bound and wait deadline are read live from `limits`.
     pub inference: InferenceQueue,
@@ -282,8 +286,23 @@ fn restrict_token_file_acl(_path: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Admin token: `<data dir>\auth.token`. See [`token_file_named`].
 pub fn token_file(dir: &Path) -> Result<String, Box<dyn Error>> {
-    let path = dir.join("auth.token");
+    token_file_named(dir, "auth.token")
+}
+
+/// User token: `<data dir>\user.token`. Same generation/persistence approach
+/// as the admin token, created alongside it so every install (per-user or
+/// machine-wide) has both -- a per-user install has no separate use for it
+/// today (the owner already has full access via `auth.token`), but keeping
+/// generation uniform avoids a special case, and it becomes relevant if that
+/// install is later shared.
+pub fn user_token_file(dir: &Path) -> Result<String, Box<dyn Error>> {
+    token_file_named(dir, "user.token")
+}
+
+fn token_file_named(dir: &Path, file_name: &str) -> Result<String, Box<dyn Error>> {
+    let path = dir.join(file_name);
     let result = match OpenOptions::new().write(true).create_new(true).open(&path) {
         Ok(mut file) => {
             let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
@@ -480,6 +499,7 @@ pub fn open_app_at_full(
     fs::create_dir_all(data_dir.join("models"))?;
     fs::create_dir_all(data_dir.join("staging"))?;
     let token = token_file(&data_dir)?;
+    let user_token = user_token_file(&data_dir)?;
     let mut db = Connection::open(data_dir.join("state.db"))?;
     db.execute_batch("PRAGMA journal_mode=WAL;")?;
     crate::store::migrate(&mut db, &catalog.models, &data_dir)?;
@@ -553,6 +573,7 @@ pub fn open_app_at_full(
         loaded: Mutex::new(loaded),
         data_dir,
         token,
+        user_token,
         inference: InferenceQueue::new(),
         limits: std::sync::RwLock::new(limits),
         selection: tokio::sync::Mutex::new(()),
@@ -966,6 +987,37 @@ mod recovery_tests {
             .unwrap();
         let listing = String::from_utf8_lossy(&output.stdout).to_lowercase();
         assert!(listing.contains(&user));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `user_token_file` creates `user.token` alongside `auth.token`, using
+    /// the same generation approach (64-char, stable across re-opens), and
+    /// they must differ. See "Access levels on a shared server".
+    #[test]
+    fn user_token_file_creates_a_distinct_stable_token() {
+        let dir = std::env::temp_dir().join(format!("stt-user-token-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let admin_token = token_file(&dir).unwrap();
+        let user_token = user_token_file(&dir).unwrap();
+        assert_eq!(user_token.len(), 64);
+        assert_ne!(admin_token, user_token);
+        assert!(dir.join("user.token").exists());
+        // Re-opening returns the same token rather than regenerating it.
+        assert_eq!(user_token_file(&dir).unwrap(), user_token);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `App::open_app_at_full` (the common opener) must populate both
+    /// tokens, since routes are gated on `app.user_token` as well as
+    /// `app.token`.
+    #[test]
+    fn open_app_populates_both_admin_and_user_tokens() {
+        let dir = std::env::temp_dir().join(format!("stt-app-tokens-test-{}", Uuid::new_v4()));
+        let app = open_app_at(dir.clone()).unwrap();
+        assert_eq!(app.token.len(), 64);
+        assert_eq!(app.user_token.len(), 64);
+        assert_ne!(app.token, app.user_token);
+        drop(app);
         fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -54,6 +54,22 @@ fn probe_host(host: &str) -> String {
     }
 }
 
+/// Reads this data dir's bearer token, preferring the admin token
+/// (`auth.token`) and falling back to the user token (`user.token`) if the
+/// admin token can't be read -- e.g. an ordinary local user on a
+/// machine-wide install, whose ACL (see `service::install`) grants
+/// `auth.token` only to SYSTEM/Administrators. A command that needs admin
+/// access still runs, just with a user-level token that the server then
+/// rejects with `403 admin_required` (see `format_error`'s hint for that
+/// code) rather than the CLI failing before ever reaching the server.
+fn read_token(data_dir: &Path) -> Result<String, ConnectError> {
+    match std::fs::read_to_string(data_dir.join("auth.token")) {
+        Ok(token) => Ok(token),
+        Err(admin_error) => std::fs::read_to_string(data_dir.join("user.token"))
+            .map_err(|_| ConnectError::TokenUnreadable(admin_error)),
+    }
+}
+
 /// Discovers the running server, confirms it answers `/health`, and reads
 /// its bearer token -- the same three steps `cmd_stop`/`cmd_status` perform
 /// before touching the authenticated API.
@@ -79,8 +95,7 @@ pub async fn connect(data_dir: &Path) -> Result<Connection, ConnectError> {
     if !healthy {
         return Err(ConnectError::NotRunning);
     }
-    let token = std::fs::read_to_string(data_dir.join("auth.token"))
-        .map_err(ConnectError::TokenUnreadable)?;
+    let token = read_token(data_dir)?;
     Ok(Connection {
         base_url: format!("http://{host}:{}", info.port),
         token: token.trim().to_owned(),
@@ -142,6 +157,7 @@ pub fn format_error(outcome: &ApiOutcome) -> String {
         "model_in_use" => " -- unload it first with `models unload`",
         "model_not_found" | "operation_not_found" => " -- check the id",
         "server_not_ready" => " -- no model is loaded yet; select one, or check for an in-progress install/verify",
+        "admin_required" => " -- admin access required (run as administrator)",
         _ => "",
     };
     if code.is_empty() {
@@ -235,4 +251,50 @@ pub async fn import_model(
     let status = response.status().as_u16();
     let body = response.json::<Value>().await.unwrap_or(Value::Null);
     Ok(ApiOutcome { status, body })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("stt-cli-token-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The CLI must prefer `auth.token` (the admin token) when it can be
+    /// read, per "CLI: prefer auth.token if readable, else fall back to
+    /// user.token" -- otherwise an admin's own CLI on a machine-wide
+    /// install would silently run at user level.
+    #[test]
+    fn read_token_prefers_admin_token_when_both_exist() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("auth.token"), "a".repeat(64)).unwrap();
+        std::fs::write(dir.join("user.token"), "u".repeat(64)).unwrap();
+        assert_eq!(read_token(&dir).unwrap(), "a".repeat(64));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Falls back to `user.token` when `auth.token` can't be read at all
+    /// (missing here; on a real machine-wide install this is instead an
+    /// ACL-denied read for a non-admin local user).
+    #[test]
+    fn read_token_falls_back_to_user_token_when_admin_token_is_unreadable() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("user.token"), "u".repeat(64)).unwrap();
+        assert_eq!(read_token(&dir).unwrap(), "u".repeat(64));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Neither token present/readable: surfaces the admin-token read error,
+    /// not a generic failure, so the CLI's error message stays useful.
+    #[test]
+    fn read_token_errors_when_neither_token_is_readable() {
+        let dir = temp_dir();
+        let result = read_token(&dir);
+        assert!(matches!(result, Err(ConnectError::TokenUnreadable(_))));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

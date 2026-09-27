@@ -29,7 +29,7 @@ use std::os::windows::process::CommandExt;
 use crate::api::run_http;
 use crate::app::{
     data_dir, machine_wide_old_program_dir, machine_wide_program_dir, migrate_machine_wide_data,
-    token_file,
+    token_file, user_token_file,
 };
 
 const NAME: &str = "OpenVibeSttNext";
@@ -122,6 +122,48 @@ fn owner_name() -> Result<String, Box<dyn Error>> {
     ))
 }
 
+/// The well-known SID for the built-in local "Users" group. Used with
+/// `icacls` instead of the localized group name (`Users`, `Utilisateurs`,
+/// ...) so the grant works on non-English Windows too.
+const USERS_GROUP_SID: &str = "*S-1-5-32-545";
+
+/// ACL rules for the machine-wide data folder itself: SYSTEM and
+/// Administrators get full control, and the installing user gets read/
+/// execute so they can browse it without being an admin.
+fn data_dir_acl_args(owner: &str) -> Vec<String> {
+    vec![
+        "/inheritance:r".to_owned(),
+        "/grant:r".to_owned(),
+        "SYSTEM:(OI)(CI)F".to_owned(),
+        "Administrators:(OI)(CI)F".to_owned(),
+        format!("{owner}:RX"),
+    ]
+}
+
+/// ACL rules for `auth.token` (the admin token): SYSTEM and Administrators
+/// only. No standing grant for the installing user -- see the call site.
+fn admin_token_acl_args() -> Vec<String> {
+    vec![
+        "/inheritance:r".to_owned(),
+        "/grant:r".to_owned(),
+        "SYSTEM:F".to_owned(),
+        "Administrators:F".to_owned(),
+    ]
+}
+
+/// ACL rules for `user.token`: SYSTEM and Administrators get full control,
+/// and every local user of the machine (the well-known Users group SID) gets
+/// read.
+fn user_token_acl_args() -> Vec<String> {
+    vec![
+        "/inheritance:r".to_owned(),
+        "/grant:r".to_owned(),
+        "SYSTEM:F".to_owned(),
+        "Administrators:F".to_owned(),
+        format!("{USERS_GROUP_SID}:R"),
+    ]
+}
+
 fn icacls(path: &Path, rules: &[String]) -> Result<(), Box<dyn Error>> {
     let status = Command::new("icacls").arg(path).args(rules).status()?;
     if !status.success() {
@@ -174,28 +216,22 @@ pub fn install() -> Result<(), Box<dyn Error>> {
     let data = migrate_machine_wide_data();
     fs::create_dir_all(&data)?;
     let token_path = data.join("auth.token");
+    let user_token_path = data.join("user.token");
     let owner = owner_name()?;
-    icacls(
-        &data,
-        &[
-            "/inheritance:r".to_owned(),
-            "/grant:r".to_owned(),
-            "SYSTEM:(OI)(CI)F".to_owned(),
-            "Administrators:(OI)(CI)F".to_owned(),
-            format!("{owner}:RX"),
-        ],
-    )?;
+    icacls(&data, &data_dir_acl_args(&owner))?;
     token_file(&data)?;
-    icacls(
-        &token_path,
-        &[
-            "/inheritance:r".to_owned(),
-            "/grant:r".to_owned(),
-            "SYSTEM:F".to_owned(),
-            "Administrators:F".to_owned(),
-            format!("{owner}:R"),
-        ],
-    )?;
+    // Admin token: SYSTEM + Administrators only. The installing user gets no
+    // extra read grant here -- an admin who needs it can already read it as
+    // an Administrator, and giving the installing account its own standing
+    // grant would let a since-demoted or different account keep reading it
+    // after ceasing to be an admin. See "Access levels on a shared server".
+    icacls(&token_path, &admin_token_acl_args())?;
+    user_token_file(&data)?;
+    // User token: readable by every local user of the machine, not just the
+    // installing account. `*S-1-5-32-545` is the well-known SID for the
+    // built-in Users group, used instead of the localized "Users" name so
+    // this works on non-English Windows too.
+    icacls(&user_token_path, &user_token_acl_args())?;
     let manager = ServiceManager::local_computer(
         None::<&str>,
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
@@ -332,5 +368,44 @@ mod tests {
     #[test]
     fn install_dir_is_the_unified_machine_wide_program_dir() {
         assert_eq!(install_dir(), machine_wide_program_dir());
+    }
+
+    /// The admin token (`auth.token`) must not carry a standing grant for
+    /// the installing user: SYSTEM and Administrators only. See the
+    /// "Access levels on a shared server" goal.
+    #[test]
+    fn admin_token_acl_grants_only_system_and_administrators() {
+        let args = admin_token_acl_args();
+        assert!(args.contains(&"SYSTEM:F".to_owned()));
+        assert!(args.contains(&"Administrators:F".to_owned()));
+        assert!(args.contains(&"/inheritance:r".to_owned()));
+        assert_eq!(args.len(), 4, "no extra owner grant expected: {args:?}");
+        for arg in &args {
+            assert!(
+                !arg.to_lowercase().contains("users"),
+                "admin token must not grant the Users group: {args:?}"
+            );
+        }
+    }
+
+    /// The user token must additionally grant the well-known Users-group
+    /// SID (not the localized name) read access, alongside SYSTEM/
+    /// Administrators full control.
+    #[test]
+    fn user_token_acl_grants_users_group_by_well_known_sid() {
+        let args = user_token_acl_args();
+        assert!(args.contains(&"SYSTEM:F".to_owned()));
+        assert!(args.contains(&"Administrators:F".to_owned()));
+        assert!(args.contains(&"*S-1-5-32-545:R".to_owned()));
+        // Never the localized name -- that would fail on non-English Windows.
+        assert!(!args.iter().any(|a| a == "Users:R"));
+    }
+
+    #[test]
+    fn data_dir_acl_grants_owner_read_execute_alongside_system_and_administrators() {
+        let args = data_dir_acl_args("DOMAIN\\alice");
+        assert!(args.contains(&"SYSTEM:(OI)(CI)F".to_owned()));
+        assert!(args.contains(&"Administrators:(OI)(CI)F".to_owned()));
+        assert!(args.contains(&"DOMAIN\\alice:RX".to_owned()));
     }
 }

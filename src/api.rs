@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::app::App;
 use crate::audio::decode_wav;
-use crate::auth::authorized;
+use crate::auth::{authorize, authorized, AccessLevel};
 use crate::capabilities::catalog_mismatch;
 use crate::catalog::{capability_matrix, catalog_model, model_view};
 use crate::download::install_model;
@@ -332,7 +332,7 @@ pub async fn readiness(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
 ) -> ApiResult<impl IntoResponse> {
-    authorized(&headers, &app)?;
+    authorize(&headers, &app, AccessLevel::User)?;
     let loaded = app.loaded.lock().map_err(internal)?;
     match loaded.as_ref() {
         Some(active) => Ok((
@@ -353,7 +353,7 @@ pub async fn system_info(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    authorized(&headers, &app)?;
+    authorize(&headers, &app, AccessLevel::User)?;
     let snapshot = tokio::task::spawn_blocking(crate::sysinfo::probe)
         .await
         .map_err(internal)?;
@@ -370,7 +370,7 @@ pub async fn recommendations(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    authorized(&headers, &app)?;
+    authorize(&headers, &app, AccessLevel::User)?;
     let mut models: Vec<_> = app
         .catalog
         .iter()
@@ -459,7 +459,7 @@ pub async fn local_models(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    authorized(&headers, &app)?;
+    authorize(&headers, &app, AccessLevel::User)?;
     let mut data = app
         .catalog
         .iter()
@@ -492,7 +492,7 @@ pub async fn openai_models(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    authorized(&headers, &app)?;
+    authorize(&headers, &app, AccessLevel::User)?;
     let mut data = Vec::new();
     for model in &app.catalog {
         if installed_path(&app, &model.slug)?.is_some() {
@@ -526,7 +526,7 @@ pub async fn selected_model(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    authorized(&headers, &app)?;
+    authorize(&headers, &app, AccessLevel::User)?;
     let Some(id) = selected_id(&app)? else {
         return Ok(Json(json!({"model":null, "effective_capabilities":null})));
     };
@@ -860,7 +860,7 @@ async fn transcribe_or_translate(
     multipart: Multipart,
     endpoint: Endpoint,
 ) -> ApiResult<Response> {
-    authorized(&headers, &app)?;
+    authorize(&headers, &app, AccessLevel::User)?;
     let fields = parse_transcription_multipart(multipart).await?;
 
     // Decode/validate happens before joining the queue; only the actual
@@ -2156,6 +2156,181 @@ mod router_tests {
         let (stored_host, stored_port) = crate::store::bind_settings(&app).unwrap();
         assert_eq!(stored_host.as_deref(), Some("0.0.0.0"));
         assert_eq!(stored_port, Some(54402));
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    /// Route classification for the "Access levels on a shared server" goal
+    /// (see `docs/client-contract.md`'s route table). Each entry is
+    /// (method, path, body) for a route that must be reachable with the
+    /// user token; junk ids are fine since `authorize` runs before any
+    /// business logic touches them.
+    fn user_routes() -> Vec<(&'static str, &'static str, Option<&'static str>)> {
+        vec![
+            ("GET", "/readiness", None),
+            ("GET", "/v1/models", None),
+            ("GET", "/v1/local/models", None),
+            ("GET", "/v1/local/models/selected", None),
+            ("GET", "/v1/local/system", None),
+            ("GET", "/v1/local/recommendations", None),
+            ("GET", "/v1/local/operations/not-a-real-id", None),
+        ]
+    }
+
+    /// Admin-only routes: install, import, verify, cancel, select, unload,
+    /// remove, refresh drop-in, PATCH config, shutdown. `import` needs a
+    /// well-formed (if empty) multipart body or axum's extractor rejects the
+    /// request before `authorize` ever runs.
+    fn admin_routes() -> Vec<(&'static str, &'static str, Option<&'static str>)> {
+        vec![
+            ("GET", "/v1/local/config", None),
+            ("PATCH", "/v1/local/config", Some(r#"{}"#)),
+            ("POST", "/v1/local/models/refresh", None),
+            ("DELETE", "/v1/local/models/selected", None),
+            ("POST", "/v1/local/models/not-a-real-id/select", None),
+            ("POST", "/v1/local/models/not-a-real-id/load", None),
+            ("DELETE", "/v1/local/models/not-a-real-id", None),
+            ("POST", "/v1/local/models/not-a-real-id/install", None),
+            ("POST", "/v1/local/models/not-a-real-id/verify", None),
+            ("POST", "/v1/local/operations/not-a-real-id/cancel", None),
+        ]
+    }
+
+    fn build_request(
+        method: &str,
+        path: &str,
+        body: Option<&'static str>,
+        token: &str,
+    ) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", format!("Bearer {token}"));
+        if body.is_some() {
+            builder = builder.header("content-type", "application/json");
+        }
+        builder
+            .body(body.map(Body::from).unwrap_or_else(Body::empty))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn user_token_is_allowed_on_every_user_route() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let user_token = app.user_token.clone();
+        for (method, route_path, body) in user_routes() {
+            let router = router(app.clone());
+            let request = build_request(method, route_path, body, &user_token);
+            let response = router.oneshot(request).await.unwrap();
+            assert_ne!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {route_path} should accept the user token"
+            );
+            assert_ne!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "{method} {route_path} should accept the user token"
+            );
+        }
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn user_token_is_forbidden_with_admin_required_on_every_admin_route() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let user_token = app.user_token.clone();
+        for (method, route_path, body) in admin_routes() {
+            let router = router(app.clone());
+            let request = build_request(method, route_path, body, &user_token);
+            let response = router.oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "{method} {route_path} should reject the user token with 403"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json_body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                json_body["error"]["code"], "admin_required",
+                "{method} {route_path} should report admin_required"
+            );
+        }
+
+        // The shutdown endpoint is loopback-gated ahead of auth, so it needs
+        // its own request with peer info.
+        let shutdown_router = router(app.clone());
+        let request = with_peer(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/local/shutdown")
+                .header("authorization", format!("Bearer {user_token}"))
+                .body(Body::empty())
+                .unwrap(),
+            loopback_peer(),
+        );
+        let response = shutdown_router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json_body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json_body["error"]["code"], "admin_required");
+
+        // Import needs a syntactically valid (if empty) multipart body.
+        let import_router = router(app.clone());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/local/models/import")
+            .header("authorization", format!("Bearer {user_token}"))
+            .header("content-type", "multipart/form-data; boundary=X")
+            .body(Body::from("--X--\r\n"))
+            .unwrap();
+        let response = import_router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn admin_token_is_allowed_on_every_route_user_and_admin() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let admin_token = app.token.clone();
+        for (method, route_path, body) in
+            user_routes().into_iter().chain(admin_routes().into_iter())
+        {
+            let router = router(app.clone());
+            let request = build_request(method, route_path, body, &admin_token);
+            let response = router.oneshot(request).await.unwrap();
+            assert_ne!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {route_path} should accept the admin token"
+            );
+            assert_ne!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "{method} {route_path} should accept the admin token"
+            );
+        }
+        // `refresh` (and possibly other admin routes above) spawns a
+        // background `tokio::spawn` task that touches the data dir; give it
+        // a moment to finish before deleting the dir, or Windows can refuse
+        // the delete with "used by another process" (see
+        // `refresh_returns_202_and_the_operation_completes` for the same
+        // pattern, polled instead of slept there because it asserts on the
+        // outcome; here we only need it to be done, not what it did).
+        tokio::time::sleep(Duration::from_millis(100)).await;
         drop(app);
         std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
     }

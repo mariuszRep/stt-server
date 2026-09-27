@@ -119,9 +119,37 @@ where to drop files should read `GET /v1/local/config`'s
 
 ## 3. Auth, CORS, LAN mode
 
-- **Auth header:** `Authorization: Bearer <token>` from `auth.token`. Every
-  route except `GET /health` requires it (`src/auth.rs::authorized`); a
-  missing/wrong token is `401 {"error": {"code": "unauthorized", ...}}`.
+- **Auth header:** `Authorization: Bearer <token>`. Every route except
+  `GET /health` requires it (`src/auth.rs::authorize`); a missing/wrong
+  token (one that matches neither token file below) is
+  `401 {"error": {"code": "unauthorized", ...}}`.
+- **Two tokens, two access levels** (see the "Access levels on a shared
+  server" goal): `<data dir>\auth.token` is the **admin token** and works on
+  every route; `<data dir>\user.token` is the **user token** and works only
+  on the user-level routes in the table below. Both exist for every install
+  (per-user and machine-wide) for uniformity, though a per-user install's
+  owner has full access via `auth.token` regardless. On a machine-wide
+  install the files carry different ACLs (`src/service.rs::install`):
+  `auth.token` is readable only by `SYSTEM`/`Administrators`; `user.token`
+  is additionally readable by the well-known local `Users` group SID
+  (`*S-1-5-32-545`, so this works on non-English Windows), i.e. every local
+  account on the machine. A valid user token used on an admin-only route is
+  `403 {"error": {"code": "admin_required", ...}}` -- distinct from a
+  missing/invalid token, which stays `401 unauthorized`.
+- **Route classification:**
+
+  | Level | Routes |
+  |---|---|
+  | Unauthenticated | `GET /health` |
+  | User (admin token also works) | `GET /readiness`, `GET /v1/models`, `GET /v1/local/models`, `GET /v1/local/models/selected`, `GET /v1/local/system`, `GET /v1/local/recommendations`, `GET /v1/local/operations/{id}`, `POST /v1/audio/transcriptions`, `POST /v1/audio/translations` |
+  | Admin only | `GET`/`PATCH /v1/local/config`, `POST /v1/local/models/{id}/install`, `POST /v1/local/models/{id}/verify`, `POST /v1/local/models/{id}/select` (and `/load`), `DELETE /v1/local/models/selected` (unload), `DELETE /v1/local/models/{id}` (remove), `POST /v1/local/models/refresh` (drop-in refresh), `POST /v1/local/models/import`, `POST /v1/local/operations/{id}/cancel`, `POST /v1/local/shutdown` |
+
+  The CLI (`stt-server-next models ...`, `status`, `stop`, `update`, ...)
+  reads `auth.token` when it can, falling back to `user.token` only when
+  `auth.token` can't be read (`src/model_cli.rs::read_token` -- the case of
+  an ordinary local user on a machine-wide install). A command that then
+  hits an admin-only route gets the server's `403 admin_required` and prints
+  "admin access required (run as administrator)", exiting non-zero.
 - **CORS:** `GET /v1/local/config`'s `cors_allowed_origins` (default `["*"]`)
   controls `Access-Control-Allow-Origin`; set via `PATCH /v1/local/config`.
   An origin must be `*` or an exact `http(s)://host[:port]` (no path/query/
@@ -329,7 +357,7 @@ source (`src/api.rs`, `src/audio.rs`, `src/auth.rs`, `src/catalog.rs`,
 |---|---|
 | 400 | `missing_file`, `missing_model`, `duplicate_field`, `unexpected_field`, `invalid_multipart`, `invalid_body`, `invalid_audio`, `unsupported_audio`, `audio_too_short`, `invalid_temperature`, `invalid_bind_host`, `invalid_bind_port`, `invalid_cors_origins`, `invalid_queue_max_waiting`, `invalid_queue_wait_timeout_ms`, `invalid_inference_timeout_ms`, `invalid_user_models_dir`, `invalid_model`, `invalid_quant`, `invalid_backend` |
 | 401 | `unauthorized` |
-| 403 | `loopback_only` (`/v1/local/shutdown` from a non-loopback caller) |
+| 403 | `loopback_only` (`/v1/local/shutdown` from a non-loopback caller), `admin_required` (a valid user token used on an admin-only route -- see section 3) |
 | 404 | `model_not_found`, `operation_not_found`, `model_not_installed` (verify, and remove of a never-installed id) |
 | 409 | `already_installed`, `operation_conflict`, `operation_finished` (cancelling a terminal operation), `model_in_use` (removing the selected model), `model_not_installed` (select, before install), **`needs_verification`** (select, before verify/refresh -- see 4), `model_load_failed`, `model_not_active` (a transcription request while nothing is loaded but the server is otherwise ready), `unowned_model_path` (refusing to remove a file outside the managed store) |
 | 413 | `audio_too_long` (payload too large) |

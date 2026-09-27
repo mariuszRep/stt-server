@@ -133,3 +133,38 @@ Tailscale; version reporting and model import.
 2026-09-27: Real service rehearsal on the dev laptop (user-run, admin). Passed: machine-wide install from the release build, status/health, whisper-tiny install with progress, select, transcription on Vulkan, Restart-Service, forced kill recovered by the SCM with a new PID and the model reloaded, uninstall removed the service and kept models. Bugs found and fixed: (1) SCM start timed out because the service was registered with bare "service", which the CLI rejected; now registers "service run" and accepts bare "service". (2) Install created the new data folder before migrating, leaving old "STT Server Next" folders; migration now runs first and the old program folder is removed. (3) Uninstall from the installed copy failed with Access denied deleting its own running exe; the program folder is now removed after exit. Fixes 2 and 3 need one more real install/uninstall pass. Transcription speed under the service (8.5 s for 8.9 s audio, whisper-tiny on Vulkan) to be rechecked after the catalog sweep releases the GPU.
 
 2026-09-27: Service re-rehearsal after fixes (user-run): old folders migrated/removed, reinstall kept whisper-tiny and came back ready, uninstall ran without errors, service removed, models kept, program files deleted. Remaining cosmetic issue: an empty program folder was left behind (contents removed); recheck on the clean VM.
+
+2026-09-27: "Access levels on a shared server" slice implemented. Two tokens now exist per data
+folder: `auth.token` (admin, unchanged path/name) and a new `user.token`, both created the same
+way (`app::token_file`/`app::user_token_file`, sharing one `token_file_named` generator). Every
+route is classified in `src/auth.rs` (`AccessLevel::User`/`Admin`, checked by `authorize`;
+`authorized` is now `authorize(.., Admin)`, kept for the many still-admin call sites). User-level:
+`/health` (unauthenticated), `readiness`, `v1/models`, `v1/local/models`, `.../selected` (GET),
+`v1/local/system`, `v1/local/recommendations`, `v1/local/operations/{id}` (GET), transcriptions/
+translations. Everything else (config GET/PATCH, install/verify/select/unload/remove/refresh/
+import, operation cancel, shutdown) stays admin-only. A valid user token on an admin route is
+`403 {"code":"admin_required"}`, distinct from `401 unauthorized` for a missing/wrong token; the
+`/v1/local/shutdown` loopback-only check still runs first, unchanged. `service.rs::install`'s
+ACLs changed to match the approved design: `auth.token` dropped the installing user's standing
+read grant (SYSTEM/Administrators only now), and the new `user.token` is granted to the built-in
+Users group by well-known SID (`*S-1-5-32-545`, not the localized name) alongside SYSTEM/
+Administrators -- the ACL rule lists are pulled into `admin_token_acl_args`/`user_token_acl_args`/
+`data_dir_acl_args` so they're unit-testable without touching real ACLs. `model_cli::connect`
+(`src/model_cli.rs::read_token`) now prefers `auth.token`, falling back to `user.token` only when
+`auth.token` can't be read; `format_error` gained an `admin_required` hint ("admin access
+required (run as administrator)"), and any command hitting it already exits non-zero via the
+existing generic error path. Updated `README.md` ("Two tokens, two access levels") and
+`docs/client-contract.md` (section 3: token/ACL description, full route-classification table,
+`admin_required` added to the 403 row of the error table). Tests added: `src/api.rs` router tests
+iterating the full user/admin route lists with both tokens (`user_token_is_allowed_on_every_user_
+route`, `user_token_is_forbidden_with_admin_required_on_every_admin_route` incl. shutdown/import's
+multipart-body edge cases, `admin_token_is_allowed_on_every_route_user_and_admin`); `src/app.rs`
+(`user_token_file_creates_a_distinct_stable_token`, `open_app_populates_both_admin_and_user_
+tokens`); `src/service.rs` (three tests on the extracted ACL-arg-list functions, no real icacls
+run); `src/model_cli.rs` (three `read_token` fallback/error tests). Gates: `cargo fmt --check`
+clean, `cargo clippy --all-targets -- -D warnings` clean, `cargo test` 228 lib + 11 bin passed
+(239 total; one transient Windows file-lock failure in the new admin-token router test was fixed
+by giving `refresh`'s background `tokio::spawn` task a moment to finish before the test deletes
+its data dir, matching the existing `refresh_returns_202_and_the_operation_completes` pattern).
+Not committed per instruction. Remaining slices: network modes including Tailscale; version
+reporting and model import.

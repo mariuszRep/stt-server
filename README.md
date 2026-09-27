@@ -255,8 +255,17 @@ failure without forcibly terminating any process.
 `0.0.0.0`/`::` or a specific LAN IP -- logs a warning that the server is reachable from the
 network and requires a usable bearer token (fails closed if the token file can't be read/created).
 `/health` stays unauthenticated; every other route, including the new shutdown endpoint, still
-requires the token. The shutdown endpoint additionally only accepts callers connecting from a
+requires a token. The shutdown endpoint additionally only accepts callers connecting from a
 loopback address, regardless of token, even when the server itself is bound to a LAN address.
+
+**Two tokens, two access levels**: `<data dir>\auth.token` is the admin token (full access to
+every route); `<data dir>\user.token` is a user token that only reaches the read-only/transcribe
+routes (see `docs/client-contract.md` section 3 for the full route table) -- a valid user token
+on an admin-only route gets `403 admin_required`, not `401`. Both files exist for every install,
+but only a machine-wide (service) install gives them different ACLs: `auth.token` is readable
+only by `SYSTEM`/Administrators, `user.token` is additionally readable by every local user of the
+machine (the well-known Users-group SID, so this also works on non-English Windows). The CLI
+prefers `auth.token`, falling back to `user.token` only when `auth.token` can't be read.
 
 **Autostart**: `enable` writes a per-user (no admin) `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
 value named `OpenVibeSttServer` set to `"<exe path>" start --data-dir "<data dir>"` (plus any
