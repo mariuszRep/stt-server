@@ -16,6 +16,7 @@ pub mod format;
 pub mod gguf_probe;
 pub mod import;
 pub mod model_cli;
+pub mod network;
 pub mod operations;
 pub mod queue;
 pub mod run_plan;

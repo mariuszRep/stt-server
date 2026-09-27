@@ -160,6 +160,66 @@ where to drop files should read `GET /v1/local/config`'s
   (`api::run_http_full`'s LAN guard) and prints a warning that every route
   except `/health` now requires the token. A client offering LAN mode should
   surface that same warning and never disable the token for a LAN bind.
+
+### 3.1 Network modes (`crate::network`)
+
+A higher-level, simpler alternative to the advanced `--host` override above:
+a `network_mode` setting (`local` | `lan` | `tailscale`, default `local`),
+settable via `PATCH /v1/local/config` (admin only) or the CLI
+`--network local|lan|tailscale` flag on `run`/`start`/`restart`/`autostart
+enable`. Precedence: CLI flag > stored setting > default `local`. **An
+explicit `--host` (or a stored `bind_host`, the older phase-1a setting)
+always wins over `network_mode` entirely** -- when either is present the
+server binds exactly that host/port as before, and `/health`'s `network`
+object reports `mode: "custom"` (see 7a below) instead of resolving
+`network_mode` at all.
+
+- **`local` (default):** binds `127.0.0.1` only, same as before this
+  setting existed.
+- **`lan`:** binds every interface (`0.0.0.0`), but a non-loopback request
+  (everything except `GET /health`) is only actually served while Windows
+  currently reports **every** active network connection profile as
+  `Private` or `DomainAuthenticated` -- detected via
+  `(Get-NetConnectionProfile).NetworkCategory` in a short-lived PowerShell
+  subprocess, bounded by a 5s timeout so a hung subprocess can never hang
+  startup or a recheck. Any `Public` profile in the mix, no active profile
+  at all, or a detection failure/timeout all fall back to local-only the
+  same way. Rechecked every 30s while serving (`network::RECHECK_INTERVAL`),
+  so plugging into (or leaving) a trusted network takes effect without a
+  restart. A rejected non-loopback caller gets
+  `403 {"error":{"code":"network_not_private", ...}}`.
+- **`tailscale`:** also binds every interface, but a non-loopback request is
+  only served while (a) this PC's own Tailscale IPv4 address is currently
+  detected (`tailscale ip -4`, parsed for a `100.64.0.0/10` CGNAT address,
+  same 5s-bounded subprocess pattern) **and** (b) the caller's own source
+  address is itself a `100.64.0.0/10` address. (b) is what actually
+  restricts reachability to the tailnet without a second listener or
+  rebinding sockets as the Tailscale interface comes and goes: a connection
+  that arrives over the Tailscale virtual network interface carries the
+  *caller's* Tailscale address as its source address (WireGuard point-to-
+  point tunnel), so a peer connecting from plain Wi-Fi/Ethernet -- even
+  directly at the machine's own Tailscale-mode listener -- never has a
+  `100.64.0.0/10` source address and is rejected the same as any other LAN
+  caller. If Tailscale isn't running or has no address, or the peer's
+  address isn't in range, the request is rejected with
+  `403 network_not_private`; the server itself still falls back to
+  local-only reporting on `/health`. Also rechecked every 30s.
+- **Why bind-all-and-reject rather than bind only the target address(es):**
+  binding exactly the LAN/Tailscale-assigned address would need the
+  listening socket rebuilt every time Windows' network category or the
+  Tailscale interface changes -- fragile (drops in-flight connections,
+  races) and, since `axum::serve` owns one `TcpListener`, would require a
+  second concurrent listener plus a shutdown signal shared across both. The
+  chosen mechanism (bind once, gate every non-loopback request against a
+  live-refreshed report) is simpler, cannot leave the process wedged
+  half-rebound, and is exactly as secure: the peer-address check for
+  `tailscale` mode is equivalent to having bound only that interface, and
+  `lan` mode's threat model (an untrusted device on a Public network) is
+  fully covered by rejecting the request rather than never accepting the
+  connection.
+- A CLI/API caller cannot force `lan`/`tailscale` to actually reach a device
+  without the token: the existing LAN-guard rule (token required beyond
+  `/health` for any non-loopback bind) is unchanged and still enforced first.
 - **CORS default reviewed (2026-09-26):** `*` is kept as the default. It is
   safe against the LAN threat this server actually faces -- auth is a bearer
   header the browser can't attach on its own and a web page has no way to
@@ -425,9 +485,9 @@ source (`src/api.rs`, `src/audio.rs`, `src/auth.rs`, `src/catalog.rs`,
 
 | Status | Codes |
 |---|---|
-| 400 | `missing_file`, `missing_model`, `duplicate_field`, `unexpected_field`, `invalid_multipart`, `invalid_body`, `invalid_audio`, `unsupported_audio`, `audio_too_short`, `invalid_temperature`, `invalid_bind_host`, `invalid_bind_port`, `invalid_cors_origins`, `invalid_queue_max_waiting`, `invalid_queue_wait_timeout_ms`, `invalid_inference_timeout_ms`, `invalid_user_models_dir`, `invalid_model`, `invalid_quant`, `invalid_backend` |
+| 400 | `missing_file`, `missing_model`, `duplicate_field`, `unexpected_field`, `invalid_multipart`, `invalid_body`, `invalid_audio`, `unsupported_audio`, `audio_too_short`, `invalid_temperature`, `invalid_bind_host`, `invalid_bind_port`, `invalid_network_mode`, `invalid_cors_origins`, `invalid_queue_max_waiting`, `invalid_queue_wait_timeout_ms`, `invalid_inference_timeout_ms`, `invalid_user_models_dir`, `invalid_model`, `invalid_quant`, `invalid_backend` |
 | 401 | `unauthorized` |
-| 403 | `loopback_only` (`/v1/local/shutdown` from a non-loopback caller), `admin_required` (a valid user token used on an admin-only route -- see section 3) |
+| 403 | `loopback_only` (`/v1/local/shutdown` from a non-loopback caller), `admin_required` (a valid user token used on an admin-only route -- see section 3), `network_not_private` (a non-loopback caller under `network_mode: "lan"`/`"tailscale"` while the live check doesn't currently allow it -- see 3.1) |
 | 404 | `model_not_found`, `operation_not_found`, `model_not_installed` (verify, and remove of a never-installed id) |
 | 409 | `already_installed`, `operation_conflict`, `operation_finished` (cancelling a terminal operation), `model_in_use` (removing the selected model), `model_not_installed` (select, before install), **`needs_verification`** (select, before verify/refresh -- see 4), `model_load_failed`, `model_not_active` (a transcription request while nothing is loaded but the server is otherwise ready), `unowned_model_path` (refusing to remove a file outside the managed store) |
 | 413 | `audio_too_long` (payload too large) |
@@ -456,10 +516,23 @@ on the initiating response.
 A client's health/status card should combine, all authenticated except the
 first:
 
-- `GET /health` -- liveness only, `{"status": "ok", "service":
-  "stt-server-next"}`, no token needed. `start`/`status` (1.2) check the
-  `service` field, not just the 200 status, so an unrelated program answering
-  on the configured port is never mistaken for this server.
+- `GET /health` -- liveness only, no token needed:
+  ```json
+  { "status": "ok", "service": "stt-server-next",
+    "network": { "mode": "lan", "effective": "local",
+                 "reason": "no active network connection is Private or Domain -- staying local-only" } }
+  ```
+  `start`/`status` (1.2) check the `service` field, not just the 200 status,
+  so an unrelated program answering on the configured port is never mistaken
+  for this server. `network.mode` is the resolved setting (`"local"` |
+  `"lan"` | `"tailscale"`, or `"custom"` when an explicit `--host`/stored
+  `bind_host` override is in play); `network.effective` is what's actually
+  in effect right now, which can differ from `mode` when a `lan`/`tailscale`
+  server has fallen back to local-only (see 3.1) -- `reason` is then present
+  explaining why, and `addresses` (only present when non-empty) lists the
+  non-loopback address(es) actually reachable, never the token. A client's
+  network-mode UI should read this object rather than infer reachability
+  from `mode` alone.
 - `GET /readiness` -- `200 {"status": "ready", "model": id, "backend":
   {...}}` when a model is loaded, else `503 {"status": "not_ready",
   "reason": "..."}`.

@@ -168,3 +168,60 @@ by giving `refresh`'s background `tokio::spawn` task a moment to finish before t
 its data dir, matching the existing `refresh_returns_202_and_the_operation_completes` pattern).
 Not committed per instruction. Remaining slices: network modes including Tailscale; version
 reporting and model import.
+
+2026-09-27: "Network modes" slice implemented in new `src/network.rs` plus glue in
+`src/app.rs`/`src/api.rs`/`src/cli.rs`/`src/bin/server.rs`. A `network_mode` setting
+(`local`/`lan`/`tailscale`, default `local`) is settable via `PATCH /v1/local/config` (admin) or
+CLI `--network` on `run`/`start`/`restart`/`autostart enable` (CLI > stored setting > default); an
+existing explicit `--host` (or a previously-stored `bind_host`) still wins over it entirely and is
+now reported as network mode `"custom"`. `local` forces a loopback-only bind, as before.
+
+Enforcement design (the "LAN guard" question): both `lan` and `tailscale` bind every interface
+(`0.0.0.0`) once, rather than rebinding sockets as Windows' network category or the Tailscale
+interface changes -- rebinding would need a second concurrent listener plus a shutdown signal
+shared across both (`axum::serve` owns one `TcpListener`) and risks dropping in-flight connections
+mid-transition. Instead a `network_gate` middleware (attached only in `run_http_full`'s serving
+router, not the shared test `router()`, so it never touches `ConnectInfo`-less unit tests) rejects
+every non-loopback, non-`/health` request with `403 network_not_private` unless a live
+`NetworkReport` (in `App.network_state`, an `RwLock`, refreshed at startup and every 30s by a
+background task) currently says the mode is active: for `lan`, every active Windows connection
+profile is Private/DomainAuthenticated (`(Get-NetConnectionProfile).NetworkCategory` via a
+PowerShell subprocess, 5s timeout, polled with `try_wait` so a hung subprocess is killed rather
+than hanging startup/recheck); for `tailscale`, this PC has a detected Tailscale IPv4
+(`tailscale ip -4`, same subprocess pattern, parsed for a `100.64.0.0/10` CGNAT address) *and* the
+calling peer's own source address is itself in that CGNAT range -- a connection arriving over the
+Tailscale virtual interface always carries the caller's own Tailscale address as its source
+address, so this peer-address check is equivalent to having bound only the Tailscale interface,
+without a second listener. Detection failure/timeout/no-active-profile all fall back to
+local-only the same way a Public profile does. `/health` (still unauthenticated) gained a
+`network: {mode, effective, reason?, addresses?}` object so a client can show the real state
+without guessing; addresses never include the token.
+
+Real checks on this laptop (temp `--data-dir`, spare ports, `curl`/`Invoke-RestMethod
+/health`, stopped afterward): `--network lan` on port 54471 reported
+`{"mode":"lan","effective":"lan"}` (this laptop's active network profile is genuinely Private);
+`--network tailscale` on port 54472 reported
+`{"mode":"tailscale","effective":"tailscale","addresses":["100.125.201.68"]}`, matching this
+laptop's real `tailscale ip -4` output (Tailscale is installed and running here). Both processes
+were stopped and their temp data dirs removed after the check.
+
+Tests added: `src/network.rs` (pure, no real subprocess/network calls) covers mode
+parse/precedence, `Get-NetConnectionProfile`-output parsing for a single Private/Public/
+DomainAuthenticated profile, mixed profiles (any Public -> not private; Private+DomainAuthenticated
+-> private), no/blank/unrecognized lines, `tailscale ip -4`-output parsing (CGNAT line picked out
+of extra non-CGNAT lines, boundary octets of `100.64.0.0/10`), the `peer_allowed_non_loopback`
+decision for all four cases (custom/local/lan/tailscale, including a tailscale-mode peer whose own
+address is a plain LAN address being rejected even while the server's own Tailscale address is up),
+and `NetworkReport::to_json` field omission. `src/cli.rs`: `--network` parses all three values and
+rejects an invalid one. `src/app.rs`: mode/custom resolution (default local, explicit `--host` wins
+over a `--network` override, a previously-stored `bind_host` also counts as custom). `src/api.rs`:
+`/health`'s `network` object for default (local) and custom-host cases; `network_gate` behaviour
+(health always open, loopback always allowed, LAN peer rejected under `local`/allowed once the
+live report says `lan`, a custom-host bind allows any peer); `PATCH`/`GET /v1/local/config`
+round-trip and rejection of an invalid `network_mode`. Gates: `cargo fmt --check` clean, `cargo
+clippy --all-targets -- -D warnings` clean, `cargo test` 266 lib + 11 bin passed (277 total).
+Updated `README.md` (new "Network modes" paragraph, `--network` flag, advanced-override note) and
+`docs/client-contract.md` (new "3.1 Network modes" section with the enforcement-design
+justification, `network_not_private`/`invalid_network_mode` added to the error table, `/health`'s
+`network` object documented in section 7). Not committed per instruction. Remaining slices: version
+reporting and model import.

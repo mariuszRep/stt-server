@@ -211,7 +211,8 @@ stt-server-next update install [--yes] [--json] [--data-dir <path>]
 ```
 
 `run`/`start`/`restart`/`autostart enable` share: `--port <n>` (default 54321), `--host <addr>`
-(default `127.0.0.1`), `--data-dir <path>`, plus the existing `--queue-max-waiting`,
+(default `127.0.0.1`), `--network <local|lan|tailscale>` (default `local`, or the stored
+`network_mode` setting), `--data-dir <path>`, plus the existing `--queue-max-waiting`,
 `--queue-wait-timeout-ms`, `--inference-timeout-ms`. The top-level `install`/`uninstall`
 spellings and bare `service` (no subcommand vs. `service run`) keep working as aliases for
 `service install`/`service uninstall`/`service run`.
@@ -219,8 +220,26 @@ spellings and bare `service` (no subcommand vs. `service run`) keep working as a
 **Bind precedence**: `--port`/`--host` (CLI flag) > the stored `bind_host`/`bind_port` settings
 (readable/settable via `GET`/`PATCH /v1/local/config`; a bind change reports
 `restart_required: true` and takes effect on the next start) > the hard default
-`127.0.0.1:54321`. `--data-dir` overrides `STT_NEXT_DATA_DIR` and the `%LOCALAPPDATA%`-based
-default the same way.
+`127.0.0.1:54321`. An explicit `--host` (or a stored `bind_host`) is an *advanced override* that
+always wins over `--network`/the stored `network_mode` setting entirely; `/health` then reports
+network mode `"custom"` instead of `local`/`lan`/`tailscale`. `--data-dir` overrides
+`STT_NEXT_DATA_DIR` and the `%LOCALAPPDATA%`-based default the same way.
+
+**Network modes** (used instead of `--host` by anyone who doesn't need the advanced override):
+`--network local` (default) binds loopback only. `--network lan` binds every interface but only
+actually accepts a non-loopback caller while Windows reports every active network connection
+profile as Private or DomainAuthenticated (`Get-NetConnectionProfile`); a Public profile, a mixed
+set, or a detection failure/timeout rejects non-loopback callers with `403 network_not_private`
+and falls back to local-only, rechecked every 30s so moving onto (or off) a trusted network takes
+effect without a restart. `--network tailscale` binds every interface but only accepts a
+non-loopback caller that is itself reachable from a genuine Tailscale address
+(`100.64.0.0/10`) while this PC's own Tailscale IPv4 address (`tailscale ip -4`) is detected;
+otherwise it also falls back to local-only, rechecked the same way. Both modes bind all
+interfaces up front rather than rebinding sockets as the network changes -- see
+`docs/client-contract.md`'s "Network modes" section for why that's the chosen, more robust
+mechanism, and for exactly what each mode's `/health` report looks like. `network_mode` is also
+settable via `PATCH /v1/local/config` (admin only; takes effect on the next start, like
+`bind_host`/`bind_port`).
 
 **Single instance and discovery**: on startup the server writes `<data dir>\server.json`
 (`{pid, host, port, version, started_at}`, atomically) and holds an exclusive

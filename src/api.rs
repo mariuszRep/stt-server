@@ -44,10 +44,12 @@ pub async fn get_config(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiR
         crate::app::default_user_models_dir().map(|path| path.to_string_lossy().into_owned())
     });
     let (stored_bind_host, stored_bind_port) = crate::store::bind_settings(&app)?;
+    let stored_network_mode = crate::store::network_mode_setting(&app)?;
     Ok(Json(json!({
         "bind": format!("{}:{}", app.bind_host, app.bind_port),
         "bind_host": stored_bind_host,
         "bind_port": stored_bind_port,
+        "network_mode": stored_network_mode.map(|mode| mode.as_str()),
         "preferred_backend":backend_preference(&app)?,
         "max_audio_bytes":40 * 1024 * 1024,
         "streaming":false,
@@ -91,6 +93,10 @@ pub struct ConfigPatch {
     /// start; a running process keeps its current bind.
     bind_host: Option<String>,
     bind_port: Option<i64>,
+    /// "Network modes": `local` | `lan` | `tailscale`. Takes effect on the
+    /// next server start; ignored by a process already running with an
+    /// explicit `--host`/stored `bind_host` override (see `crate::network`).
+    network_mode: Option<String>,
 }
 
 pub async fn patch_config(
@@ -194,6 +200,15 @@ pub async fn patch_config(
             ));
         }
     }
+    if let Some(mode) = &patch.network_mode {
+        if crate::network::NetworkMode::parse(mode).is_none() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_network_mode",
+                "network_mode must be 'local', 'lan', or 'tailscale'",
+            ));
+        }
+    }
     {
         let db = app.db.lock().map_err(internal)?;
         if let Some(backend) = &patch.preferred_backend {
@@ -239,6 +254,15 @@ pub async fn patch_config(
             )
             .map_err(internal)?;
             response.insert("bind_port".to_owned(), json!(port));
+            restart_required = true;
+        }
+        if let Some(mode) = &patch.network_mode {
+            db.execute(
+                "INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![crate::store::SETTING_NETWORK_MODE, mode],
+            )
+            .map_err(internal)?;
+            response.insert("network_mode".to_owned(), json!(mode));
             restart_required = true;
         }
         for (key, value, response_key) in [
@@ -324,8 +348,13 @@ fn cors_layer(origins: &[String]) -> CorsLayer {
 /// check, not just a successful status code.
 pub const SERVICE_ID: &str = "stt-server-next";
 
-pub async fn health() -> Json<Value> {
-    Json(json!({"status": "ok", "service": SERVICE_ID}))
+pub async fn health(State(app): State<Arc<App>>) -> Json<Value> {
+    let network = app
+        .network_state
+        .read()
+        .map(|state| state.to_json())
+        .unwrap_or_else(|_| json!({"mode": app.network_mode.as_str(), "effective": "local"}));
+    Json(json!({"status": "ok", "service": SERVICE_ID, "network": network}))
 }
 
 pub async fn readiness(
@@ -1157,6 +1186,7 @@ pub async fn run_http_with_overrides(
         crate::app::data_dir(),
         cli_overrides,
         crate::app::BindOverrides::default(),
+        None,
         crate::app::install_scope(),
         shutdown,
     )
@@ -1203,6 +1233,7 @@ pub async fn run_http_full(
     data_dir: std::path::PathBuf,
     cli_overrides: crate::app::RuntimeLimits,
     bind_overrides: crate::app::BindOverrides,
+    network_override: Option<crate::network::NetworkMode>,
     scope: crate::app::InstallScope,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), ServeError> {
@@ -1211,9 +1242,47 @@ pub async fn run_http_full(
     let _lock =
         crate::discovery::acquire_lock(&data_dir).map_err(|_| ServeError::AlreadyRunning)?;
 
-    let mut app =
-        crate::app::open_app_at_full(data_dir.clone(), cli_overrides, bind_overrides.clone())
-            .map_err(ServeError::Other)?;
+    let mut app = crate::app::open_app_at_full(
+        data_dir.clone(),
+        cli_overrides,
+        bind_overrides.clone(),
+        network_override,
+    )
+    .map_err(ServeError::Other)?;
+
+    // "Network modes" (see `crate::network`): an explicit `--host`/stored
+    // `bind_host` override always wins and is left exactly as
+    // `open_app_at_full` resolved it (`network_custom` is already true and
+    // `network_state` already reports mode "custom"). Otherwise the resolved
+    // `network_mode` decides the actual bind host: `local` forces loopback,
+    // `lan`/`tailscale` both bind every interface and rely on the
+    // `network_gate` middleware plus live detection to decide, per request,
+    // whether a non-loopback caller is currently allowed (see
+    // `crate::network::peer_allowed_non_loopback` for why this -- rather
+    // than dynamically rebinding sockets as the network changes -- is the
+    // chosen enforcement mechanism).
+    if !app.network_custom {
+        let forced_host = match app.network_mode {
+            crate::network::NetworkMode::Local => crate::app::DEFAULT_BIND_HOST.to_owned(),
+            crate::network::NetworkMode::Lan | crate::network::NetworkMode::Tailscale => {
+                "0.0.0.0".to_owned()
+            }
+        };
+        Arc::get_mut(&mut app)
+            .expect("no other Arc<App> clone exists yet")
+            .bind_host = forced_host;
+        if !matches!(app.network_mode, crate::network::NetworkMode::Local) {
+            // Resolve the initial live report synchronously (bounded by
+            // `network::DETECT_TIMEOUT`) so the very first requests already
+            // see an accurate `/health` and enforcement decision, rather
+            // than waiting for the first periodic tick.
+            let initial = refresh_network_state(app.network_mode).await;
+            *app.network_state
+                .write()
+                .map_err(|e| ServeError::Other(Box::new(std::io::Error::other(e.to_string()))))? =
+                initial;
+        }
+    }
 
     // LAN guard: refuse to start on a non-loopback bind unless the token is
     // present and non-empty. `token_file`/`open_app_at_full` already fail if
@@ -1269,7 +1338,14 @@ pub async fn run_http_full(
         Err(error) => return Err(ServeError::BindFailed(error)),
     };
     let address = listener.local_addr().map_err(ServeError::BindFailed)?;
-    let router = router(app.clone());
+    // The network-reachability gate is only meaningful for real serving (it
+    // needs a real peer address via `ConnectInfo`, provided below by
+    // `into_make_service_with_connect_info`); the shared `router()` used
+    // directly by unit tests stays ungated so those tests are unaffected.
+    let router = router(app.clone()).layer(axum::middleware::from_fn_with_state(
+        app.clone(),
+        network_gate,
+    ));
     println!(
         "listening on {address}; token file: {}",
         app.data_dir.join("auth.token").display()
@@ -1280,6 +1356,29 @@ pub async fn run_http_full(
     }
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     *app.shutdown.lock().unwrap() = Some(shutdown_tx);
+    // Periodic recheck (every `network::RECHECK_INTERVAL`) so a `lan`/
+    // `tailscale` server picks up a network change (a laptop moving from a
+    // Private home network to a Public coffee-shop one, or Tailscale
+    // starting up after the server did) without a restart. Aborted
+    // automatically when the task's `Arc<App>` is the last reference to drop
+    // (server shutdown) since it's a plain detached `tokio::spawn`, not
+    // tracked further -- there is nothing to cancel explicitly because it
+    // only ever reads live state and writes `network_state`, both cheap and
+    // safe to do right up until process exit.
+    if !app.network_custom && !matches!(app.network_mode, crate::network::NetworkMode::Local) {
+        let recheck_app = app.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(crate::network::RECHECK_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let report = refresh_network_state(recheck_app.network_mode).await;
+                if let Ok(mut state) = recheck_app.network_state.write() {
+                    *state = report;
+                }
+            }
+        });
+    }
     let combined_shutdown = async move {
         tokio::select! {
             _ = shutdown => {},
@@ -1294,6 +1393,85 @@ pub async fn run_http_full(
     .await;
     crate::discovery::remove_server_json(&data_dir);
     result.map_err(|e| ServeError::Other(Box::new(e)))
+}
+
+/// Runs the live detection for `mode` (`lan`/`tailscale` only) off the async
+/// executor thread (both detectors shell out and poll synchronously) and
+/// turns the result into the report shown on `/health` and used by
+/// `network_gate`. Never panics or hangs: `spawn_blocking` failing (executor
+/// shutting down) is treated the same as detection failing.
+async fn refresh_network_state(mode: crate::network::NetworkMode) -> crate::network::NetworkReport {
+    match mode {
+        crate::network::NetworkMode::Local => crate::network::NetworkReport::local(mode),
+        crate::network::NetworkMode::Lan => {
+            let is_private = tokio::task::spawn_blocking(|| {
+                crate::network::detect_lan_private(crate::network::DETECT_TIMEOUT)
+            })
+            .await
+            .unwrap_or(false);
+            if is_private {
+                crate::network::NetworkReport::lan(Vec::new())
+            } else {
+                crate::network::NetworkReport::local_fallback(
+                    mode,
+                    "no active network connection is Private or Domain -- staying local-only",
+                )
+            }
+        }
+        crate::network::NetworkMode::Tailscale => {
+            let address = tokio::task::spawn_blocking(|| {
+                crate::network::detect_tailscale_ipv4(crate::network::DETECT_TIMEOUT)
+            })
+            .await
+            .unwrap_or(None);
+            match address {
+                Some(ip) => crate::network::NetworkReport::tailscale(ip),
+                None => crate::network::NetworkReport::local_fallback(
+                    mode,
+                    "tailscale is not running or has no address -- staying local-only",
+                ),
+            }
+        }
+    }
+}
+
+/// Rejects a non-loopback, non-`/health` request when the live network
+/// report says the current mode doesn't currently allow it (see
+/// `crate::network::peer_allowed_non_loopback`). Applied as an extra layer
+/// in `run_http_full` only -- see the comment where it's attached.
+async fn network_gate(
+    State(app): State<Arc<App>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if request.uri().path() == "/health" || caller_is_loopback(peer) {
+        return next.run(request).await;
+    }
+    let report = match app.network_state.read() {
+        Ok(state) => state.clone(),
+        Err(_) => return internal("network state lock poisoned").into_response(),
+    };
+    if crate::network::peer_allowed_non_loopback(
+        app.network_mode,
+        app.network_custom,
+        &report,
+        peer.ip(),
+    ) {
+        return next.run(request).await;
+    }
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        "network_not_private",
+        format!(
+            "not reachable from another device right now ({})",
+            report
+                .reason
+                .as_deref()
+                .unwrap_or("network mode does not currently allow this")
+        ),
+    )
+    .into_response()
 }
 
 /// Pure decision used by [`shutdown_endpoint`] (and exercised directly by
@@ -2005,6 +2183,259 @@ mod router_tests {
     }
 
     #[tokio::test]
+    async fn health_reports_local_mode_by_default_with_no_reason_or_addresses() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let router = router(app.clone());
+        let request = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["network"]["mode"], "local");
+        assert_eq!(body["network"]["effective"], "local");
+        assert!(body["network"].get("reason").is_none());
+        assert!(body["network"].get("addresses").is_none());
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_reports_custom_mode_for_an_explicit_host_override() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = crate::app::open_app_at_full(
+            path.clone(),
+            crate::app::RuntimeLimits::default(),
+            crate::app::BindOverrides {
+                host: Some("0.0.0.0".to_owned()),
+                port: None,
+            },
+            None,
+        )
+        .unwrap();
+        let router = router(app.clone());
+        let request = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["network"]["mode"], "custom");
+        assert_eq!(body["network"]["effective"], "custom");
+        assert_eq!(body["network"]["addresses"][0], "0.0.0.0");
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    /// `network_gate` is only attached in `run_http_full`, not the shared
+    /// `router()` (see the comment where it's attached) -- built here
+    /// directly the same way, so these tests exercise it without spinning up
+    /// a real TCP listener.
+    fn gated_router(app: Arc<App>) -> Router {
+        router(app.clone()).layer(axum::middleware::from_fn_with_state(app, network_gate))
+    }
+
+    #[tokio::test]
+    async fn network_gate_allows_health_from_anywhere_ungated() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let router = gated_router(app.clone());
+        let request = with_peer(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+            lan_peer(),
+        );
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn network_gate_rejects_lan_peer_when_mode_is_local() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let router = gated_router(app.clone());
+        let request = with_peer(
+            Request::builder()
+                .uri("/v1/local/system")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+            lan_peer(),
+        );
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "network_not_private");
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn network_gate_allows_loopback_peer_regardless_of_mode() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let router = gated_router(app.clone());
+        let request = with_peer(
+            Request::builder()
+                .uri("/v1/local/system")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+            loopback_peer(),
+        );
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn network_gate_allows_lan_peer_once_the_live_report_says_lan() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = crate::app::open_app_at_full(
+            path.clone(),
+            crate::app::RuntimeLimits::default(),
+            crate::app::BindOverrides::default(),
+            Some(crate::network::NetworkMode::Lan),
+        )
+        .unwrap();
+        let token = app.token.clone();
+        // Simulate what the initial-detection step in `run_http_full` (or a
+        // periodic recheck) would write once Windows reports a Private
+        // network -- this test does not shell out to PowerShell.
+        *app.network_state.write().unwrap() = crate::network::NetworkReport::lan(Vec::new());
+        let router = gated_router(app.clone());
+        let request = with_peer(
+            Request::builder()
+                .uri("/v1/local/system")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+            lan_peer(),
+        );
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn network_gate_allows_a_custom_host_override_from_any_peer() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = crate::app::open_app_at_full(
+            path.clone(),
+            crate::app::RuntimeLimits::default(),
+            crate::app::BindOverrides {
+                host: Some("0.0.0.0".to_owned()),
+                port: None,
+            },
+            None,
+        )
+        .unwrap();
+        let token = app.token.clone();
+        let router = gated_router(app.clone());
+        let request = with_peer(
+            Request::builder()
+                .uri("/v1/local/system")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+            lan_peer(),
+        );
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_patch_rejects_invalid_network_mode() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let router = router(app.clone());
+        let request = Request::builder()
+            .method("PATCH")
+            .uri("/v1/local/config")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"network_mode":"public"}"#))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_network_mode");
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_patch_accepts_a_valid_network_mode_and_reports_restart_required() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let router = router(app.clone());
+        let request = Request::builder()
+            .method("PATCH")
+            .uri("/v1/local/config")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"network_mode":"lan"}"#))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["network_mode"], "lan");
+        assert_eq!(body["restart_required"], true);
+
+        let request = Request::builder()
+            .uri("/v1/local/config")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["network_mode"], "lan");
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
     async fn shutdown_without_token_is_unauthorized() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
         let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
@@ -2082,6 +2513,7 @@ mod router_tests {
                 host: Some("0.0.0.0".to_owned()),
                 port: Some(54400),
             },
+            None,
         )
         .unwrap();
         let token = app.token.clone();
@@ -2395,6 +2827,7 @@ mod port_fallback_tests {
                     host: Some("127.0.0.1".to_owned()),
                     port: None,
                 },
+                None,
                 crate::app::InstallScope::PerUser,
                 std::future::pending::<()>(),
             )
@@ -2435,6 +2868,7 @@ mod port_fallback_tests {
             data_dir.clone(),
             Default::default(),
             overrides,
+            None,
             crate::app::InstallScope::PerUser,
             std::future::pending::<()>(),
         )
@@ -2470,6 +2904,7 @@ mod port_fallback_tests {
             data_dir.clone(),
             Default::default(),
             overrides,
+            None,
             crate::app::InstallScope::MachineWide,
             std::future::pending::<()>(),
         )

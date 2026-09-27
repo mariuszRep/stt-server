@@ -41,6 +41,20 @@ pub struct App {
     /// whether a caller is loopback.
     pub bind_host: String,
     pub bind_port: u16,
+    /// Resolved `network_mode` (CLI `--network` > stored setting > default
+    /// `local`). Meaningless when `network_custom` is true (an explicit
+    /// `--host` override always wins -- see `crate::network`).
+    pub network_mode: crate::network::NetworkMode,
+    /// True when this process was given an explicit `--host` (or a stored
+    /// `bind_host` from the older phase-1a setting) -- the "advanced
+    /// override" that takes precedence over `network_mode` entirely. Health
+    /// reports mode `"custom"` in this case.
+    pub network_custom: bool,
+    /// Live network reachability report shown on `/health`. Set once at
+    /// startup for `local`/`custom` (no detection needed) and kept current
+    /// by a periodic background recheck for `lan`/`tailscale` (see
+    /// `api::run_http_full`).
+    pub network_state: std::sync::RwLock<crate::network::NetworkReport>,
     /// Set by `api::run_http_full` while serving; `POST /v1/local/shutdown`
     /// takes it and fires it to trigger axum's graceful shutdown.
     pub shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -485,15 +499,23 @@ pub fn open_app_at_with_overrides(
     data_dir: PathBuf,
     cli_overrides: RuntimeLimits,
 ) -> Result<Arc<App>, Box<dyn Error>> {
-    open_app_at_full(data_dir, cli_overrides, BindOverrides::default())
+    open_app_at_full(data_dir, cli_overrides, BindOverrides::default(), None)
 }
 
 /// Full opener: also resolves the effective bind host/port from
-/// `bind_overrides` (CLI `--host`/`--port`) > stored settings > default.
+/// `bind_overrides` (CLI `--host`/`--port`) > stored settings > default, and
+/// the effective `network_mode` from `network_override` (CLI `--network`) >
+/// the stored `network_mode` setting > default `local`. Does not itself
+/// perform any network detection (see `api::run_http_full`, which owns
+/// binding and resolves `network_state` from live detection for `lan`/
+/// `tailscale`); here `network_state` is only ever set to the no-detection-
+/// needed `local`/`custom` reports so this opener stays fast and I/O-free
+/// for the many callers (tests, CLI subcommands) that never serve traffic.
 pub fn open_app_at_full(
     data_dir: PathBuf,
     cli_overrides: RuntimeLimits,
     bind_overrides: BindOverrides,
+    network_override: Option<crate::network::NetworkMode>,
 ) -> Result<Arc<App>, Box<dyn Error>> {
     let catalog: Catalog = serde_json::from_str(include_str!("../catalog/handy-2026-08-17.json"))?;
     fs::create_dir_all(data_dir.join("models"))?;
@@ -559,6 +581,7 @@ pub fn open_app_at_full(
             .or(stored_limits.inference_timeout_ms),
     };
     let (stored_host, stored_port) = crate::store::read_bind_settings(&db)?;
+    let network_custom = bind_overrides.host.is_some() || stored_host.is_some();
     let bind_host = bind_overrides
         .host
         .or(stored_host)
@@ -567,6 +590,13 @@ pub fn open_app_at_full(
         .port
         .or(stored_port)
         .unwrap_or(DEFAULT_BIND_PORT);
+    let stored_network_mode = crate::store::read_network_mode_setting(&db)?;
+    let network_mode = crate::network::resolve_mode(network_override, stored_network_mode);
+    let network_state = if network_custom {
+        crate::network::NetworkReport::custom(&bind_host)
+    } else {
+        crate::network::NetworkReport::local(network_mode)
+    };
     Ok(Arc::new(App {
         catalog: catalog.models,
         db: Mutex::new(db),
@@ -585,6 +615,9 @@ pub fn open_app_at_full(
             .build()?,
         bind_host,
         bind_port,
+        network_mode,
+        network_custom,
+        network_state: std::sync::RwLock::new(network_state),
         shutdown: Mutex::new(None),
     }))
 }
@@ -1018,6 +1051,74 @@ mod recovery_tests {
         assert_eq!(app.user_token.len(), 64);
         assert_ne!(app.token, app.user_token);
         drop(app);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn default_open_resolves_local_mode_and_is_not_custom() {
+        let dir = std::env::temp_dir().join(format!("stt-app-network-test-{}", Uuid::new_v4()));
+        let app = open_app_at(dir.clone()).unwrap();
+        assert_eq!(app.network_mode, crate::network::NetworkMode::Local);
+        assert!(!app.network_custom);
+        assert_eq!(app.network_state.read().unwrap().mode, "local");
+        drop(app);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_host_override_is_reported_as_custom_regardless_of_network_override() {
+        let dir = std::env::temp_dir().join(format!("stt-app-network-test-{}", Uuid::new_v4()));
+        let app = open_app_at_full(
+            dir.clone(),
+            RuntimeLimits::default(),
+            BindOverrides {
+                host: Some("0.0.0.0".to_owned()),
+                port: None,
+            },
+            Some(crate::network::NetworkMode::Tailscale),
+        )
+        .unwrap();
+        assert!(app.network_custom);
+        assert_eq!(app.network_state.read().unwrap().mode, "custom");
+        drop(app);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn network_override_resolves_when_no_host_override_is_given() {
+        let dir = std::env::temp_dir().join(format!("stt-app-network-test-{}", Uuid::new_v4()));
+        let app = open_app_at_full(
+            dir.clone(),
+            RuntimeLimits::default(),
+            BindOverrides::default(),
+            Some(crate::network::NetworkMode::Lan),
+        )
+        .unwrap();
+        assert!(!app.network_custom);
+        assert_eq!(app.network_mode, crate::network::NetworkMode::Lan);
+        drop(app);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_previously_stored_bind_host_setting_is_also_treated_as_custom() {
+        let dir = std::env::temp_dir().join(format!("stt-app-network-test-{}", Uuid::new_v4()));
+        {
+            let app = open_app_at(dir.clone()).unwrap();
+            app.db
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO settings(key,value) VALUES(?1,?2)",
+                    params![crate::store::SETTING_BIND_HOST, "0.0.0.0"],
+                )
+                .unwrap();
+            drop(app);
+        }
+        let reopened = open_app_at(dir.clone()).unwrap();
+        assert!(reopened.network_custom);
+        assert_eq!(reopened.network_state.read().unwrap().mode, "custom");
+        drop(reopened);
         fs::remove_dir_all(dir).unwrap();
     }
 }

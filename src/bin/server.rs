@@ -227,6 +227,7 @@ async fn cmd_update_install(data_dir: PathBuf, yes: bool, json: bool) -> i32 {
         data_dir: Some(data_dir.clone()),
         host: previous_info.as_ref().map(|info| info.host.clone()),
         port: previous_info.as_ref().map(|info| info.port),
+        network: None,
         limits: Default::default(),
     };
 
@@ -304,11 +305,13 @@ async fn cmd_update_install(data_dir: PathBuf, yes: bool, json: bool) -> i32 {
 async fn cmd_run(flags: RunFlags) -> i32 {
     let data_dir = effective_data_dir(&flags);
     let overrides = bind_overrides(&flags);
+    let network = flags.network;
     let limits = flags.limits;
     let result = stt_server_next::api::run_http_full(
         data_dir,
         limits,
         overrides,
+        network,
         app::install_scope(),
         async {
             let _ = tokio::signal::ctrl_c().await;
@@ -338,10 +341,6 @@ async fn cmd_run(flags: RunFlags) -> i32 {
 
 async fn cmd_start(flags: RunFlags) -> i32 {
     let data_dir = effective_data_dir(&flags);
-    let host = flags
-        .host
-        .clone()
-        .unwrap_or_else(|| DEFAULT_BIND_HOST.to_owned());
 
     if let Some(info) = discovery::read_server_json(&data_dir) {
         if discovery::pid_is_alive(info.pid) && health_ok(&probe_host(&info.host), info.port).await
@@ -377,8 +376,20 @@ async fn cmd_start(flags: RunFlags) -> i32 {
         args.push("--port".to_owned());
         args.push(port.to_string());
     }
-    args.push("--host".to_owned());
-    args.push(host.clone());
+    // Only pass `--host` on to the spawned process when the caller
+    // explicitly asked for one -- same reasoning as `--port` above, and also
+    // what lets `--network`/the stored `network_mode` setting actually take
+    // effect: an unconditionally-passed `--host` would always look like an
+    // explicit override to `run_http_full` and permanently force mode
+    // "custom" (see `crate::network`).
+    if let Some(host) = &flags.host {
+        args.push("--host".to_owned());
+        args.push(host.clone());
+    }
+    if let Some(network) = flags.network {
+        args.push("--network".to_owned());
+        args.push(network.as_str().to_owned());
+    }
     if let Some(v) = flags.limits.queue_max_waiting {
         args.push("--queue-max-waiting".to_owned());
         args.push(v.to_string());
@@ -1184,8 +1195,12 @@ mod recovery_tests {
         assert!(!health_ok("127.0.0.1", port).await);
         server.abort();
 
-        let real =
-            axum::Router::new().route("/health", axum::routing::get(stt_server_next::api::health));
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", uuid::Uuid::new_v4()));
+        let real_app = app::open_app_at(path.clone()).unwrap();
+        let real = axum::Router::new()
+            .route("/health", axum::routing::get(stt_server_next::api::health))
+            .with_state(real_app.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = tokio::spawn(async move {
@@ -1193,6 +1208,14 @@ mod recovery_tests {
         });
         assert!(health_ok("127.0.0.1", port).await);
         server.abort();
+        // Wait for the aborted task to actually unwind (it holds a clone of
+        // `real_app`, and thus the open SQLite connection) before dropping
+        // our own clone and deleting the directory -- otherwise the delete
+        // can race the task's teardown and fail with a Windows file lock
+        // (AGENTS.md's "drop the app and router before deleting temp dirs").
+        let _ = server.await;
+        drop(real_app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
     }
 }
 
@@ -1235,6 +1258,7 @@ mod models_cli_tests {
                 dir_for_task,
                 Default::default(),
                 overrides,
+                None,
                 app::InstallScope::PerUser,
                 std::future::pending::<()>(),
             )
@@ -1389,6 +1413,7 @@ mod models_cli_tests {
                 dir_for_task,
                 Default::default(),
                 overrides,
+                None,
                 app::InstallScope::PerUser,
                 std::future::pending::<()>(),
             )

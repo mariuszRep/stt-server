@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use crate::app::RuntimeLimits;
+use crate::network::NetworkMode;
 
 pub const USAGE: &str = "\
 stt-server-next -- local batch STT server
@@ -37,7 +38,12 @@ USAGE:
 
 FLAGS:
     --port <n>                    bind port (default 54321)
-    --host <addr>                 bind host (default 127.0.0.1)
+    --host <addr>                 bind host (default 127.0.0.1); an explicit
+                                   --host is an advanced override that wins
+                                   over --network/the stored network_mode
+                                   setting, and is reported as mode \"custom\"
+    --network <mode>              local | lan | tailscale (default: local, or
+                                   the stored network_mode setting)
     --data-dir <path>              data directory
     --queue-max-waiting <n>
     --queue-wait-timeout-ms <n>
@@ -61,6 +67,7 @@ server are restored automatically.
 pub struct RunFlags {
     pub port: Option<u16>,
     pub host: Option<String>,
+    pub network: Option<NetworkMode>,
     pub data_dir: Option<PathBuf>,
     pub limits: RuntimeLimits,
 }
@@ -225,6 +232,14 @@ pub fn parse_run_flags(args: &[String]) -> Result<RunFlags, CliError> {
             }
             "--host" => {
                 flags.host = Some(next_value(&mut iter, flag)?);
+            }
+            "--network" => {
+                let raw = next_value(&mut iter, flag)?;
+                flags.network = Some(NetworkMode::parse(&raw).ok_or_else(|| {
+                    CliError::usage(format!(
+                        "--network requires 'local', 'lan', or 'tailscale', got '{raw}'"
+                    ))
+                })?);
             }
             "--data-dir" => {
                 flags.data_dir = Some(PathBuf::from(next_value(&mut iter, flag)?));
@@ -643,6 +658,28 @@ mod tests {
             Command::Run(flags) => assert_eq!(flags.limits.queue_max_waiting, Some(5)),
             _ => panic!("expected Run"),
         }
+    }
+
+    #[test]
+    fn parses_network_flag_for_each_valid_mode() {
+        for (raw, expected) in [
+            ("local", NetworkMode::Local),
+            ("lan", NetworkMode::Lan),
+            ("tailscale", NetworkMode::Tailscale),
+        ] {
+            let cmd = parse(&args(&["run", "--network", raw])).unwrap();
+            match cmd {
+                Command::Run(flags) => assert_eq!(flags.network, Some(expected)),
+                _ => panic!("expected Run"),
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_an_invalid_network_flag_value() {
+        let error = parse(&args(&["run", "--network", "public"])).unwrap_err();
+        assert_eq!(error.exit_code, 2);
+        assert!(error.message.contains("--network"));
     }
 
     #[test]

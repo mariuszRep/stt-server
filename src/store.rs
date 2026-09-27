@@ -27,6 +27,11 @@ pub const SETTING_USER_MODELS_DIR: &str = "user_models_dir";
 pub const SETTING_BIND_HOST: &str = "bind_host";
 pub const SETTING_BIND_PORT: &str = "bind_port";
 
+/// Settings key for the "Network modes" setting (`local`/`lan`/`tailscale`).
+/// See `crate::network`. Absent means unset (falls back to the CLI
+/// `--network` flag, then the default `local`).
+pub const SETTING_NETWORK_MODE: &str = "network_mode";
+
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -277,6 +282,29 @@ pub fn validate_bind_host(host: &str) -> bool {
 
 pub fn validate_bind_port(port: i64) -> bool {
     port > 0 && port <= u16::MAX as i64
+}
+
+/// Read the persisted `network_mode` setting directly from an open
+/// connection, unvalidated (a stored value written by an older/incompatible
+/// build that fails to parse is treated the same as absent). Used at startup
+/// (before `App` exists).
+pub fn read_network_mode_setting(
+    db: &Connection,
+) -> rusqlite::Result<Option<crate::network::NetworkMode>> {
+    let raw: Option<String> = db
+        .query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            params![SETTING_NETWORK_MODE],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(raw.and_then(|value| crate::network::NetworkMode::parse(&value)))
+}
+
+/// Read the persisted `network_mode` setting, unvalidated.
+pub fn network_mode_setting(app: &App) -> ApiResult<Option<crate::network::NetworkMode>> {
+    let db = app.db.lock().map_err(internal)?;
+    read_network_mode_setting(&db).map_err(internal)
 }
 
 pub fn backend_preference(app: &App) -> ApiResult<String> {
