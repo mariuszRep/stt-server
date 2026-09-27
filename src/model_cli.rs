@@ -157,6 +157,7 @@ pub fn format_error(outcome: &ApiOutcome) -> String {
         "model_in_use" => " -- unload it first with `models unload`",
         "model_not_found" | "operation_not_found" => " -- check the id",
         "server_not_ready" => " -- no model is loaded yet; select one, or check for an in-progress install/verify",
+        "model_loading" => " -- the selected model is still loading; check `status`/`health` and retry shortly",
         "admin_required" => " -- admin access required (run as administrator)",
         _ => "",
     };

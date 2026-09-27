@@ -32,8 +32,8 @@ use crate::import::import_model;
 use crate::operations::{cancel_operation, operation};
 use crate::run_plan::{plan as build_plan, Endpoint, ParsedRequest};
 use crate::store::{
-    all_installed, backend_preference, cors_allowed_origins, installed_file, installed_path,
-    is_valid_cors_origin, selected_id, user_models_dir_setting, SOURCE_USER_FOLDER,
+    all_installed, backend_preference, installed_file, installed_path, is_valid_cors_origin,
+    selected_id, user_models_dir_setting, SOURCE_USER_FOLDER,
 };
 use crate::verify::verify_model;
 
@@ -53,7 +53,7 @@ pub async fn get_config(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiR
         "preferred_backend":backend_preference(&app)?,
         "max_audio_bytes":40 * 1024 * 1024,
         "streaming":false,
-        "cors_allowed_origins":cors_allowed_origins(&app)?,
+        "cors_allowed_origins":app.cors_origins,
         "queue_max_waiting": limits.queue_max_waiting,
         "queue_wait_timeout_ms": limits.queue_wait_timeout_ms,
         "inference_timeout_ms": limits.inference_timeout_ms,
@@ -377,17 +377,37 @@ pub async fn readiness(
     headers: HeaderMap,
 ) -> ApiResult<impl IntoResponse> {
     authorize(&headers, &app, AccessLevel::User)?;
-    let loaded = app.loaded.lock().map_err(internal)?;
-    match loaded.as_ref() {
-        Some(active) => Ok((
-            StatusCode::OK,
-            Json(json!({"status":"ready", "model":active.id, "backend":active.diagnostic})),
-        )),
-        None => Ok((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"status":"not_ready", "reason":"No selected model loaded"})),
-        )),
+    {
+        let loaded = app.loaded.lock().map_err(internal)?;
+        if let Some(active) = loaded.as_ref() {
+            return Ok((
+                StatusCode::OK,
+                Json(json!({"status":"ready", "model":active.id, "backend":active.diagnostic})),
+            ));
+        }
     }
+    // No model loaded yet -- either the previously selected model is still
+    // loading in the background (see `app::open_app_at_full`/
+    // `engine::spawn_tracked_load`), or nothing is selected at all. Health
+    // (`/health`) is always `ok` regardless of which of these applies; only
+    // readiness distinguishes them, so a client's health card can show
+    // "starting up (loading <model>, 42s)" instead of a bare "not ready".
+    let loading = app.loading.lock().map_err(internal)?;
+    if let Some(status) = loading.as_ref() {
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status":"not_ready",
+                "reason":"loading model",
+                "model": status.model_id,
+                "elapsed_ms": status.elapsed_ms(),
+            })),
+        ));
+    }
+    Ok((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"status":"not_ready", "reason":"No selected model loaded"})),
+    ))
 }
 
 /// `GET /v1/local/system`: OS/CPU/memory/GPU/process/server info for the
@@ -642,6 +662,21 @@ pub async fn select_model(
     // new model finishing its load and the swap), memory usage is briefly
     // the sum of both models -- acceptable per README.
     let _selection = app.selection.lock().await;
+    // A background load already in progress (currently only the startup
+    // reload kicked off by `open_app_at_full` -- see `engine::
+    // spawn_tracked_load`) is rejected outright rather than queued: the
+    // simplest sane behaviour, and consistent with "a request uses the model
+    // it entered the queue with" -- there is no in-progress request here to
+    // preserve, just an unfinished load with no cancellation support. The
+    // client is expected to poll `/readiness` and retry once it clears.
+    if let Some(status) = app.loading.lock().map_err(internal)?.as_ref() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "model_loading",
+            "Another model is still loading; retry once it finishes",
+        )
+        .with_details(json!({"model": status.model_id, "elapsed_ms": status.elapsed_ms()})));
+    }
     known_or_installed(&app, &id)?;
     let installed = installed_file(&app, &id)?.ok_or_else(|| {
         ApiError::new(
@@ -921,6 +956,30 @@ async fn transcribe_or_translate(
     let (model, active_id, backend, caps) = {
         let active = app.loaded.lock().map_err(internal)?;
         let loaded = active.as_ref().ok_or_else(|| {
+            // Distinguish "the selected model is still loading in the
+            // background" (see `app::open_app_at_full`) from "nothing is
+            // selected at all": a client retrying blindly on `server_not_ready`
+            // would otherwise get the same unhelpful answer throughout a
+            // multi-minute startup load. Dedicated `model_loading` code (see
+            // docs/client-contract.md's 503 table) rather than reusing
+            // `server_not_ready`, so a client can tell "wait, it's on its
+            // way" apart from "nothing selected, go select one". A request
+            // that lands here entered the queue (or would have) before the
+            // model was ready, so per convention it is rejected outright
+            // rather than queued -- it never silently uses whatever model
+            // finishes loading later.
+            if let Ok(loading) = app.loading.lock() {
+                if let Some(status) = loading.as_ref() {
+                    return ApiError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "model_loading",
+                        "The selected model is still loading",
+                    )
+                    .with_details(
+                        json!({"model": status.model_id, "elapsed_ms": status.elapsed_ms()}),
+                    );
+                }
+            }
             let mut error = ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "server_not_ready",
@@ -1145,9 +1204,12 @@ pub async fn refresh_models(
 }
 
 pub fn router(app: Arc<App>) -> Router {
-    let origins =
-        cors_allowed_origins(&app).unwrap_or_else(|_| crate::store::default_cors_origins());
-    let cors = cors_layer(&origins);
+    // The effective allow-list already resolved at `open_app_at_full` time
+    // (CLI `--cors-origin` > stored `cors_allowed_origins` setting > default
+    // empty). A `PATCH /v1/local/config` write to the setting takes effect
+    // on the next start (`restart_required: true` in its response), matching
+    // `bind_host`/`bind_port`.
+    let cors = cors_layer(&app.cors_origins);
     Router::new()
         .route("/health", get(health))
         .route("/readiness", get(readiness))
@@ -1532,11 +1594,15 @@ mod router_tests {
     use tower::ServiceExt;
     use uuid::Uuid;
 
+    /// Default (nothing stored, no CLI override): no browser origin is
+    /// allowed, so a preflight for an arbitrary origin gets no CORS headers.
+    /// See the "locked down by default" decision, 2026-09-27.
     #[tokio::test]
-    async fn options_preflight_succeeds_without_token_and_reports_cors_headers() {
+    async fn options_preflight_default_locked_down_reports_no_cors_headers() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
         let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
+        assert!(app.cors_origins.is_empty());
         let router = router(app.clone());
         let request = Request::builder()
             .method("OPTIONS")
@@ -1547,6 +1613,135 @@ mod router_tests {
             .body(Body::empty())
             .unwrap();
         let response = router.oneshot(request).await.unwrap();
+        assert!(!response
+            .headers()
+            .contains_key("access-control-allow-origin"));
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    /// A request with no `Origin` header at all (every non-browser client:
+    /// Voice Typer, SDK, CLI, curl) is unaffected by the CORS layer either
+    /// way; it still needs the token like any other protected route, but
+    /// gets no CORS-related rejection or header.
+    #[tokio::test]
+    async fn request_without_origin_header_is_unaffected_by_cors() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let router = router(app.clone());
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/local/config")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response
+            .headers()
+            .contains_key("access-control-allow-origin"));
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    /// Once an origin is explicitly allowed (via the persisted setting, as a
+    /// real client would get it there through `PATCH /v1/local/config`), its
+    /// preflight succeeds with the expected headers (methods, Authorization,
+    /// Content-Type) and an actual request from that origin gets
+    /// `Access-Control-Allow-Origin` back; a different, non-allowed origin
+    /// still gets no CORS headers.
+    #[tokio::test]
+    async fn allowed_origin_gets_cors_headers_and_preflight_others_do_not() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = crate::app::open_app_at_full(
+            path.clone(),
+            crate::app::RuntimeLimits::default(),
+            crate::app::BindOverrides {
+                host: None,
+                port: None,
+                cors_origins: Some(vec!["http://localhost:3000".to_owned()]),
+            },
+            None,
+        )
+        .unwrap();
+        let router = router(app.clone());
+
+        let preflight = Request::builder()
+            .method("OPTIONS")
+            .uri("/v1/audio/transcriptions")
+            .header("origin", "http://localhost:3000")
+            .header("access-control-request-method", "POST")
+            .header(
+                "access-control-request-headers",
+                "authorization,content-type",
+            )
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(preflight).await.unwrap();
+        assert!(response.status().is_success());
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .unwrap(),
+            "http://localhost:3000"
+        );
+        let allow_headers = response
+            .headers()
+            .get("access-control-allow-headers")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(allow_headers.contains("authorization"));
+        assert!(allow_headers.contains("content-type"));
+
+        let other_origin_preflight = Request::builder()
+            .method("OPTIONS")
+            .uri("/v1/audio/transcriptions")
+            .header("origin", "http://evil.example")
+            .header("access-control-request-method", "POST")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(other_origin_preflight).await.unwrap();
+        assert!(!response
+            .headers()
+            .contains_key("access-control-allow-origin"));
+
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    /// `"*"` is only ever the enforced allow-list when explicitly set (never
+    /// the implicit default): an app opened with it explicitly configured
+    /// allows any origin's preflight.
+    #[tokio::test]
+    async fn wildcard_when_explicitly_set_allows_any_origin() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = crate::app::open_app_at_full(
+            path.clone(),
+            crate::app::RuntimeLimits::default(),
+            crate::app::BindOverrides {
+                host: None,
+                port: None,
+                cors_origins: Some(vec!["*".to_owned()]),
+            },
+            None,
+        )
+        .unwrap();
+        let router = router(app.clone());
+        let preflight = Request::builder()
+            .method("OPTIONS")
+            .uri("/v1/audio/transcriptions")
+            .header("origin", "http://anything.example")
+            .header("access-control-request-method", "POST")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(preflight).await.unwrap();
         assert!(response.status().is_success());
         assert!(response
             .headers()
@@ -1869,6 +2064,106 @@ mod router_tests {
             .unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["error"]["code"], "server_not_ready");
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    /// `/readiness` while a background load is in progress (see
+    /// `engine::spawn_tracked_load`/`app::open_app_at_full`): 503 with a
+    /// `"loading model"` reason, the loading model's id, and `elapsed_ms`,
+    /// distinct from the plain "no selected model" case above.
+    #[tokio::test]
+    async fn readiness_reports_loading_model_and_elapsed_while_loading() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        *app.loading.lock().unwrap() = Some(crate::engine::LoadingStatus::new(
+            "voxtral-small-24b".to_owned(),
+        ));
+        let token = app.token.clone();
+        let router = router(app.clone());
+        let request = Request::builder()
+            .method("GET")
+            .uri("/readiness")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], "not_ready");
+        assert_eq!(body["reason"], "loading model");
+        assert_eq!(body["model"], "voxtral-small-24b");
+        assert!(body["elapsed_ms"].is_u64());
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    /// A transcription request while the selected model is still loading
+    /// gets the dedicated `model_loading` 503, not the generic
+    /// `server_not_ready` -- see docs/client-contract.md's error table.
+    #[tokio::test]
+    async fn transcription_while_model_is_loading_is_503_model_loading() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        *app.loading.lock().unwrap() =
+            Some(crate::engine::LoadingStatus::new("slow-model".to_owned()));
+        let token = app.token.clone();
+        let router = router(app.clone());
+        let boundary = "X-BOUNDARY";
+        let body = multipart_body(boundary, &[("model", "default")], &sample_wav_bytes());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", format!("Bearer {token}"))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "model_loading");
+        assert_eq!(body["error"]["details"]["model"], "slow-model");
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    /// Selecting another model while a background load is already in
+    /// progress is rejected outright (409 `model_loading`) rather than
+    /// queued -- the simplest sane behaviour for a load with no
+    /// cancellation support. See `select_model`.
+    #[tokio::test]
+    async fn select_model_while_loading_is_409_model_loading() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        *app.loading.lock().unwrap() =
+            Some(crate::engine::LoadingStatus::new("slow-model".to_owned()));
+        let token = app.token.clone();
+        let router = router(app.clone());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/local/models/some-other-model/select")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "model_loading");
         drop(app);
         std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
     }
@@ -2258,6 +2553,7 @@ mod router_tests {
             crate::app::BindOverrides {
                 host: Some("0.0.0.0".to_owned()),
                 port: None,
+                cors_origins: None,
             },
             None,
         )
@@ -2394,6 +2690,7 @@ mod router_tests {
             crate::app::BindOverrides {
                 host: Some("0.0.0.0".to_owned()),
                 port: None,
+                cors_origins: None,
             },
             None,
         )
@@ -2554,6 +2851,7 @@ mod router_tests {
             crate::app::BindOverrides {
                 host: Some("0.0.0.0".to_owned()),
                 port: Some(54400),
+                cors_origins: None,
             },
             None,
         )
@@ -2868,6 +3166,7 @@ mod port_fallback_tests {
                 crate::app::BindOverrides {
                     host: Some("127.0.0.1".to_owned()),
                     port: None,
+                    cors_origins: None,
                 },
                 None,
                 crate::app::InstallScope::PerUser,
@@ -2905,6 +3204,7 @@ mod port_fallback_tests {
         let overrides = crate::app::BindOverrides {
             host: Some("127.0.0.1".to_owned()),
             port: Some(busy_port),
+            cors_origins: None,
         };
         let result = run_http_full(
             data_dir.clone(),
@@ -2929,6 +3229,7 @@ mod port_fallback_tests {
             // Not an explicit `--port` -- only the scope should be what
             // stops the fallback here.
             port: None,
+            cors_origins: None,
         };
         {
             let app = crate::app::open_app_at(data_dir.clone()).unwrap();

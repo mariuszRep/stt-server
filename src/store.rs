@@ -155,9 +155,13 @@ pub fn selected_id(app: &App) -> ApiResult<Option<String>> {
     .map_err(internal)
 }
 
-/// Default CORS origin list when the setting has never been written.
+/// Default CORS origin list when the setting has never been written: no
+/// browser origin is allowed (locked down by default; user decision
+/// 2026-09-27). Non-browser clients (Voice Typer, SDK, CLI, curl) send no
+/// `Origin` header and are unaffected either way -- CORS only ever concerns
+/// requests a browser sends with an `Origin` header attached.
 pub fn default_cors_origins() -> Vec<String> {
-    vec!["*".to_owned()]
+    Vec::new()
 }
 
 /// Pure validation: an origin is either the wildcard `*` or an
@@ -184,20 +188,36 @@ pub fn is_valid_cors_origin(origin: &str) -> bool {
     !host_part.is_empty()
 }
 
-pub fn cors_allowed_origins(app: &App) -> ApiResult<Vec<String>> {
-    let db = app.db.lock().map_err(internal)?;
+/// Read the persisted `cors_allowed_origins` setting directly from an open
+/// connection, unvalidated (a stored value that fails to parse as a JSON
+/// array is treated the same as absent). `None` means "never explicitly set"
+/// -- only an explicit `PATCH /v1/local/config` write ever creates this row,
+/// so a stored value (including a stored `["*"]`) always reflects a real,
+/// explicit choice and is never the old implicit wide-open default: the
+/// implicit default was never written to the `settings` table, it only ever
+/// existed as this function's fallback return value. Used at startup (before
+/// `App` exists) so the CLI `--cors-origin` override can take precedence over
+/// it without a redundant read.
+pub fn read_cors_origins_setting(db: &Connection) -> rusqlite::Result<Option<Vec<String>>> {
     let raw: Option<String> = db
         .query_row(
             "SELECT value FROM settings WHERE key='cors_allowed_origins'",
             [],
             |row| row.get(0),
         )
-        .optional()
-        .map_err(internal)?;
-    match raw {
-        Some(value) => serde_json::from_str(&value).map_err(internal),
-        None => Ok(default_cors_origins()),
-    }
+        .optional()?;
+    Ok(raw.and_then(|value| serde_json::from_str(&value).ok()))
+}
+
+/// Effective stored-or-default origin list for the running `App` (used by
+/// `GET /v1/local/config`'s validation path and tests); does not reflect a
+/// CLI `--cors-origin` override for this process -- see `App::cors_origins`
+/// for the effective value the CORS layer actually enforces.
+pub fn cors_allowed_origins(app: &App) -> ApiResult<Vec<String>> {
+    let db = app.db.lock().map_err(internal)?;
+    Ok(read_cors_origins_setting(&db)
+        .map_err(internal)?
+        .unwrap_or_else(default_cors_origins))
 }
 
 /// Settings keys for the optional queue/inference limits (see

@@ -103,6 +103,19 @@ None yet.
 2026-09-27: Created from the user's decisions on install scope, one data folder, service role,
 multi-user PCs, access levels, network safety and Tailscale.
 
+2026-09-27: User decision -- browser CORS access is locked down by default: no browser origin is
+allowed unless explicitly configured (`cors_allowed_origins` default `[]`, no
+`Access-Control-Allow-Origin` header for any `Origin`). Configurable via `cors_allowed_origins` on
+`PATCH /v1/local/config` (admin) and the CLI `--cors-origin <origin>` flag (repeatable) on
+`run`/`start`/`restart`; precedence CLI > stored setting > default. `"*"` is accepted only when
+explicitly set. Non-browser clients (Voice Typer, `stt-sdk`, CLI, curl) are unaffected either way.
+This reverses the 2026-09-26 review (recorded in `docs/client-contract.md`) that had kept `*` as
+the default; implemented in `src/api.rs`, `src/app.rs`, `src/store.rs`, `src/cli.rs`,
+`src/bin/server.rs`, with tests covering the default rejection, an explicitly allowed origin's
+headers and preflight, explicit `"*"`, no-`Origin`-header requests, and config validation. See
+`README.md`'s "Browser access (CORS)" section and `docs/client-contract.md` section 3 for the
+full writeup.
+
 ## Final Outcome
 
 Not started.

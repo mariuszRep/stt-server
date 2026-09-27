@@ -1,4 +1,6 @@
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use serde::Serialize;
 use transcribe_cpp::{backend_available, Backend, CancelToken, Model, ModelOptions};
@@ -30,6 +32,72 @@ impl LoadedModel {
             diagnostic,
             caps,
         }
+    }
+}
+
+/// Reported by `/readiness` (and the transcription handlers) while a model
+/// is loading in the background: see `spawn_tracked_load`. `started_at` is
+/// process-local monotonic time, never serialized directly -- callers read
+/// [`LoadingStatus::elapsed_ms`] instead.
+#[derive(Clone)]
+pub struct LoadingStatus {
+    pub model_id: String,
+    started_at: Instant,
+}
+
+impl LoadingStatus {
+    pub fn new(model_id: String) -> Self {
+        LoadingStatus {
+            model_id,
+            started_at: Instant::now(),
+        }
+    }
+
+    pub fn elapsed_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis() as u64
+    }
+}
+
+/// Load `loader` on a detached OS thread (not `tokio::spawn_blocking`, so
+/// this works from a plain synchronous caller with no tokio runtime, such as
+/// `App::open_app_at_full` when it is exercised directly by a non-`tokio`
+/// `#[test]`) and swap the result into `slot` when it finishes. `status` is
+/// set to `Some(LoadingStatus::new(model_id))` before the thread starts and
+/// unconditionally cleared back to `None` when it finishes -- on success
+/// *and* on failure -- so a concurrent reader (`/readiness`, a transcription
+/// request) can report "still loading" for exactly the load's real duration.
+/// Never blocks the caller: this is the mechanism that lets the HTTP server
+/// and `server.json` become available immediately at startup even when the
+/// selected model takes minutes to load (see the "instant startup, model
+/// loads in background" fix).
+///
+/// On a failed load, `slot` is left untouched (`None`) and the error is
+/// logged; there is no channel back to the caller because startup has
+/// already moved on by the time this could complete.
+pub fn spawn_tracked_load<T, E>(
+    status: Arc<Mutex<Option<LoadingStatus>>>,
+    slot: Arc<Mutex<Option<T>>>,
+    model_id: String,
+    loader: impl FnOnce() -> Result<T, E> + Send + 'static,
+) where
+    T: Send + 'static,
+    E: Send + std::fmt::Display + 'static,
+{
+    *status.lock().expect("loading status poisoned") = Some(LoadingStatus::new(model_id));
+    let status_for_thread = status.clone();
+    let spawned = std::thread::Builder::new()
+        .name("model-startup-load".to_owned())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            match loader() {
+                Ok(value) => *slot.lock().expect("swap slot poisoned") = Some(value),
+                Err(error) => eprintln!("selected model could not load: {error}"),
+            }
+            *status_for_thread.lock().expect("loading status poisoned") = None;
+        });
+    if spawned.is_err() {
+        eprintln!("could not spawn model-startup-load thread; model stays unloaded");
+        *status.lock().expect("loading status poisoned") = None;
     }
 }
 
@@ -143,5 +211,73 @@ mod swap_tests {
         let result = load_and_swap::<i32, String>(&slot, || Err("boom".to_owned())).await;
         assert_eq!(result, Err("boom".to_owned()));
         assert_eq!(*slot.lock().unwrap(), Some(1));
+    }
+}
+
+/// `spawn_tracked_load` is the mechanism behind "instant startup, model
+/// loads in background": these tests simulate a slow model load with a fake
+/// loader (a sleeping closure, no real `Model`) the same way `swap_tests`
+/// above simulates a slow/failing load with `i32`, and are the seam the
+/// server-level "server.json present and /health ok while a slow load is in
+/// progress" tests build on.
+#[cfg(test)]
+mod tracked_load_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn wait_until<F: Fn() -> bool>(condition: F, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while !condition() {
+            assert!(Instant::now() < deadline, "condition never became true");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn status_is_visible_while_loading_and_clears_on_success() {
+        let status: Arc<Mutex<Option<LoadingStatus>>> = Arc::new(Mutex::new(None));
+        let slot: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
+        spawn_tracked_load(
+            status.clone(),
+            slot.clone(),
+            "slow-model".to_owned(),
+            || {
+                std::thread::sleep(Duration::from_millis(100));
+                Ok::<i32, String>(42)
+            },
+        );
+        // The status must be observable immediately, before the loader
+        // thread has had a chance to finish -- this is exactly what lets
+        // `/readiness` report "loading" instead of blocking or 404ing.
+        {
+            let guard = status.lock().unwrap();
+            let observed = guard.as_ref().expect("status must be Some while loading");
+            assert_eq!(observed.model_id, "slow-model");
+        }
+        assert!(slot.lock().unwrap().is_none());
+
+        wait_until(|| slot.lock().unwrap().is_some(), Duration::from_secs(5));
+        assert_eq!(*slot.lock().unwrap(), Some(42));
+        wait_until(|| status.lock().unwrap().is_none(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn status_clears_and_slot_stays_empty_on_failure() {
+        let status: Arc<Mutex<Option<LoadingStatus>>> = Arc::new(Mutex::new(None));
+        let slot: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
+        spawn_tracked_load(status.clone(), slot.clone(), "bad-model".to_owned(), || {
+            std::thread::sleep(Duration::from_millis(30));
+            Err::<i32, String>("boom".to_owned())
+        });
+        assert!(status.lock().unwrap().is_some());
+        wait_until(|| status.lock().unwrap().is_none(), Duration::from_secs(5));
+        assert!(slot.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn elapsed_ms_increases_while_loading() {
+        let status = LoadingStatus::new("m".to_owned());
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(status.elapsed_ms() >= 15);
     }
 }

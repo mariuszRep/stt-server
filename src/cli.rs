@@ -50,6 +50,14 @@ FLAGS:
     --queue-max-waiting <n>
     --queue-wait-timeout-ms <n>
     --inference-timeout-ms <n>
+    --cors-origin <origin>         allow a browser origin (e.g.
+                                   http://localhost:3000) to call the API;
+                                   repeatable. \"*\" is accepted only if given
+                                   explicitly. Overrides the stored
+                                   cors_allowed_origins setting for this
+                                   process; default (no flag, nothing stored)
+                                   is no browser origin allowed. Non-browser
+                                   clients are never affected.
 
 The `models`/`health` commands talk to an already-running server over its
 existing authenticated local API (same discovery/token as `stop`/`status`);
@@ -72,6 +80,10 @@ pub struct RunFlags {
     pub network: Option<NetworkMode>,
     pub data_dir: Option<PathBuf>,
     pub limits: RuntimeLimits,
+    /// `--cors-origin <origin>` (repeatable); empty means the flag was not
+    /// given at all (see `App::cors_origins` for how this combines with the
+    /// stored setting and the default).
+    pub cors_origins: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,6 +275,15 @@ pub fn parse_run_flags(args: &[String]) -> Result<RunFlags, CliError> {
             "--inference-timeout-ms" => {
                 let raw = next_value(&mut iter, flag)?;
                 flags.limits.inference_timeout_ms = Some(parse_positive_u64(flag, &raw)?);
+            }
+            "--cors-origin" => {
+                let raw = next_value(&mut iter, flag)?;
+                if !crate::store::is_valid_cors_origin(&raw) {
+                    return Err(CliError::usage(format!(
+                        "--cors-origin requires '*' or an http(s)://host[:port] origin, got '{raw}'"
+                    )));
+                }
+                flags.cors_origins.push(raw);
             }
             other => return Err(CliError::usage(format!("unknown flag: {other}"))),
         }

@@ -165,6 +165,21 @@ the client disconnects while queued or running, the handler future is dropped an
 additive `x_diagnostics` object: `queue_wait_ms`, `inference_ms`, `audio_ms` (post-resample
 duration at 16 kHz), `model`, `backend`, and `fallback_reason`.
 
+The server and `server.json` are available immediately at startup; a previously selected model
+(a huge one that falls back to CPU, e.g. Voxtral-Small-24B, can take minutes) reloads on a
+detached background thread that startup never waits for or joins. `GET /health` is `ok`
+throughout, so `stop`/`status`/`models list` all work while it's loading -- previously
+`server.json` did not exist until the load finished, so those commands failed as if the server
+weren't running, and only killing the process worked. While it's loading, `GET /readiness` reports
+`503 {"status": "not_ready", "reason": "loading model", "model": id, "elapsed_ms": n}`, and a
+transcription/translation request gets `503 model_loading` (details: `model`, `elapsed_ms`) rather
+than the generic `server_not_ready`, so a client can tell "still coming up" apart from "nothing
+selected." Selecting a *different* model while this background load is in progress is rejected
+with `409 model_loading` rather than queued (the in-progress load can't be cancelled); retry once
+`/readiness` clears. `stop`/shutdown during the load returns promptly -- it is never blocked on the
+loader thread, which is torn down with the process. See `docs/client-contract.md` section 4.2 for
+the full behaviour.
+
 `POST /v1/local/models/{id}/select` (and its `/load` alias) no longer holds the inference slot
 while the new model loads: the old model keeps serving in-flight and newly queued transcriptions
 off its already-loaded handle while the new model loads on a blocking thread, and only the final
@@ -176,16 +191,49 @@ elapses. When transcription's readiness check fails (`server_not_ready`), the er
 `error.details.operation_id` when an install/import/verify operation is currently queued or
 running.
 
-## CORS
+## Browser access (CORS)
 
-`GET /v1/local/config` and `PATCH /v1/local/config` expose `cors_allowed_origins` (JSON array,
-default `["*"]`; `preferred_backend` is independently optional on PATCH so either can be patched
-alone). Each entry must be `*` or an `http(s)://host[:port]` origin; an invalid entry returns 400
-`invalid_cors_origins`. A CORS `PATCH` returns `restart_required: true` and takes effect on the
-next server start, when the `tower_http::cors::CorsLayer` is built from the persisted setting.
-`OPTIONS` preflight requests succeed without a bearer token; every other route (except `/health`)
-still requires one. When origins are restricted (not `*`), `Authorization` and `Content-Type` are
-explicitly allowed.
+CORS ("Cross-Origin Resource Sharing") is the browser rule that decides whether a web page loaded
+from one origin (e.g. `http://localhost:3000`) is allowed to read the response of a request it
+makes to a different origin (e.g. this server on `http://127.0.0.1:54321`). It only ever applies
+to requests a **browser** makes on a web page's behalf; it has no effect on Voice Typer, `stt-sdk`,
+the CLI, curl, or any other non-browser client, since none of those send the `Origin` header a
+browser attaches automatically, and the server's CORS layer only ever reacts to that header.
+
+**Secure by default (decision 2026-09-27):** out of the box, no browser origin is allowed --
+`GET /v1/local/config`'s `cors_allowed_origins` defaults to `[]`, and no response ever carries an
+`Access-Control-Allow-Origin` header. A web page cannot call this server's API at all unless an
+operator explicitly opts an origin in. The bearer token is still required regardless of CORS: an
+allowed origin only lets a browser *see* the response, it doesn't bypass `Authorization`.
+
+**Allowing a browser origin:**
+
+- CLI, at start: `stt-server-next run --cors-origin http://localhost:3000` (repeatable for more
+  than one origin; wins for that process's lifetime over the stored setting). Also accepted by
+  `start`/`restart`.
+- Config API, persisted across restarts:
+  ```
+  PATCH /v1/local/config
+  Authorization: Bearer <admin token>
+  Content-Type: application/json
+
+  {"cors_allowed_origins": ["http://localhost:3000"]}
+  ```
+  Each entry must be `*` or an exact `http(s)://host[:port]` origin (no path/query/credentials);
+  an invalid entry returns 400 `invalid_cors_origins`. The response includes
+  `"restart_required": true` -- a CORS change takes effect on the next server start, when the
+  `tower_http::cors::CorsLayer` is built from the resolved allow-list (CLI `--cors-origin` >
+  stored setting > default `[]`).
+
+**Avoid `"*"`:** it is accepted, but only when set explicitly -- never as an implicit default --
+because it lets *any* web page probe this server, including `GET /health` (the one unauthenticated
+route), from a victim's browser. Prefer listing the exact origin(s) that need access (e.g. your
+Electron/Tauri app's dev server, or a local web UI you trust) instead.
+
+`OPTIONS` preflight requests succeed without a bearer token for an allowed origin, with the
+expected `Access-Control-Allow-Methods`/`-Headers` (including `Authorization` and `Content-Type`);
+a disallowed origin gets no CORS headers at all, and every other route (except `/health`) still
+requires the token exactly as before.
 
 ## CLI
 

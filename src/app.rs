@@ -11,13 +11,26 @@ use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use crate::catalog::{Catalog, CatalogModel};
-use crate::engine::{load_engine, LoadedModel};
+use crate::engine::{load_engine, spawn_tracked_load, LoadedModel, LoadingStatus};
 use crate::queue::InferenceQueue;
 
 pub struct App {
     pub catalog: Vec<CatalogModel>,
     pub db: Mutex<Connection>,
-    pub loaded: Mutex<Option<LoadedModel>>,
+    /// `Arc`-wrapped (not a plain `Mutex`) so the background startup load
+    /// spawned by `open_app_at_full` can hold its own clone of this slot and
+    /// swap the loaded model in once it finishes, without needing a clone of
+    /// the whole `App`/`Arc<App>` (which does not exist yet while `App`
+    /// itself is still being built). Every existing `app.loaded.lock()` call
+    /// site is unaffected: `Arc<Mutex<T>>` derefs to `Mutex<T>`.
+    pub loaded: Arc<Mutex<Option<LoadedModel>>>,
+    /// `Some` for the duration of a background model load (currently only
+    /// the startup reload of the previously selected model -- see
+    /// `open_app_at_full`), `None` otherwise. Read by `GET /readiness` and
+    /// the transcription handlers to report "loading" instead of either
+    /// blocking the request or answering as if no model were selected at
+    /// all. See `engine::spawn_tracked_load`.
+    pub loading: Arc<Mutex<Option<LoadingStatus>>>,
     pub data_dir: PathBuf,
     pub token: String,
     /// User-level token (`user.token`): satisfies `AccessLevel::User` routes
@@ -50,6 +63,13 @@ pub struct App {
     /// override" that takes precedence over `network_mode` entirely. Health
     /// reports mode `"custom"` in this case.
     pub network_custom: bool,
+    /// Effective CORS allow-list this process enforces (CLI `--cors-origin` >
+    /// stored `cors_allowed_origins` setting > default empty, i.e. no browser
+    /// origin allowed). Resolved once at `open_app_at_full` time and used by
+    /// `api::router` to build the `CorsLayer`. Only ever affects requests
+    /// that carry an `Origin` header (browsers); non-browser clients are
+    /// unaffected regardless of this value.
+    pub cors_origins: Vec<String>,
     /// Live network reachability report shown on `/health`. Set once at
     /// startup for `local`/`custom` (no detection needed) and kept current
     /// by a periodic background recheck for `lan`/`tailscale` (see
@@ -70,6 +90,10 @@ pub const DEFAULT_BIND_PORT: u16 = 54321;
 pub struct BindOverrides {
     pub host: Option<String>,
     pub port: Option<u16>,
+    /// CLI `--cors-origin` (repeatable); `None` when the flag was not given
+    /// at all, so it can be told apart from an empty stored/default list and
+    /// correctly loses precedence to the stored setting.
+    pub cors_origins: Option<Vec<String>>,
 }
 
 /// Optional operational limits; `None` means unbounded/no-timeout, matching
@@ -553,30 +577,17 @@ pub fn open_app_at_full(
         )
         .optional()?
         .unwrap_or_else(|| "auto".to_owned());
-    let loaded = selected.and_then(|(id, path)| {
-        let load = std::thread::Builder::new()
-            .name("model-reload".to_owned())
-            .stack_size(16 * 1024 * 1024)
-            .spawn({
-                let preference = preference.clone();
-                move || load_engine(Path::new(&path), &preference)
-            });
-        match load.and_then(|worker| {
-            worker
-                .join()
-                .map_err(|_| std::io::Error::other("model reload thread panicked"))
-        }) {
-            Ok(Ok((model, diagnostic))) => Some(LoadedModel::new(id, model, diagnostic)),
-            Ok(Err(error)) => {
-                eprintln!("selected model could not reload: {error}");
-                None
-            }
-            Err(error) => {
-                eprintln!("selected model reload failed: {error}");
-                None
-            }
-        }
-    });
+    // Startup no longer blocks on the (possibly minutes-long, e.g. a large
+    // model that falls back from Vulkan to CPU) reload of the previously
+    // selected model: the HTTP server and `server.json` must become
+    // available immediately so `stop`/`status`/`models list` work while a
+    // slow load is still in progress (see the "instant startup, model loads
+    // in background" fix). `loaded` starts empty; if a model was selected,
+    // its reload is kicked off on a detached thread below (after `App` is
+    // constructed, since the loader needs its own clone of `loaded`/
+    // `loading`) and swaps itself in whenever it finishes.
+    let loaded: Arc<Mutex<Option<LoadedModel>>> = Arc::new(Mutex::new(None));
+    let loading: Arc<Mutex<Option<LoadingStatus>>> = Arc::new(Mutex::new(None));
     let stored_limits = crate::store::read_runtime_limits(&db)?;
     let limits = RuntimeLimits {
         queue_max_waiting: cli_overrides
@@ -601,15 +612,65 @@ pub fn open_app_at_full(
         .unwrap_or(DEFAULT_BIND_PORT);
     let stored_network_mode = crate::store::read_network_mode_setting(&db)?;
     let network_mode = crate::network::resolve_mode(network_override, stored_network_mode);
+    // CLI `--cors-origin` > stored `cors_allowed_origins` setting > default
+    // empty (no browser origin allowed). See `App::cors_origins`.
+    let cors_origins = bind_overrides
+        .cors_origins
+        .clone()
+        .or(crate::store::read_cors_origins_setting(&db)?)
+        .unwrap_or_default();
     let network_state = if network_custom {
         crate::network::NetworkReport::custom(&bind_host)
     } else {
         crate::network::NetworkReport::local(network_mode)
     };
+    // Kick off the background reload now that `loaded`/`loading` (the slots
+    // the detached thread will write into) exist, but before `App` itself is
+    // built -- `spawn_tracked_load` only needs clones of these two `Arc`s,
+    // not the whole `App`. Never blocks: `open_app_at_full` returns as soon
+    // as this call returns, regardless of how long the real load takes.
+    // Test-only seam (`STT_NEXT_TEST_SLOW_LOAD_MS`, milliseconds): simulates
+    // a slow/huge-model startup load without needing a real multi-gigabyte
+    // GGUF, so CLI-level tests (`src/bin/server.rs`'s `slow_load_cli_tests`)
+    // can exercise "server.json/`/health` available immediately, `stop`
+    // returns promptly during a load" against a real process. It never
+    // resolves to a usable model (the loader always errors after sleeping),
+    // matching the "on a failed load, `slot` is left untouched" contract
+    // `spawn_tracked_load` already documents; it fires regardless of whether
+    // a real model is selected, and is mutually exclusive with the real
+    // reload below since neither test data dir nor a real deployment ever
+    // sets both.
+    if let Ok(raw) = std::env::var("STT_NEXT_TEST_SLOW_LOAD_MS") {
+        let delay_ms: u64 = raw
+            .parse()
+            .map_err(|_| std::io::Error::other("STT_NEXT_TEST_SLOW_LOAD_MS must be an integer"))?;
+        let loaded_slot = loaded.clone();
+        let loading_slot = loading.clone();
+        spawn_tracked_load(
+            loading_slot,
+            loaded_slot,
+            "test-slow-model".to_owned(),
+            move || -> Result<LoadedModel, &'static str> {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                Err("STT_NEXT_TEST_SLOW_LOAD_MS test seam never resolves to a real model")
+            },
+        );
+    } else if let Some((id, path)) = selected {
+        let preference = preference.clone();
+        let loaded_slot = loaded.clone();
+        let loading_slot = loading.clone();
+        let model_id = id.clone();
+        spawn_tracked_load(loading_slot, loaded_slot, model_id, move || {
+            load_engine(Path::new(&path), &preference)
+                .map(|(model, diagnostic)| LoadedModel::new(id, model, diagnostic))
+        });
+    }
+
     Ok(Arc::new(App {
         catalog: catalog.models,
         db: Mutex::new(db),
-        loaded: Mutex::new(loaded),
+        loaded,
+        loading,
         data_dir,
         token,
         user_token,
@@ -626,6 +687,7 @@ pub fn open_app_at_full(
         bind_port,
         network_mode,
         network_custom,
+        cors_origins,
         network_state: std::sync::RwLock::new(network_state),
         shutdown: Mutex::new(None),
     }))
@@ -1083,6 +1145,7 @@ mod recovery_tests {
             BindOverrides {
                 host: Some("0.0.0.0".to_owned()),
                 port: None,
+                cors_origins: None,
             },
             Some(crate::network::NetworkMode::Tailscale),
         )

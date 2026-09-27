@@ -21,6 +21,10 @@ fn bind_overrides(flags: &RunFlags) -> BindOverrides {
     BindOverrides {
         host: flags.host.clone(),
         port: flags.port,
+        // `None` (not `Some(vec![])`) when `--cors-origin` was never given,
+        // so it loses precedence to the stored setting rather than forcing
+        // the default empty (locked-down) list -- see `App::cors_origins`.
+        cors_origins: (!flags.cors_origins.is_empty()).then(|| flags.cors_origins.clone()),
     }
 }
 
@@ -229,6 +233,7 @@ async fn cmd_update_install(data_dir: PathBuf, yes: bool, json: bool) -> i32 {
         port: previous_info.as_ref().map(|info| info.port),
         network: None,
         limits: Default::default(),
+        cors_origins: Vec::new(),
     };
 
     if !was_running {
@@ -1354,6 +1359,7 @@ mod models_cli_tests {
             let overrides = app::BindOverrides {
                 host: Some("127.0.0.1".to_owned()),
                 port: Some(port),
+                cors_origins: None,
             };
             let _ = stt_server_next::api::run_http_full(
                 dir_for_task,
@@ -1507,6 +1513,7 @@ mod models_cli_tests {
             let overrides = app::BindOverrides {
                 host: Some("127.0.0.1".to_owned()),
                 port: None,
+                cors_origins: None,
             };
             // A machine-wide install would fail clearly instead; PerUser is
             // what's eligible to fall back here.

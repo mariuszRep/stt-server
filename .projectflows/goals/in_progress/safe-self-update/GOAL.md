@@ -8,7 +8,7 @@ scope: stt-server-next only
 attempt: 1
 max_attempts: 8
 last_result: implemented; unit/mock-server rehearsal green; real GitHub Releases source untested (repo private)
-next_action: Rehearse a live N to N+1 update and forced rollback with two real tagged binaries once a release source exists; confirm asset naming and non-interactive install behaviour with the user.
+next_action: Rehearse a live N to N+1 update and forced rollback with two real tagged binaries once a release source exists.
 success_criteria:
   - A user can check for a newer released server and choose when to install it through the CLI.
   - The downloaded executable is checked against the release checksum before it can replace the running version.
@@ -109,3 +109,9 @@ Implemented and unit/mock-server tested (attempt 1); not yet verified against a 
 server pair or the real GitHub Releases source. Left in `in_progress` pending review.
 
 2026-09-26: Orchestrator re-ran gates: fmt clean, clippy clean, cargo test 202 lib + 10 bin passed. Live two-binary update/rollback not yet rehearsed; goal stays in_progress.
+
+2026-09-27: User approved the two open design decisions from attempt 1: release assets are named
+`stt-server-next.exe` and `stt-server-next.exe.sha256`, and `update install` without `--yes`
+continues to only report what it would do (no interactive stdin prompt). No implementation change
+needed -- attempt 1 already matches this. `next_action` updated to drop these as open decisions;
+only the live two-binary/real-release-source rehearsal remains outstanding.

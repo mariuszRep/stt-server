@@ -185,10 +185,18 @@ where to drop files should read `GET /v1/local/config`'s
   an ordinary local user on a machine-wide install). A command that then
   hits an admin-only route gets the server's `403 admin_required` and prints
   "admin access required (run as administrator)", exiting non-zero.
-- **CORS:** `GET /v1/local/config`'s `cors_allowed_origins` (default `["*"]`)
-  controls `Access-Control-Allow-Origin`; set via `PATCH /v1/local/config`.
-  An origin must be `*` or an exact `http(s)://host[:port]` (no path/query/
-  credentials) -- see `store::is_valid_cors_origin`.
+- **CORS:** `GET /v1/local/config`'s `cors_allowed_origins` (default `[]` --
+  no browser origin allowed; see "CORS locked down by default" below)
+  controls `Access-Control-Allow-Origin`; set via `PATCH /v1/local/config`
+  (admin only) or the CLI `--cors-origin <origin>` flag (repeatable) on
+  `run`/`start`/`restart`. Precedence: CLI flag(s) for that process > stored
+  setting > default `[]`. An origin must be `*` or an exact
+  `http(s)://host[:port]` (no path/query/credentials) -- see
+  `store::is_valid_cors_origin`; a malformed entry returns 400
+  `invalid_cors_origins`. This only ever affects a browser page attaching an
+  `Origin` header -- Voice Typer, `stt-sdk`, the CLI, and curl send no such
+  header and are unaffected by this setting either way, and the bearer token
+  is still required on every non-`/health` route regardless of CORS.
 - **LAN mode:** binding `--host` to anything non-loopback (not `127.0.0.1`/
   `::1`) requires a non-empty token to exist already; the server refuses to
   start on a non-loopback bind with an empty/missing token
@@ -255,17 +263,37 @@ object reports `mode: "custom"` (see 7a below) instead of resolving
 - A CLI/API caller cannot force `lan`/`tailscale` to actually reach a device
   without the token: the existing LAN-guard rule (token required beyond
   `/health` for any non-loopback bind) is unchanged and still enforced first.
-- **CORS default reviewed (2026-09-26):** `*` is kept as the default. It is
-  safe against the LAN threat this server actually faces -- auth is a bearer
-  header the browser can't attach on its own and a web page has no way to
-  read `auth.token` off disk, so an allowed origin still can't call an
-  authenticated route without the operator handing it the token some other
-  way. The residual risk is that any web page can probe `GET /health` (the
-  one unauthenticated route) and learn a server exists on that port; this is
-  accepted for now given the intended local/LAN clients (an Electron/Tauri
-  app and `stt-sdk`, neither of which is a same-origin-policy-restricted
-  browser tab) but should be revisited before the repo goes public. No
-  change made; this note is the recorded review.
+- **CORS locked down by default (superseded 2026-09-26 review; user decision
+  2026-09-27):** the 2026-09-26 review below kept `*` as the default and
+  accepted the residual risk of any web page probing `GET /health`. On
+  2026-09-27 the user revisited that decision and reversed it now that the
+  repo is headed toward public: the default is now no browser origin allowed
+  at all (`cors_allowed_origins` defaults to `[]`, no
+  `Access-Control-Allow-Origin` header for any `Origin`), configurable via
+  `cors_allowed_origins` on `PATCH /v1/local/config` (admin) and the CLI
+  `--cors-origin <origin>` flag (repeatable) on `run`/`start`/`restart`,
+  precedence CLI > stored > default `[]`. `"*"` is still accepted but only
+  when explicitly set -- an old install's implicit wide-open default was
+  never itself a stored value (it only ever existed as `default_cors_origins`'s
+  fallback return, never written to the `settings` table), so upgrading a
+  process that never called `PATCH .../config` for CORS lands on the new
+  empty default automatically, with no migration needed; a stored `"*"`
+  found in the database can only have gotten there through an explicit past
+  `PATCH`, so it is correctly honoured as an explicit choice, not silently
+  narrowed. Non-browser clients (Voice Typer, `stt-sdk`, the CLI, curl) are
+  unaffected either way, since CORS only ever reacts to a browser's `Origin`
+  header and the bearer token requirement on every non-`/health` route is
+  unchanged. See the README's "Browser access (CORS)" section for the
+  operator-facing writeup, and the "install scope and shared access" goal's
+  verification log for this decision's record.
+- **Original CORS default review (2026-09-26, historical):** `*` was kept as
+  the default at the time. It was judged safe against the LAN threat this
+  server actually faces -- auth is a bearer header the browser can't attach
+  on its own and a web page has no way to read `auth.token` off disk, so an
+  allowed origin still couldn't call an authenticated route without the
+  operator handing it the token some other way. The residual risk noted then
+  (any web page probing `GET /health`, the one unauthenticated route) is what
+  the 2026-09-27 decision above no longer accepts.
 - **No idle timeout.** Unlike the old `stt`/faster-whisper CLI's
   `--idle-timeout-secs`, `stt-server-next` never shuts itself down for lack
   of requests. An app-owned launch (1.1) that used to rely on an idle timeout
@@ -362,6 +390,50 @@ per optional control (`prompt`, `temperature`, `language_hint`,
   "mechanism": "whisper_initial_prompt" | null,
   "extra": { "...": "..." } }
 ```
+
+### 4.2 Background loading (instant startup, no blocking on a slow/huge model)
+
+The HTTP server, `server.json`, and `/health` are available immediately at
+startup; the previously selected model (from a prior `select`) reloads on a
+detached background thread and is never joined before serving starts.
+Previously, a huge model that fell back to CPU (e.g. Voxtral-Small-24B)
+could take minutes to load, during which `server.json` did not exist yet, so
+`stop`/`status`/`models list` all failed as if the server weren't running at
+all -- only killing the process worked. Now:
+
+- **`GET /health`** is `ok` throughout, whether or not a model is loaded or
+  loading -- it never depends on model state, so `status`/`stop` always work.
+- **`GET /readiness`** is `503 {"status": "not_ready", "reason": "loading
+  model", "model": id, "elapsed_ms": n}` while the reload is in progress,
+  distinct from the plain `{"reason": "No selected model loaded"}` case
+  (nothing selected at all, or the load already failed). Once it finishes,
+  readiness flips straight to `200 {"status": "ready", ...}` (see 7).
+- **A transcription/translation request during the load** gets `503
+  {"error": {"code": "model_loading", "message": "...", "details": {"model",
+  "elapsed_ms"}}}` rather than the generic `server_not_ready` -- a client can
+  tell "it's on its way, poll and retry" apart from "nothing is selected, go
+  select one." Per `CONVENTIONS.md`'s "a request uses the model that was
+  loaded when it entered the queue" rule, a request never waits for a load
+  in progress and never silently ends up using whatever model finishes
+  loading later; it is rejected outright and the caller retries.
+- **`POST /v1/local/models/{id}/select`** (and `.../load`) while a
+  background load is already in progress is rejected with `409
+  {"error": {"code": "model_loading", "details": {"model", "elapsed_ms"}}}`
+  rather than queued -- the simplest sane behaviour, since the in-progress
+  load has no cancellation support. Retry once `/readiness` clears.
+- **A failed background load** (bad file, out of memory, ...) leaves nothing
+  loaded and logs the error to stderr; there is no client-facing error for
+  it specifically (startup has already moved on by the time it could
+  complete) -- `/readiness`/transcription then report the plain "no selected
+  model" case, and re-`select`ing (now unblocked, since `loading` has
+  cleared) is how a client recovers.
+- **`stop`/shutdown during a load** returns promptly: the server never joins
+  the loading thread, so shutdown proceeds as soon as in-flight HTTP work
+  drains, leaving the loader thread to be torn down with the process. The
+  database is left consistent either way (the loader only ever writes into
+  the in-memory `loaded`/`loading` slots, never the database, during a
+  reload; a future `select` remains the only thing that persists a chosen
+  model row).
 
 **Timestamp gate (Bug 1, corrected):** an earlier revision of this fix
 distrusted `transcribe_cpp::Model::capabilities().max_timestamp_kind` and
@@ -524,12 +596,12 @@ source (`src/api.rs`, `src/audio.rs`, `src/auth.rs`, `src/catalog.rs`,
 | 401 | `unauthorized` |
 | 403 | `loopback_only` (`/v1/local/shutdown` from a non-loopback caller), `admin_required` (a valid user token used on an admin-only route -- see section 3), `network_not_private` (a non-loopback caller under `network_mode: "lan"`/`"tailscale"` while the live check doesn't currently allow it -- see 3.1) |
 | 404 | `model_not_found`, `operation_not_found`, `model_not_installed` (verify, and remove of a never-installed id) |
-| 409 | `already_installed`, `operation_conflict`, `operation_finished` (cancelling a terminal operation), `model_in_use` (removing the selected model), `model_not_installed` (select, before install), **`needs_verification`** (select, before verify/refresh -- see 4), `model_load_failed`, `model_not_active` (a transcription request while nothing is loaded but the server is otherwise ready), `unowned_model_path` (refusing to remove a file outside the managed store) |
+| 409 | `already_installed`, `operation_conflict`, `operation_finished` (cancelling a terminal operation), `model_in_use` (removing the selected model), `model_not_installed` (select, before install), **`needs_verification`** (select, before verify/refresh -- see 4), `model_load_failed`, `model_not_active` (a transcription request while nothing is loaded but the server is otherwise ready), `unowned_model_path` (refusing to remove a file outside the managed store), `model_loading` (select/load of a different model while a background load is already in progress -- see 4.2) |
 | 413 | `audio_too_long` (payload too large) |
 | 422 | `unsupported_capability`, `engine_unsupported`, `engine_rejected_option`, `prompt_too_long`, `size_mismatch` (import exceeds catalog size), `hash_mismatch` (import/verify SHA-256 or size mismatch) |
 | 429 | `queue_full` |
 | 500 | `internal_error`, `inference_failed` (message only; not meant to be pattern-matched) |
-| 503 | `server_not_ready` (no model loaded; includes an `operation_id` in `details` when an install/verify that would fix this is already running), `not_ready`, `engine_busy`, `queue_timeout` |
+| 503 | `server_not_ready` (no model loaded; includes an `operation_id` in `details` when an install/verify that would fix this is already running), `not_ready`, `model_loading` (a transcription request while the selected model is still loading in the background; `details` carries `model`/`elapsed_ms` -- see 4.2), `engine_busy`, `queue_timeout` |
 | 504 | `inference_timeout` |
 | 507 | `insufficient_memory` (insufficient storage) |
 
@@ -569,8 +641,10 @@ first:
   network-mode UI should read this object rather than infer reachability
   from `mode` alone.
 - `GET /readiness` -- `200 {"status": "ready", "model": id, "backend":
-  {...}}` when a model is loaded, else `503 {"status": "not_ready",
-  "reason": "..."}`.
+  {...}}` when a model is loaded; `503 {"status": "not_ready", "reason":
+  "loading model", "model": id, "elapsed_ms": n}` while it is still loading
+  in the background (see 4.2); else `503 {"status": "not_ready", "reason":
+  "No selected model loaded"}`.
 - `GET /v1/local/models/selected` -- which model, and its full capability
   matrix (4.1).
 - `GET /v1/local/system` -- hardware: see 8.
