@@ -24,8 +24,13 @@ use windows_service::{
     service_manager::{ServiceManager, ServiceManagerAccess},
 };
 
+use std::os::windows::process::CommandExt;
+
 use crate::api::run_http;
-use crate::app::{data_dir, machine_wide_data_dir, machine_wide_program_dir, token_file};
+use crate::app::{
+    data_dir, machine_wide_old_program_dir, machine_wide_program_dir, migrate_machine_wide_data,
+    token_file,
+};
 
 const NAME: &str = "OpenVibeSttNext";
 define_windows_service!(ffi_service_main, service_main);
@@ -161,7 +166,12 @@ pub fn install() -> Result<(), Box<dyn Error>> {
     // so the binary is still recognized after being moved/copied elsewhere
     // (e.g. by an installer that stages it under a different path first).
     fs::write(install_dir.join(".machine-wide-install"), b"")?;
-    let data = machine_wide_data_dir();
+    // Best effort: the old program folder only ever held a copy of the exe.
+    let old_program_dir = machine_wide_old_program_dir();
+    if old_program_dir.exists() && old_program_dir != install_dir {
+        let _ = fs::remove_dir_all(&old_program_dir);
+    }
+    let data = migrate_machine_wide_data();
     fs::create_dir_all(&data)?;
     let token_path = data.join("auth.token");
     let owner = owner_name()?;
@@ -234,6 +244,9 @@ pub fn install() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const DETACHED_PROCESS: u32 = 0x0000_0008;
+
 pub fn uninstall() -> Result<(), Box<dyn Error>> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service = manager.open_service(
@@ -251,9 +264,22 @@ pub fn uninstall() -> Result<(), Box<dyn Error>> {
     }
     service.delete()?;
     drop(service);
-    let binary = install_dir().join("stt-server-next.exe");
-    if binary.exists() {
-        fs::remove_file(binary)?;
+    let dir = install_dir();
+    let running_from_install = std::env::current_exe()
+        .map(|exe| exe.parent() == Some(dir.as_path()))
+        .unwrap_or(false);
+    if running_from_install {
+        // A running exe cannot delete itself; remove the folder once this process has exited.
+        let script = format!(
+            "ping -n 3 127.0.0.1 >nul & rmdir /s /q \"{}\"",
+            dir.display()
+        );
+        Command::new("cmd")
+            .args(["/C", &script])
+            .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+            .spawn()?;
+    } else if dir.exists() {
+        fs::remove_dir_all(&dir)?;
     }
     println!("Removed {NAME}; model and state data preserved");
     Ok(())

@@ -110,6 +110,21 @@ fn machine_wide_old_data_dir() -> PathBuf {
     programdata_dir().join("OpenVibeAI").join("STT Server Next")
 }
 
+/// Moves a pre-unification machine-wide data folder to the current name
+/// before `service install` creates anything, so the old data is carried
+/// over instead of being shadowed by a fresh empty folder.
+pub fn migrate_machine_wide_data() -> PathBuf {
+    migrate_dir_once(&machine_wide_data_dir(), &machine_wide_old_data_dir())
+}
+
+/// The old (pre-unification) machine-wide program folder, removed by
+/// `service install` once the new one is in place.
+pub fn machine_wide_old_program_dir() -> PathBuf {
+    program_files_dir()
+        .join("OpenVibeAI")
+        .join("STT Server Next")
+}
+
 /// `%LOCALAPPDATA%\OpenVibeAI\STT Server`: a per-user install's single data
 /// folder. `None` only when `LOCALAPPDATA` itself is unset (not expected on
 /// real Windows).
