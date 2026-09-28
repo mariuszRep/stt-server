@@ -610,17 +610,63 @@ fn callable_capabilities(app: &App, id: &str, catalog_fallback: Option<Value>) -
 
 /// One `GET /v1/models`/`GET /v1/models/{id}` entry for a callable
 /// (downloaded, verified) model: OpenAI's `{id, object, owned_by}` shape plus
-/// this server's extension fields `default` and `capabilities`. See
-/// `docs/client-contract.md`.
+/// this server's extension fields `default`, `capabilities`, `languages`, and
+/// `language_detect`. See `docs/client-contract.md`.
+///
+/// `languages` and `language_detect` are derived from the same `capabilities`
+/// view above (so they agree with it): the live `EffectiveCaps` for this
+/// model if this process has ever loaded it (`language_hint.languages` --
+/// `ControlCapability::to_json` flattens its `extra` map into the control's
+/// own object -- and `language_detect.status == "supported"`), falling back
+/// to the catalog's static claim, or, for a custom/drop-in model with no
+/// catalog entry, its own GGUF-header-derived languages and `lang_detect`
+/// claim.
 fn openai_model_entry(app: &App, id: &str, default_id: Option<&str>) -> ApiResult<Value> {
-    let catalog_fallback = catalog_model(app, id).ok().map(capability_matrix);
+    let catalog_model = catalog_model(app, id).ok();
+    let catalog_fallback = catalog_model.map(capability_matrix);
     let capabilities = callable_capabilities(app, id, catalog_fallback)?;
+
+    let languages_from_capabilities = capabilities["language_hint"]["languages"]
+        .as_array()
+        .cloned();
+    let language_detect_from_capabilities = match &capabilities["language_detect"]["status"] {
+        Value::String(status) if status != "unknown" => Some(status == "supported"),
+        _ => None,
+    };
+
+    let (languages, language_detect) = if let (Some(languages), Some(language_detect)) = (
+        languages_from_capabilities,
+        language_detect_from_capabilities,
+    ) {
+        (json!(languages), json!(language_detect))
+    } else if let Some(model) = catalog_model {
+        (
+            json!(model.languages),
+            json!(model.capabilities.lang_detect),
+        )
+    } else {
+        let installed = installed_file(app, id)?;
+        let languages = installed
+            .as_ref()
+            .and_then(|file| file.custom_languages.clone())
+            .unwrap_or_default();
+        let language_detect = installed
+            .as_ref()
+            .and_then(|file| file.custom_claims.as_ref())
+            .and_then(|claims| claims.get("lang_detect"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        (json!(languages), json!(language_detect))
+    };
+
     Ok(json!({
         "id": id,
         "object": "model",
         "owned_by": "local",
         "default": Some(id) == default_id,
         "capabilities": capabilities,
+        "languages": languages,
+        "language_detect": language_detect,
     }))
 }
 
@@ -2564,6 +2610,103 @@ mod router_tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         drop(router);
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    /// `GET /v1/models/{id}` reports top-level `languages`/`language_detect`
+    /// for a callable catalog model, falling back to the catalog's static
+    /// claim when this process has never loaded it.
+    #[tokio::test]
+    async fn openai_model_entry_reports_catalog_languages_when_unloaded() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let model = app.catalog[0].clone();
+        {
+            let db = app.db.lock().unwrap();
+            db.execute(
+                "INSERT INTO installed(id,path,sha256,source) VALUES(?1,'unused','x','catalog_download')",
+                rusqlite::params![model.slug],
+            )
+            .unwrap();
+        }
+        let router = router(app.clone());
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/models/{}", model.slug))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["languages"], json!(model.languages));
+        assert_eq!(
+            body["language_detect"],
+            json!(model.capabilities.lang_detect)
+        );
+
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    /// `GET /v1/models/{id}` prefers the live `EffectiveCaps` view for
+    /// `languages`/`language_detect` once this process has loaded the model,
+    /// even when it differs from the catalog's static claim.
+    #[tokio::test]
+    async fn openai_model_entry_reports_live_languages_when_loaded() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let model = app.catalog[0].clone();
+        {
+            let db = app.db.lock().unwrap();
+            db.execute(
+                "INSERT INTO installed(id,path,sha256,source) VALUES(?1,'unused','x','catalog_download')",
+                rusqlite::params![model.slug],
+            )
+            .unwrap();
+        }
+        let live_languages = vec!["zz".to_string(), "yy".to_string()];
+        let live_caps = crate::capabilities::EffectiveCaps::new(crate::capabilities::LoadedCaps {
+            arch: model.architecture.clone(),
+            languages: live_languages.clone(),
+            translate_target_languages: vec![],
+            supports_translate: false,
+            supports_language_detect: true,
+            max_timestamp_kind: crate::capabilities::TimestampGranularity::None,
+            feature_initial_prompt_flag: false,
+            whisper_ext_accepted: None,
+            prompt_max_tokens: None,
+            timestamp_granularity_rejected: false,
+        });
+        app.live_caps
+            .lock()
+            .unwrap()
+            .insert(model.slug.clone(), live_caps);
+
+        let router = router(app.clone());
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/models/{}", model.slug))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["languages"], json!(live_languages));
+        assert_eq!(body["language_detect"], json!(true));
+
         drop(app);
         std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
     }
