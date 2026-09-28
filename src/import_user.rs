@@ -1,4 +1,4 @@
-//! `POST /v1/local/models/import-user`: admin-only. Copies GGUF files from
+//! `POST /models/manage/import-user`: admin-only. Copies GGUF files from
 //! another install's models folder (default: this OS user's own per-user
 //! data folder, `crate::app::per_user_data_dir`) into *this* install's
 //! managed store -- the machine-wide-from-per-user case the goal describes
@@ -160,7 +160,7 @@ fn is_cancelled(app: &App, operation_id: &str) -> bool {
 }
 
 /// Entry point run inside the `tokio::spawn`ed task backing
-/// `POST /v1/local/models/import-user`. A missing source models folder is
+/// `POST /models/manage/import-user`. A missing source models folder is
 /// treated as an empty source (nothing to import), the same way `dropin.rs`
 /// treats a missing drop-in folder -- it simply means the source install has
 /// no models yet, not an error.
@@ -381,7 +381,7 @@ mod tests {
         let router = router(app.clone());
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/local/models/import-user")
+            .uri("/models/manage/import-user")
             .header("authorization", format!("Bearer {token}"))
             .header("content-type", "application/json")
             .body(Body::from(
@@ -527,7 +527,7 @@ mod tests {
         let router = router(app.clone());
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/local/models/import-user")
+            .uri("/models/manage/import-user")
             .header("authorization", format!("Bearer {}", app.user_token))
             .header("content-type", "application/json")
             .body(Body::from(json!({"from": "C:\\nowhere"}).to_string()))

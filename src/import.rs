@@ -328,7 +328,7 @@ mod tests {
     /// with `download.rs`) instead of writing SQLite on every multipart
     /// chunk. This exercises the whole streaming-then-force-flush path end
     /// to end and pins the outcome that matters to a client polling
-    /// `GET /v1/local/operations/{id}`: the operation ends `completed` with
+    /// `GET /models/manage/operations/{id}`: the operation ends `completed` with
     /// `progress_bytes` equal to the full file size, not just whatever the
     /// last throttled write happened to catch.
     #[tokio::test]
@@ -348,7 +348,7 @@ mod tests {
         let body = import_body(boundary, "fake-import-model", &file_bytes);
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/local/models/import")
+            .uri("/models/manage/import")
             .header("authorization", format!("Bearer {token}"))
             .header(
                 "content-type",

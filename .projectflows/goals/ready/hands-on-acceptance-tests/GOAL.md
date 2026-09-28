@@ -47,10 +47,10 @@ Copy `stt-server-next.exe` to `C:\stt\` in the VM. Install nothing else. In a no
 cd C:\stt
 .\stt-server-next.exe start
 .\stt-server-next.exe status --json          # expect: running: true, version and api_level shown; note the "port" field
-.\stt-server-next.exe models install whisper-tiny --wait
-.\stt-server-next.exe models select whisper-tiny   # sets whisper-tiny as the default AND loads it
+.\stt-server-next.exe models download whisper-tiny --wait
+.\stt-server-next.exe models default whisper-tiny   # sets whisper-tiny as the default AND loads it
 .\stt-server-next.exe health                 # expect: ready; backend CPU with a fallback reason; default_model and loaded_model both whisper-tiny
-.\stt-server-next.exe models install moonshine-tiny --wait   # a second downloaded model (whisper-tiny stays the default)
+.\stt-server-next.exe models download moonshine-tiny --wait   # a second downloaded model (whisper-tiny stays the default)
 .\stt-server-next.exe stop
 ```
 
@@ -69,8 +69,8 @@ $exe = 'D:\Users\mariu\Projects\stt-server-next\s\release\stt-server-next.exe'
 & $exe health                                # expect: network mode lan, effective lan
 Get-Content "$env:LOCALAPPDATA\OpenVibeAI\STT Server\auth.token"
 Get-Content "$env:LOCALAPPDATA\OpenVibeAI\STT Server\user.token"
-& $exe models install whisper-tiny --wait; & $exe models install moonshine-tiny --wait
-& $exe models select whisper-tiny            # default model, and confirms something is loaded
+& $exe models download whisper-tiny --wait; & $exe models download moonshine-tiny --wait
+& $exe models default whisper-tiny            # default model, and confirms something is loaded
 & $exe health                                # expect: ready, default_model and loaded_model both whisper-tiny
 ```
 
@@ -83,7 +83,7 @@ curl.exe -s http://<LAPTOP-IP>:<PORT>/health                               # exp
 curl.exe -s -o NUL -w "%{http_code}`n" http://<LAPTOP-IP>:<PORT>/v1/models  # expect: 401
 curl.exe -s -H "Authorization: Bearer <USER-TOKEN>" -F file=@C:\stt\clip.wav -F model=default http://<LAPTOP-IP>:<PORT>/v1/audio/transcriptions   # expect: text, model=whisper-tiny in x_diagnostics
 curl.exe -s -H "Authorization: Bearer <USER-TOKEN>" -F file=@C:\stt\clip.wav -F model=moonshine-tiny http://<LAPTOP-IP>:<PORT>/v1/audio/transcriptions   # expect: text, model=moonshine-tiny in x_diagnostics -- the server swaps models itself, no select call
-curl.exe -s -o NUL -w "%{http_code}`n" -X POST -H "Authorization: Bearer <USER-TOKEN>" http://<LAPTOP-IP>:<PORT>/v1/local/models/refresh   # expect: 403
+curl.exe -s -o NUL -w "%{http_code}`n" -X POST -H "Authorization: Bearer <USER-TOKEN>" http://<LAPTOP-IP>:<PORT>/models/manage/refresh   # expect: 403
 ```
 
 Optional: switch the laptop's network to Public in Windows settings, wait 30 s, repeat the
@@ -130,8 +130,8 @@ Admin PowerShell in the VM:
 C:\stt\stt-server-next.exe service install
 $svc = 'C:\Program Files\OpenVibeAI\STT Server\stt-server-next.exe'
 $data = 'C:\ProgramData\OpenVibeAI\STT Server'
-& $svc models install whisper-tiny --wait --data-dir $data
-& $svc models select whisper-tiny --data-dir $data
+& $svc models download whisper-tiny --wait --data-dir $data
+& $svc models default whisper-tiny --data-dir $data
 net user tester Test1234! /add               # a standard (non-admin) user
 ```
 
@@ -159,7 +159,7 @@ deletes the file:
 & $svc models remove whisper-tiny --data-dir $data
 & $svc models import-user --from "$env:LOCALAPPDATA\OpenVibeAI\STT Server" --wait --data-dir $data
 & $svc models list --data-dir $data          # expect: whisper-tiny installed, no download happened
-& $svc models select whisper-tiny --data-dir $data   # re-establish a default/loaded model before section F
+& $svc models default whisper-tiny --data-dir $data   # re-establish a default/loaded model before section F
 ```
 
 ## F. Uninstall (inside the VM)
@@ -176,7 +176,7 @@ Get-ChildItem "$data\models" | Select Name                     # expect: model f
 
 Not automated here -- unit-tested only (`insufficient_disk_space`'s preflight check in
 `src/download.rs`/`src/update_transaction.rs`). If a real full-disk rehearsal is done: shrink a VM
-disk or fill it with a large dummy file until under ~100 MiB free, then attempt `models install`
+disk or fill it with a large dummy file until under ~100 MiB free, then attempt `models download`
 on an uninstalled model and `update install --yes` on a pending update; expect a clear
 `insufficient_disk_space` failure (or the update's own preflight refusal) in both cases, with no
 partial/corrupted state left registered as installed or as the active executable. Record actual
@@ -188,10 +188,10 @@ free-space thresholds observed, since the preflight math is a heuristic
 
 Not automated here -- unit-tested only (stall timeout, retry/backoff, `.part` resume-from-partial
 in `src/download.rs`; journalled recovery in `src/update_transaction.rs`). If a real interruption
-rehearsal is done: start a large model's `models install`, then hard-kill the server process (or
+rehearsal is done: start a large model's `models download`, then hard-kill the server process (or
 the VM itself) partway through; on restart, confirm via `models list`/`operations` that the
 interrupted operation is reported `failed` (not silently resumed), that the `.part` file under
-`<data dir>\staging` is still present, and that a fresh `models install` of the same model reuses
+`<data dir>\staging` is still present, and that a fresh `models download` of the same model reuses
 it (verify via a visibly shorter download / an immediate "resuming" indication) rather than
 starting from zero. Separately, kill the process mid-`update install --yes` and confirm the
 one-shot recovery Scheduled Task rolls the executable and database back to the previous version on

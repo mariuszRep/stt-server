@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use crate::discovery;
 
-/// Interval between `GET /v1/local/operations/{id}` polls under `--wait`.
+/// Interval between `GET /models/manage/operations/{id}` polls under `--wait`.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Debug)]
@@ -153,7 +153,7 @@ pub fn format_error(outcome: &ApiOutcome) -> String {
         }
         "already_installed" => " -- the model is already installed",
         "operation_conflict" => " -- an operation for this model is already running; use `models cancel <operation_id>` or wait",
-        "model_not_installed" => " -- install it first with `models install <id>`",
+        "model_not_installed" => " -- install it first with `models download <id>`",
         "model_in_use" => " -- unload it first with `models unload`",
         "model_not_found" | "operation_not_found" => " -- check the id",
         "server_not_ready" => " -- no model is loaded yet; select one, or check for an in-progress install/verify",
@@ -168,7 +168,7 @@ pub fn format_error(outcome: &ApiOutcome) -> String {
     }
 }
 
-/// Polls `GET /v1/local/operations/{id}` on [`POLL_INTERVAL`] until it
+/// Polls `GET /models/manage/operations/{id}` on [`POLL_INTERVAL`] until it
 /// reaches a terminal state (`completed`/`failed`/`cancelled`), printing
 /// progress lines unless `json` (in which case only the final body matters
 /// to the caller). Returns the last-seen operation body.
@@ -178,7 +178,7 @@ pub async fn poll_operation(
     json: bool,
 ) -> Result<Value, String> {
     loop {
-        let path = format!("/v1/local/operations/{operation_id}");
+        let path = format!("/models/manage/operations/{operation_id}");
         let outcome = call(conn, reqwest::Method::GET, &path, None).await?;
         if outcome.is_error() {
             return Err(format_error(&outcome));
@@ -214,7 +214,7 @@ fn print_progress_line(body: &Value, state: &str) {
     }
 }
 
-/// Streams a local file into `POST /v1/local/models/import` as
+/// Streams a local file into `POST /models/manage/import` as
 /// `multipart/form-data` with the exact field shape `src/import.rs` expects:
 /// a `model` text field, an optional `quant` text field, then a `file` part
 /// -- `model` (and `quant`, if present) must arrive before `file` since the
@@ -243,7 +243,7 @@ pub async fn import_model(
     );
     let response = conn
         .client
-        .post(format!("{}/v1/local/models/import", conn.base_url))
+        .post(format!("{}/models/manage/import", conn.base_url))
         .bearer_auth(&conn.token)
         .multipart(form)
         .send()

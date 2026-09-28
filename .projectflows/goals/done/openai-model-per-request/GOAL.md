@@ -2,13 +2,13 @@
 name: openai-model-per-request
 title: Choose the Model per Request, OpenAI-Style, with a Separate Model Manager
 description: Let clients pick any downloaded model on each request, as with OpenAI, while the server swaps models itself; keep the OpenAI model list for downloaded models and move download and removal into a clearly named model manager.
-status: in_progress
+status: done
 type: feature
 scope: stt-server-next only
-attempt: 1
+attempt: 2
 max_attempts: 6
-last_result: none
-next_action: First slice (per-request model choice and default model) implemented and gates green; next slice is the /models/manage path rename, then CLI (`models select` -> `models default`).
+last_result: success
+next_action: none -- both slices implemented, gated, and verified with a real model.
 success_criteria:
   - A request naming any downloaded model is served by that model without a separate select call; the server loads it itself.
   - A request naming a model that is not downloaded gets a clear "model not installed" error, and nothing is ever downloaded by a request.
@@ -120,6 +120,78 @@ Gates (debug target dir `t/`, `cargo fmt --check` / `cargo clippy --all-targets 
 
 Not committed (per instructions).
 
+### Attempt 2 (2026-09-28) -- second slice: the `/models/manage` rename
+
+Implemented the remaining success criteria: the model manager path rename and its CLI follow-on.
+
+- Router (`src/api.rs`): everything formerly under `/v1/local/models*`,
+  `/v1/local/recommendations`, and `/v1/local/operations*` moved to `/models/manage` with no
+  aliases for the old paths (removed outright, per the user's decision -- no clients exist yet):
+  `GET /models/manage` (was `GET /v1/local/models`), `POST /models/manage/{id}/download` (was
+  `.../install`), `POST /models/manage/{id}/verify` (unchanged suffix), `POST
+  /models/manage/{id}/default` (was `.../select` and `.../load`, both removed -- one route now),
+  `DELETE /models/manage/{id}` (remove), `GET`/`DELETE /models/manage/default` (was
+  `/v1/local/models/selected`, same response shapes kept), `POST /models/manage/refresh`,
+  `POST /models/manage/import` / `import-user`, `GET /models/manage/operations/{id}` and
+  `POST .../cancel`, `GET /models/manage/recommendations`. `/v1/local/system`, `/v1/local/config`,
+  `/v1/local/shutdown`, `/health`, `/readiness`, `/v1/models*`, `/v1/audio/*` unchanged. Access
+  levels unchanged (list/default-GET/recommendations/operation-status = user; every change =
+  admin) -- authorization in this codebase is per-handler (`authorize(..., AccessLevel::_)` inside
+  each function), not a path-prefix middleware check, so no separate gate needed updating.
+- Route precedence: axum's router matches a literal path segment ahead of a `{id}` capture
+  regardless of registration order, so `/models/manage/default`, `/refresh`, `/import`,
+  `/import-user`, `/operations/...`, and `/recommendations` are never shadowed by
+  `/models/manage/{id}` -- pinned by a new test,
+  `static_models_manage_routes_take_precedence_over_id_capture`, that hits each static suffix with
+  an id-shaped bogus value and checks for the *right* handler's response shape (not just a
+  non-404 status, since a legitimate `operation_not_found`/`404` from the correct handler and a
+  routing miss both return 404 -- distinguished by the error `code` in the body).
+- Response shape: `/models/manage`'s per-model view now has explicit `downloaded: bool` (renamed
+  from `installed`, which was already a bool; `installed_quant` kept as-is) and a new `default:
+  bool` (missing before this slice) on both catalog and custom/drop-in entries, so a client no
+  longer needs to cross-reference `GET /models/manage/default` separately to know which model is
+  starred.
+- `src/model_cli.rs`, `src/cli.rs`, `src/bin/server.rs`: all CLI HTTP calls use the new paths.
+  Added `models download <id>` (was `models install`, kept as an alias) and `models default <id>`
+  (was `models select`, kept as an alias) to the parser (`cli.rs::parse`) and `USAGE`; `models
+  unload` already meant "clear the default" and needed no rename, just its underlying path
+  (`DELETE /models/manage/default`). New parse tests pin both aliases.
+- `scripts/catalog_sweep.py`: every API call path updated to `/models/manage/...`.
+- `docs/client-contract.md` (route table in section 3, section 4's model-centric flow, the old-call
+  mapping table in section 9), `README.md` (API section, CLI usage block and command
+  descriptions), and `.projectflows/goals/ready/hands-on-acceptance-tests/GOAL.md` (every
+  `/v1/local/models*` path and `models select`/`install` wording replaced; steps otherwise
+  unchanged) updated to the new paths/names.
+- Internal "selected" -> "default" naming: left the `selected_model` settings/DB key name as-is
+  (with its existing comment already covering the rename-in-meaning) since renaming the column
+  itself is a migration for no behavioural gain; renamed the doc-comment/route-string level
+  references throughout `src/store.rs`, `src/import.rs`, `src/import_user.rs`, `src/dropin.rs`.
+- Tests: every existing route test updated to the new paths (was: string literals scattered across
+  ~15 call sites in `src/api.rs` plus the shared `user_routes()`/`admin_routes()` tables); added
+  `old_local_models_paths_are_gone` (every old path 404s: list, selected GET/DELETE,
+  recommendations, refresh, select/load/install/verify/remove-by-id, import, import-user,
+  operations GET/cancel) and the precedence test above.
+
+Gates (debug target dir `t/`): `cargo fmt --check` clean; `cargo clippy --all-targets -- -D
+warnings` clean (0 warnings); `cargo test` (all four test binaries: lib, `stt-proof` bin, `server`
+bin, and the `tests/` integration binary) -- 305 + 0 + 11 + 1 = 317 passed, 0 failed. (One new
+precedence test failed on the first run for a test-design reason, not a product bug -- a bogus
+operation id legitimately 404s from `cancel_operation` itself, indistinguishable by status alone
+from a routing miss; fixed by asserting the response body's `error.code` is `operation_not_found`
+instead of just checking the status code.)
+
+Real check (debug exe, port 54401, temp data dir under `%TEMP%`):
+
+```
+models download whisper-tiny --wait   -> completed: 45981088/45981088 bytes
+models default whisper-tiny           -> {"backend":{"fallback_reason":null,"observed_backend":"Vulkan0"},"model":"whisper-tiny"}
+GET /models/manage                    -> catalog + drop-in list; whisper-tiny row shows "downloaded":true,"default":true
+GET /v1/models                        -> {"data":[{"id":"whisper-tiny","default":true,"capabilities":{...live...},...}]}
+GET /v1/local/models (old path)       -> 404
+POST /v1/audio/transcriptions (WAV)   -> {"text":"you","x_diagnostics":{"model":"whisper-tiny","backend":"Vulkan0","inference_ms":298,...}}
+stop                                  -> "stopped via shutdown endpoint"; temp data dir removed
+```
+
 ## Verification Log
 
 2026-09-28: Created from the user's decisions: model per request with host-side switching,
@@ -130,11 +202,16 @@ models, and the model manager named `/models/manage`.
 see Attempt 1 above for the gate results and real-model check. `/models/manage` rename is the
 next slice.
 
+2026-09-28: Second slice (`/models/manage` path rename, `downloaded`/`default` fields, CLI
+`download`/`default` with `install`/`select` kept as aliases, route-precedence and old-path-404
+tests, docs) implemented and verified -- see Attempt 2 above for the gate results and real-model
+check. All success criteria met; not committed per instructions -- the user commits.
+
 ## Final Outcome
 
-Not done. First slice (per-request model choice, default model, `GET /v1/models`/`/v1/models/{id}`
-restricted to callable models, health/readiness `default_model`/`loaded_model`) is implemented,
-gated (fmt/clippy clean, 297 tests passed at the time), and documented in `README.md` and
-`docs/client-contract.md`. Remaining success criteria not yet done: the `/models/manage` path
-rename (everything currently under `/v1/local/models*`, recommendations, and operations), and the
-CLI rename `models select` -> `models default` (with `select` kept as an alias).
+Done. Both slices of the goal are implemented: per-request model choice with host-side switching
+and a default model (Attempt 1), and the `/models/manage` model manager rename with its CLI
+follow-on (Attempt 2). All six success criteria are met, gates are green (fmt/clippy clean, 317
+tests passing), and a real-model check exercised the new download/default/list/transcribe/stop
+path end to end. Changes are staged in the working tree, not committed -- committing is the user's
+call.

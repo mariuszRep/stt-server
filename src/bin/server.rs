@@ -586,13 +586,8 @@ async fn cmd_health(data_dir: PathBuf, json: bool) -> i32 {
     };
     let health = model_cli::call(&conn, reqwest::Method::GET, "/health", None).await;
     let readiness = model_cli::call(&conn, reqwest::Method::GET, "/readiness", None).await;
-    let selected = model_cli::call(
-        &conn,
-        reqwest::Method::GET,
-        "/v1/local/models/selected",
-        None,
-    )
-    .await;
+    let selected =
+        model_cli::call(&conn, reqwest::Method::GET, "/models/manage/default", None).await;
     let system = model_cli::call(&conn, reqwest::Method::GET, "/v1/local/system", None).await;
 
     let outcomes = [&health, &readiness, &selected, &system];
@@ -688,19 +683,19 @@ fn report_connect_error(error: &ConnectError, json: bool) -> i32 {
 async fn cmd_models(command: ModelsCommand) -> i32 {
     match command {
         ModelsCommand::List { json, data_dir } => {
-            simple_get(data_dir, "/v1/local/models", json).await
+            simple_get(data_dir, "/models/manage", json).await
         }
         ModelsCommand::Recommended { json, data_dir } => {
-            simple_get(data_dir, "/v1/local/recommendations", json).await
+            simple_get(data_dir, "/models/manage/recommendations", json).await
         }
         ModelsCommand::Selected { json, data_dir } => {
-            simple_get(data_dir, "/v1/local/models/selected", json).await
+            simple_get(data_dir, "/models/manage/default", json).await
         }
         ModelsCommand::Unload { json, data_dir } => {
             simple_call(
                 data_dir,
                 reqwest::Method::DELETE,
-                "/v1/local/models/selected",
+                "/models/manage/default",
                 None,
                 json,
             )
@@ -710,7 +705,7 @@ async fn cmd_models(command: ModelsCommand) -> i32 {
             simple_call(
                 data_dir,
                 reqwest::Method::POST,
-                &format!("/v1/local/models/{id}/select"),
+                &format!("/models/manage/{id}/default"),
                 None,
                 json,
             )
@@ -720,7 +715,7 @@ async fn cmd_models(command: ModelsCommand) -> i32 {
             simple_call(
                 data_dir,
                 reqwest::Method::DELETE,
-                &format!("/v1/local/models/{id}"),
+                &format!("/models/manage/{id}"),
                 None,
                 json,
             )
@@ -733,7 +728,7 @@ async fn cmd_models(command: ModelsCommand) -> i32 {
             simple_call(
                 data_dir,
                 reqwest::Method::POST,
-                &format!("/v1/local/operations/{operation_id}/cancel"),
+                &format!("/models/manage/operations/{operation_id}/cancel"),
                 None,
                 false,
             )
@@ -748,7 +743,7 @@ async fn cmd_models(command: ModelsCommand) -> i32 {
             operation_call(
                 effective_data_dir_opt(&data_dir),
                 reqwest::Method::POST,
-                &format!("/v1/local/models/{id}/install"),
+                &format!("/models/manage/{id}/download"),
                 None,
                 wait,
                 json,
@@ -764,7 +759,7 @@ async fn cmd_models(command: ModelsCommand) -> i32 {
             operation_call(
                 effective_data_dir_opt(&data_dir),
                 reqwest::Method::POST,
-                &format!("/v1/local/models/{id}/verify"),
+                &format!("/models/manage/{id}/verify"),
                 None,
                 wait,
                 json,
@@ -781,20 +776,16 @@ async fn cmd_models(command: ModelsCommand) -> i32 {
                 Ok(conn) => conn,
                 Err(error) => return report_connect_error(&error, json),
             };
-            let outcome = match model_cli::call(
-                &conn,
-                reqwest::Method::POST,
-                "/v1/local/models/refresh",
-                None,
-            )
-            .await
-            {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    eprintln!("error: {error}");
-                    return 1;
-                }
-            };
+            let outcome =
+                match model_cli::call(&conn, reqwest::Method::POST, "/models/manage/refresh", None)
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        return 1;
+                    }
+                };
             if outcome.is_error() {
                 return report_api_error(&outcome, json);
             }
@@ -873,7 +864,7 @@ async fn cmd_models(command: ModelsCommand) -> i32 {
             let outcome = match model_cli::call(
                 &conn,
                 reqwest::Method::POST,
-                "/v1/local/models/import-user",
+                "/models/manage/import-user",
                 Some(body),
             )
             .await

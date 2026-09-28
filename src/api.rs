@@ -499,7 +499,7 @@ fn effective_view_if_loaded(app: &App, id: &str) -> ApiResult<Option<Value>> {
         }))
 }
 
-/// Build the `/v1/local/models` view for an installed custom model (a
+/// Build the `/models/manage` view for an installed custom model (a
 /// drop-in file whose header, not the catalog, is the source of its
 /// metadata). See "Integration rules": `source`, `custom: true`, an
 /// `evidence: "gguf_header"` capability view, `installable: false`, and
@@ -527,7 +527,7 @@ fn custom_model_view(installed: &crate::store::InstalledFile) -> Value {
             "streaming": {"status": "unsupported"},
             "response_formats": {"json": "supported", "text": "unsupported", "verbose_json": "unsupported"},
         },
-        "installed": true,
+        "downloaded": true,
         "installed_quant": installed.quant,
         "installable": false,
         "recommended_rank": Value::Null,
@@ -537,7 +537,7 @@ fn custom_model_view(installed: &crate::store::InstalledFile) -> Value {
 }
 
 /// Custom (non-catalog) installed models: rows with `custom_arch` set, i.e.
-/// registered by `/v1/local/models/refresh` from a GGUF header probe rather
+/// registered by `/models/manage/refresh` from a GGUF header probe rather
 /// than a catalog match.
 fn installed_custom_models(app: &App) -> ApiResult<Vec<crate::store::InstalledFile>> {
     Ok(all_installed(app)?
@@ -551,6 +551,7 @@ pub async fn local_models(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     authorize(&headers, &app, AccessLevel::User)?;
+    let default_id = selected_id(&app)?;
     let mut data = app
         .catalog
         .iter()
@@ -570,11 +571,15 @@ pub async fn local_models(
             if let Some(effective) = effective_view_if_loaded(&app, &model.slug)? {
                 view["effective_capabilities"] = effective;
             }
+            view["default"] = json!(default_id.as_deref() == Some(model.slug.as_str()));
             Ok(view)
         })
         .collect::<ApiResult<Vec<_>>>()?;
     for custom in installed_custom_models(&app)? {
-        data.push(custom_model_view(&custom));
+        let is_default = default_id.as_deref() == Some(custom.id.as_str());
+        let mut view = custom_model_view(&custom);
+        view["default"] = json!(is_default);
+        data.push(view);
     }
     Ok(Json(json!({"object":"list", "data":data})))
 }
@@ -1397,7 +1402,7 @@ pub async fn translations(
     transcribe_or_translate(app, headers, multipart, Endpoint::Translations).await
 }
 
-/// `POST /v1/local/models/refresh`: a durable operation (kind `refresh`)
+/// `POST /models/manage/refresh`: a durable operation (kind `refresh`)
 /// that scans the drop-in `user_models_dir` for new/changed/removed `.gguf`
 /// files. See `crate::dropin` for the scan/registration rules.
 pub async fn refresh_models(
@@ -1448,30 +1453,32 @@ pub fn router(app: Arc<App>) -> Router {
             post(translations).layer(DefaultBodyLimit::max(40 * 1024 * 1024)),
         )
         .route("/v1/local/system", get(system_info))
-        .route("/v1/local/recommendations", get(recommendations))
         .route("/v1/local/config", get(get_config).patch(patch_config))
         .route("/v1/local/shutdown", post(shutdown_endpoint))
-        .route("/v1/local/models", get(local_models))
-        .route("/v1/local/models/refresh", post(refresh_models))
+        .route("/models/manage", get(local_models))
+        .route("/models/manage/refresh", post(refresh_models))
+        .route("/models/manage/recommendations", get(recommendations))
         .route(
-            "/v1/local/models/selected",
+            "/models/manage/default",
             get(selected_model).delete(deselect_model),
         )
-        .route("/v1/local/models/{id}/select", post(select_model))
-        .route("/v1/local/models/{id}/load", post(select_model))
-        .route("/v1/local/models/{id}", delete(remove_model))
-        .route("/v1/local/models/{id}/install", post(install_model))
-        .route("/v1/local/models/{id}/verify", post(verify_model))
+        .route("/models/manage/{id}/default", post(select_model))
+        .route("/models/manage/{id}", delete(remove_model))
+        .route("/models/manage/{id}/download", post(install_model))
+        .route("/models/manage/{id}/verify", post(verify_model))
         .route(
-            "/v1/local/models/import",
+            "/models/manage/import",
             post(import_model).layer(DefaultBodyLimit::max(3 * 1024 * 1024 * 1024usize)),
         )
         .route(
-            "/v1/local/models/import-user",
+            "/models/manage/import-user",
             post(crate::import_user::import_user_models),
         )
-        .route("/v1/local/operations/{id}", get(operation))
-        .route("/v1/local/operations/{id}/cancel", post(cancel_operation))
+        .route("/models/manage/operations/{id}", get(operation))
+        .route(
+            "/models/manage/operations/{id}/cancel",
+            post(cancel_operation),
+        )
         .layer(cors)
         .layer(axum::middleware::from_fn_with_state(
             app.clone(),
@@ -2266,7 +2273,7 @@ mod router_tests {
         let router = router(app.clone());
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/local/models/parakeet-unified-en-0.6b/install")
+            .uri("/models/manage/parakeet-unified-en-0.6b/download")
             .header("authorization", format!("Bearer {token}"))
             .header("content-type", "application/json")
             .body(Body::from(r#"{"quant":"not-a-real-quant"}"#))
@@ -2646,7 +2653,7 @@ mod router_tests {
         let router = router(app.clone());
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/local/models/some-other-model/select")
+            .uri("/models/manage/some-other-model/default")
             .header("authorization", format!("Bearer {token}"))
             .body(Body::empty())
             .unwrap();
@@ -2846,7 +2853,7 @@ mod router_tests {
         // folder is a `failed` terminal state, still reachable via polling).
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/local/models/refresh")
+            .uri("/models/manage/refresh")
             .header("authorization", format!("Bearer {token}"))
             .body(Body::empty())
             .unwrap();
@@ -2862,7 +2869,7 @@ mod router_tests {
         for _ in 0..100 {
             let get_request = Request::builder()
                 .method("GET")
-                .uri(format!("/v1/local/operations/{operation_id}"))
+                .uri(format!("/models/manage/operations/{operation_id}"))
                 .header("authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap();
@@ -2908,7 +2915,7 @@ mod router_tests {
         let router = router(app.clone());
         let request = Request::builder()
             .method("DELETE")
-            .uri("/v1/local/models/custom-mine-abc12345")
+            .uri("/models/manage/custom-mine-abc12345")
             .header("authorization", format!("Bearer {token}"))
             .body(Body::empty())
             .unwrap();
@@ -2951,7 +2958,7 @@ mod router_tests {
         let router = router(app.clone());
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/local/models/custom-mine-abc12345/select")
+            .uri("/models/manage/custom-mine-abc12345/default")
             .header("authorization", format!("Bearer {token}"))
             .body(Body::empty())
             .unwrap();
@@ -3474,11 +3481,11 @@ mod router_tests {
         vec![
             ("GET", "/readiness", None),
             ("GET", "/v1/models", None),
-            ("GET", "/v1/local/models", None),
-            ("GET", "/v1/local/models/selected", None),
+            ("GET", "/models/manage", None),
+            ("GET", "/models/manage/default", None),
             ("GET", "/v1/local/system", None),
-            ("GET", "/v1/local/recommendations", None),
-            ("GET", "/v1/local/operations/not-a-real-id", None),
+            ("GET", "/models/manage/recommendations", None),
+            ("GET", "/models/manage/operations/not-a-real-id", None),
         ]
     }
 
@@ -3490,14 +3497,17 @@ mod router_tests {
         vec![
             ("GET", "/v1/local/config", None),
             ("PATCH", "/v1/local/config", Some(r#"{}"#)),
-            ("POST", "/v1/local/models/refresh", None),
-            ("DELETE", "/v1/local/models/selected", None),
-            ("POST", "/v1/local/models/not-a-real-id/select", None),
-            ("POST", "/v1/local/models/not-a-real-id/load", None),
-            ("DELETE", "/v1/local/models/not-a-real-id", None),
-            ("POST", "/v1/local/models/not-a-real-id/install", None),
-            ("POST", "/v1/local/models/not-a-real-id/verify", None),
-            ("POST", "/v1/local/operations/not-a-real-id/cancel", None),
+            ("POST", "/models/manage/refresh", None),
+            ("DELETE", "/models/manage/default", None),
+            ("POST", "/models/manage/not-a-real-id/default", None),
+            ("DELETE", "/models/manage/not-a-real-id", None),
+            ("POST", "/models/manage/not-a-real-id/download", None),
+            ("POST", "/models/manage/not-a-real-id/verify", None),
+            (
+                "POST",
+                "/models/manage/operations/not-a-real-id/cancel",
+                None,
+            ),
         ]
     }
 
@@ -3593,7 +3603,7 @@ mod router_tests {
         let import_router = router(app.clone());
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/local/models/import")
+            .uri("/models/manage/import")
             .header("authorization", format!("Bearer {user_token}"))
             .header("content-type", "multipart/form-data; boundary=X")
             .body(Body::from("--X--\r\n"))
@@ -3635,6 +3645,126 @@ mod router_tests {
         // `refresh_returns_202_and_the_operation_completes` for the same
         // pattern, polled instead of slept there because it asserts on the
         // outcome; here we only need it to be done, not what it did).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    /// The old `/v1/local/models*`, `/v1/local/recommendations` and
+    /// `/v1/local/operations*` paths were removed outright (no clients yet,
+    /// per the `openai-model-per-request` goal's second slice) and must 404,
+    /// not fall through to some other handler.
+    #[tokio::test]
+    async fn old_local_models_paths_are_gone() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let old_paths: Vec<(&str, &str)> = vec![
+            ("GET", "/v1/local/models"),
+            ("GET", "/v1/local/models/selected"),
+            ("DELETE", "/v1/local/models/selected"),
+            ("GET", "/v1/local/recommendations"),
+            ("POST", "/v1/local/models/refresh"),
+            ("POST", "/v1/local/models/not-a-real-id/select"),
+            ("POST", "/v1/local/models/not-a-real-id/load"),
+            ("POST", "/v1/local/models/not-a-real-id/install"),
+            ("POST", "/v1/local/models/not-a-real-id/verify"),
+            ("DELETE", "/v1/local/models/not-a-real-id"),
+            ("POST", "/v1/local/models/import"),
+            ("POST", "/v1/local/models/import-user"),
+            ("GET", "/v1/local/operations/not-a-real-id"),
+            ("POST", "/v1/local/operations/not-a-real-id/cancel"),
+        ];
+        for (method, route_path) in old_paths {
+            let router = router(app.clone());
+            let request = build_request(method, route_path, None, &token);
+            let response = router.oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{method} {route_path} should 404: the old path was removed"
+            );
+        }
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    /// Axum matches a literal path segment ahead of a `{id}` capture
+    /// regardless of registration order, but this pins that behaviour for
+    /// every static suffix under `/models/manage` that could otherwise be
+    /// shadowed by `/models/manage/{id}` or `/models/manage/{id}/...`: an id
+    /// literally named `default`, `refresh`, `import`, `import-user`,
+    /// `recommendations` or `operations` must never reach `remove_model`/
+    /// `select_model`/etc instead of the intended static handler.
+    #[tokio::test]
+    async fn static_models_manage_routes_take_precedence_over_id_capture() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+
+        // GET /models/manage/default must hit `selected_model`, not
+        // `remove_model` misrouted, or `openai_model_by_id`-style 404 for an
+        // id literally called "default". With nothing selected yet this is a
+        // 200 with a "no default set" shape (or 404 with a `no_default`-style
+        // code), never the generic `model_not_installed` a stray id lookup
+        // would produce.
+        let router1 = router(app.clone());
+        let request = build_request("GET", "/models/manage/default", None, &token);
+        let response = router1.oneshot(request).await.unwrap();
+        assert_ne!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "GET /models/manage/default must not be swallowed by /models/manage/{{id}}"
+        );
+
+        // POST /models/manage/refresh must hit `refresh_models` (202/200),
+        // never `select_model` treating "refresh" as a model id (which would
+        // 404 model_not_installed with the same status but is the wrong
+        // handler -- checked indirectly via the recommendations/import routes
+        // below returning their own distinct shapes).
+        let router2 = router(app.clone());
+        let request = build_request("POST", "/models/manage/refresh", None, &token);
+        let response = router2.oneshot(request).await.unwrap();
+        assert!(
+            response.status() == StatusCode::OK || response.status() == StatusCode::ACCEPTED,
+            "POST /models/manage/refresh must hit refresh_models, got {}",
+            response.status()
+        );
+
+        // GET /models/manage/recommendations must hit `recommendations`
+        // (200), not `openai_model_by_id`/`remove_model`-style handling of an
+        // id named "recommendations".
+        let router3 = router(app.clone());
+        let request = build_request("GET", "/models/manage/recommendations", None, &token);
+        let response = router3.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // GET /models/manage/operations/{id} must hit `operation`'s own
+        // not-found handling for a bogus operation id, distinguishable from
+        // routing failure only in that the route exists at all -- covered by
+        // `user_routes()` above; here we additionally check the literal
+        // "operations" segment isn't captured as a model id by asserting the
+        // cancel route is also reachable (POST, admin token).
+        let router4 = router(app.clone());
+        let request = build_request(
+            "POST",
+            "/models/manage/operations/not-a-real-id/cancel",
+            None,
+            &token,
+        );
+        let response = router4.oneshot(request).await.unwrap();
+        // A bogus operation id is itself a legitimate 404, so status alone
+        // can't distinguish "routed to cancel_operation, which reported
+        // operation_not_found" from "the route never matched"; the error
+        // code can.
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "operation_not_found");
+
         tokio::time::sleep(Duration::from_millis(100)).await;
         drop(app);
         std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();

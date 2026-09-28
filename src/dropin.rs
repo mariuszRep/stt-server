@@ -1,4 +1,4 @@
-//! `POST /v1/local/models/refresh`: scans the user-writable drop-in models
+//! `POST /models/manage/refresh`: scans the user-writable drop-in models
 //! folder (and, trivially, keeps the managed store's own reconciliation
 //! untouched) for `.gguf` files a user copied in by hand, hashing and
 //! probing each one before it becomes selectable. See the "Drop-in models
@@ -522,7 +522,7 @@ fn set_progress_items(app: &App, operation_id: &str, done: u64, total: u64) -> R
 }
 
 /// Entry point run inside the `tokio::spawn`ed task backing
-/// `POST /v1/local/models/refresh`. Resolves the effective `user_models_dir`
+/// `POST /models/manage/refresh`. Resolves the effective `user_models_dir`
 /// (persisted setting, else the process default), then scans it. A missing
 /// directory is treated as an empty scan (nothing to register) rather than
 /// an error -- it simply hasn't been created yet.

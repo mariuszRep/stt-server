@@ -118,15 +118,15 @@ predates the field -- treat `0` the same as "older than any level you require."
 **Moving models between scopes**: when a machine-wide install is set up on a PC where a user
 already has models installed under their own per-user install, an admin can import those models
 into the machine-wide install instead of downloading them again --
-`POST /v1/local/models/import-user` (admin only; see section 3's route table), or the CLI
+`POST /models/manage/import-user` (admin only; see section 3's route table), or the CLI
 `stt-server-next models import-user [--from <per-user data dir>] [--wait]`. `--from` defaults to
 the invoking OS user's own per-user data folder. Every `.gguf` under `<from>\models` is hashed and
-matched against the catalog (the same check `POST /v1/local/models/refresh` uses for drop-in
+matched against the catalog (the same check `POST /models/manage/refresh` uses for drop-in
 files) before being copied into this install's managed store and re-verified in place; a file
 already installed here, or one that doesn't match any catalog entry, is reported and left alone.
 The source install is never modified or deleted -- the user's own copy stays exactly as it was
 unless they remove it themselves. The response and behavior mirror install/import/refresh: `202
-{"operation_id","state":"queued"}`, polled via `GET /v1/local/operations/{id}` to a terminal state,
+{"operation_id","state":"queued"}`, polled via `GET /models/manage/operations/{id}` to a terminal state,
 with a `result` object of `{"imported":[{"model"}], "skipped":[{"model","reason"}],
 "unsupported":[{"path"|"model","reason"}]}` once `completed`.
 
@@ -142,7 +142,7 @@ From `crate::app::data_dir()`:
   `C:\ProgramData\...` if `PROGRAMDATA` is unset).
 
 The drop-in models folder (manually copied `.gguf` files, picked up by
-`POST /v1/local/models/refresh`) defaults to
+`POST /models/manage/refresh`) defaults to
 `%LOCALAPPDATA%\OpenVibeAI\STT Server\models` for a normal run (note: a
 different vendor/product path segment than the data dir above -- this is
 intentional, matching `crate::app::default_user_models_dir`) and has no
@@ -176,8 +176,8 @@ where to drop files should read `GET /v1/local/config`'s
   | Level | Routes |
   |---|---|
   | Unauthenticated | `GET /health` |
-  | User (admin token also works) | `GET /readiness`, `GET /v1/models`, `GET /v1/local/models`, `GET /v1/local/models/selected`, `GET /v1/local/system`, `GET /v1/local/recommendations`, `GET /v1/local/operations/{id}`, `POST /v1/audio/transcriptions`, `POST /v1/audio/translations` |
-  | Admin only | `GET`/`PATCH /v1/local/config`, `POST /v1/local/models/{id}/install`, `POST /v1/local/models/{id}/verify`, `POST /v1/local/models/{id}/select` (and `/load`), `DELETE /v1/local/models/selected` (unload), `DELETE /v1/local/models/{id}` (remove), `POST /v1/local/models/refresh` (drop-in refresh), `POST /v1/local/models/import`, `POST /v1/local/models/import-user` (copy another install's models in; see section 1.4), `POST /v1/local/operations/{id}/cancel`, `POST /v1/local/shutdown` |
+  | User (admin token also works) | `GET /readiness`, `GET /v1/models`, `GET /models/manage`, `GET /models/manage/default`, `GET /v1/local/system`, `GET /models/manage/recommendations`, `GET /models/manage/operations/{id}`, `POST /v1/audio/transcriptions`, `POST /v1/audio/translations` |
+  | Admin only | `GET`/`PATCH /v1/local/config`, `POST /models/manage/{id}/download`, `POST /models/manage/{id}/verify`, `POST /models/manage/{id}/default` (set default and load), `DELETE /models/manage/default` (unload), `DELETE /models/manage/{id}` (remove), `POST /models/manage/refresh` (drop-in refresh), `POST /models/manage/import`, `POST /models/manage/import-user` (copy another install's models in; see section 1.4), `POST /models/manage/operations/{id}/cancel`, `POST /v1/local/shutdown` |
 
   The CLI (`stt-server-next models ...`, `status`, `stop`, `update`, ...)
   reads `auth.token` when it can, falling back to `user.token` only when
@@ -306,9 +306,12 @@ object reports `mode: "custom"` (see 7a below) instead of resolving
 There is one engine and at most one loaded model; no provider IDs, variants,
 or descriptors.
 
-- **List catalog + installed state:** `GET /v1/local/models` -- catalog
-  entries plus any drop-in/custom models, each with `id`, `name`,
-  `installed`, `source`, capability info.
+- **List catalog + installed state:** `GET /models/manage` -- everything
+  available (catalog entries plus any drop-in/custom models), each with
+  `id`, `name`, `downloaded` (bool), `default` (bool), `source`,
+  `needs_verification`, capability info. This is the model manager: it lists
+  models the OpenAI-shaped `/v1/models` list never shows (not-yet-downloaded
+  catalog entries), deliberately outside `/v1`.
 - **OpenAI-shaped list:** `GET /v1/models` -- `{"object": "list", "data":
   [{"id", "object": "model", "owned_by": "local", "default": bool,
   "capabilities": ControlCapability-map}, ...]}`, listing only **callable**
@@ -323,57 +326,56 @@ or descriptors.
   model never yet loaded. `GET /v1/models/{id}` returns one such entry
   directly (not wrapped in `{"data": [...]}}`), or `404 model_not_installed`
   if `id` is not callable.
-- **Recommendations:** `GET /v1/local/recommendations` -- the curated,
+- **Recommendations:** `GET /models/manage/recommendations` -- the curated,
   hardware-independent recommended subset in fixed rank order (`recommended`
   + `recommended_rank` from the catalog; per `CONVENTIONS.md`, hardware
   probing never reorders this list).
-- **Install:** `POST /v1/local/models/{id}/install` -> `202 {"operation_id",
+- **Install:** `POST /models/manage/{id}/download` -> `202 {"operation_id",
   "state": "queued"}` (or `409 already_installed` / `operation_conflict`).
-  Poll `GET /v1/local/operations/{id}` until `state` is terminal
+  Poll `GET /models/manage/operations/{id}` until `state` is terminal
   (`completed`/`failed`/`cancelled`), reading `progress_bytes`/`total_bytes`
-  for a progress bar; `POST /v1/local/operations/{id}/cancel` aborts it.
-- **Verify:** `POST /v1/local/models/{id}/verify` -- same operation-polling
+  for a progress bar; `POST /models/manage/operations/{id}/cancel` aborts it.
+- **Verify:** `POST /models/manage/{id}/verify` -- same operation-polling
   shape; checks the immutable revision/size/SHA-256 before a model is
   trusted (`CONVENTIONS.md`'s trust rule).
-- **Select (set default and load):** `POST /v1/local/models/{id}/select`
-  (alias: `.../load`) -> `200 {"model": id, "backend": {"observed_backend",
-  "fallback_reason"}}`, or `409 needs_verification` if the model needs
-  verification first. This is now "set the default model": it persists `id`
-  as the default (what an empty/`"default"` `model` field resolves to on
-  every future request, and what loads at startup) **and** loads it
-  immediately, same as before. Verify a managed model, or refresh a drop-in
-  model, then select again. Loading never triggers a download
-  (`CONVENTIONS.md`: "nothing ever downloads on request"). This endpoint's
-  path and "select" name are unchanged in this slice; the `/models/manage`
-  rename is a later slice of the same goal.
+- **Set default (and load):** `POST /models/manage/{id}/default` (was
+  `.../select` and `.../load`, both removed) -> `200 {"model": id, "backend":
+  {"observed_backend", "fallback_reason"}}`, or `409 needs_verification` if
+  the model needs verification first. This persists `id` as the default
+  (what an empty/`"default"` `model` field resolves to on every future
+  request, and what loads at startup) **and** loads it immediately. Verify a
+  managed model, or refresh a drop-in model, then set it as default again.
+  Loading never triggers a download (`CONVENTIONS.md`: "nothing ever
+  downloads on request"). The CLI keeps `models select` as an alias of
+  `models default`.
 - **Model per request:** every transcription/translation may name any
   callable model directly in its `model` field (see section 5) -- the server
   loads/swaps to it itself if it is not already resident, with no separate
   select call needed. A per-request `model` never changes the default.
 - **Deselect / current selection:**
-  `GET /v1/local/models/selected` -> the loaded model's `id` plus its full
+  `GET /models/manage/default` -> the loaded model's `id` plus its full
   effective-capability matrix (see 4.1), or `{"model": null,
   "effective_capabilities": null}` when nothing is loaded.
-  `DELETE /v1/local/models/selected` unloads it (`{"model": null, "loaded":
+  `DELETE /models/manage/default` unloads it (`{"model": null, "loaded":
   false}`).
-- **Remove:** `DELETE /v1/local/models/{id}` -- removes the managed-store
+- **Remove:** `DELETE /models/manage/{id}` -- removes the managed-store
   file (drop-in/`user_folder` models keep their file on disk:
   `{"removed": true, "file_deleted": false}`). For a drop-in model this only
   deletes the `installed` row, not the user's file (`CONVENTIONS.md`: refresh
   and removal never delete a user's file). There is no dismissed/ignore list:
   the file still sits in the drop-in folder, so the **next**
-  `POST /v1/local/models/refresh` re-hashes and re-registers it, and it
-  reappears in `GET /v1/local/models` as installed again. `removed: true`
+  `POST /models/manage/refresh` re-hashes and re-registers it, and it
+  reappears in `GET /models/manage` as installed again. `removed: true`
   means "unregistered now," not "will never come back." A client that wants
   removal to stick must tell the operator to move or delete the file itself;
   the server has no separate dismiss action.
-- **Refresh (drop-in scan):** `POST /v1/local/models/refresh` -> `202
+- **Refresh (drop-in scan):** `POST /models/manage/refresh` -> `202
   {"operation_id", "state": "queued"}`, polled the same way as
   install/verify.
 
 ### 4.1 Catalog view vs. selected (effective) view -- two different answers, on purpose
 
-`GET /v1/local/models` (and any per-model view before a model is loaded)
+`GET /models/manage` (and any per-model view before a model is loaded)
 reports `effective_capabilities` from **catalog/architecture metadata
 alone** -- no engine has looked at the file yet. This is the *catalog view*
 (`catalog::capability_matrix`): a control the catalog's own claim does not
@@ -388,7 +390,7 @@ fixing this ledger's Bug 3, every control here hard-coded `"unsupported"`
 regardless of the catalog's own claims -- that was a placeholder, not a
 truthful static answer, and clients must not have relied on it.**
 
-`GET /v1/local/models/selected`'s `effective_capabilities` reports the
+`GET /models/manage/default`'s `effective_capabilities` reports the
 *live* view (`capabilities::EffectiveCaps`), computed from the actually
 loaded `transcribe_cpp::Model` -- this is a verified fact, never `"unknown"`
 for the controls it covers. **Always prefer the selected-model endpoint's
@@ -448,7 +450,7 @@ all -- only killing the process worked. Now:
   synchronous attempt: it either finishes or fails outright as
   `409 model_load_failed`, leaving whatever model was previously resident
   untouched and serving the next request.
-- **`POST /v1/local/models/{id}/select`** (and `.../load`) while a
+- **`POST /models/manage/{id}/default`** while a
   background load is already in progress is rejected with `409
   {"error": {"code": "model_loading", "details": {"model", "elapsed_ms"}}}`
   rather than queued -- the simplest sane behaviour, since the in-progress
@@ -554,7 +556,7 @@ rejected with `422 unsupported_capability` (see the error table in 6).
 ### 4.4 Operation retry behaviour (install/verify/import/refresh)
 
 A long-running model operation (`install`, `verify`, `import`, `import-user`, `refresh`) is
-tracked as one row in the `operations` table (`GET /v1/local/operations/{id}`), polled to a
+tracked as one row in the `operations` table (`GET /models/manage/operations/{id}`), polled to a
 terminal state (`completed`/`failed`/`cancelled`). What happens to it on failure, cancel, or a
 server restart -- and whether a client should expect it to come back on its own -- differs by
 cause; **the server never automatically resumes or retries an operation once its request has
@@ -569,7 +571,7 @@ returned**, only a client starting a new operation call does:
   `src/download.rs`: an exact-size partial goes straight to hash verification, a shorter one
   resumes via HTTP `Range`, an oversized or invalid one restarts from zero) -- so retrying is
   cheap, but it is still the client's job to issue that new call after seeing `failed`.
-- **Explicit cancel** (`POST /v1/local/operations/{id}/cancel`): the operation is marked
+- **Explicit cancel** (`POST /models/manage/operations/{id}/cancel`): the operation is marked
   `cancelled` (a distinct terminal state, `error_code: "cancelled"`); an already-terminal operation
   cannot be cancelled (`409 operation_finished`). Any partial download bytes are likewise left on
   disk for a future `install` call to resume from, exactly as above -- cancel never deletes the
@@ -628,7 +630,7 @@ model-aware planning happens; a field sent twice is `400 duplicate_field`.
   support a new client's format or duration) needs its own compatibility
   check against every client that depends on this contract, recorded in this
   file and the change's goal log -- it is not a drop-in change.
-- `POST /v1/local/models/import` (a locally supplied GGUF, not audio) has its
+- `POST /models/manage/import` (a locally supplied GGUF, not audio) has its
   own, much larger limit (3 GiB) since it streams a model file, not a
   request body meant to be quick.
 
@@ -706,11 +708,11 @@ source (`src/api.rs`, `src/audio.rs`, `src/auth.rs`, `src/catalog.rs`,
 | 507 | `insufficient_memory` (insufficient storage) |
 
 `missing_model` (400) means "no `model` field and no `file` field either" at
-the *import* endpoint (`POST /v1/local/models/import`, "send model before
+the *import* endpoint (`POST /models/manage/import`, "send model before
 file") -- unrelated to transcription's "missing model" question, which no
 longer exists there; see 5.
 
-A long-running operation's own terminal state (`GET /v1/local/operations/
+A long-running operation's own terminal state (`GET /models/manage/operations/
 {id}`, state `failed`) carries a separate, narrower `error_code` for
 operation-specific failures that are never top-level HTTP errors because
 the request that started them already returned `202`:
@@ -756,7 +758,7 @@ first:
   "default_model": id_or_null, "loaded_model": null}`. The legacy `model`
   field is kept for compatibility within this slice; prefer `default_model`/
   `loaded_model` going forward (see 7's `/health` note for the distinction).
-- `GET /v1/local/models/selected` -- which model, and its full capability
+- `GET /models/manage/default` -- which model, and its full capability
   matrix (4.1).
 - `GET /v1/local/system` -- hardware: see 8.
 
@@ -818,24 +820,24 @@ From `whisper-vibes/apps/web/src/lib/stt-server-client.ts` and
 |---|---|
 | `getOrStartProviderDescriptor(providerId, opts)` | App-owned mode: spawn `stt-server-next run --port <p> --data-dir <d>` directly (1.1); no descriptor, no per-provider install |
 | `installVariant` / `removeProviderVariant` | removed: no provider variants -- see model install/remove (4) instead |
-| `cancelOperation` / `pollInstallOperation` (`/v1/install-operations/{id}`) | `POST /v1/local/operations/{id}/cancel` / `GET /v1/local/operations/{id}` (same polling shape, different path, model-scoped not provider-scoped) |
-| `getProviders()` (`/v1/providers`) | removed: no provider catalog -- use `GET /v1/local/models` |
-| `getModels()` (`/v1/models`) | `GET /v1/models` (kept, OpenAI-shaped) or `GET /v1/local/models` for the richer view |
-| `getRecommendations()` (`/v1/recommendations`) | `GET /v1/local/recommendations` |
+| `cancelOperation` / `pollInstallOperation` (`/v1/install-operations/{id}`) | `POST /models/manage/operations/{id}/cancel` / `GET /models/manage/operations/{id}` (same polling shape, different path, model-scoped not provider-scoped) |
+| `getProviders()` (`/v1/providers`) | removed: no provider catalog -- use `GET /models/manage` |
+| `getModels()` (`/v1/models`) | `GET /v1/models` (kept, OpenAI-shaped) or `GET /models/manage` for the richer view |
+| `getRecommendations()` (`/v1/recommendations`) | `GET /models/manage/recommendations` |
 | `getHardware()` (`/v1/hardware`) | `GET /v1/local/system` (`os`/`cpu`/`memory`/`gpu`; no `hasNvidiaGpu`/`driverVersion` fields -- Vulkan device presence via `gpu.devices`/`gpu.vulkan_available` instead) |
 | `getSystemMemory()` (`/v1/system/memory`) | `GET /v1/local/system`'s `memory` (queried live on every call, same as before; no separate VRAM figures) |
-| `selectModel(providerId, modelId)` (`/v1/models/select`) | `POST /v1/local/models/{id}/select` |
-| `switchModel` | `POST /v1/local/models/{id}/select` (same call now covers both "first load" and "switch"; response shape differs -- see 4) |
+| `selectModel(providerId, modelId)` (`/v1/models/select`) | `POST /models/manage/{id}/default` |
+| `switchModel` | `POST /models/manage/{id}/default` (same call now covers both "first load" and "switch"; response shape differs -- see 4) |
 | `setModelLanguage` | removed: language is a per-request hint (`language` field), not a load-time model setting -- see 5 and `run_plan.rs`'s Handy fallback |
-| `loadModel` | `POST /v1/local/models/{id}/select` |
-| `pullModel` | `POST /v1/local/models/{id}/install` |
-| `verifyModel` | `POST /v1/local/models/{id}/verify` |
-| `removeModel(providerId, modelId)` | `DELETE /v1/local/models/{id}` |
+| `loadModel` | `POST /models/manage/{id}/default` |
+| `pullModel` | `POST /models/manage/{id}/download` |
+| `verifyModel` | `POST /models/manage/{id}/verify` |
+| `removeModel(providerId, modelId)` | `DELETE /models/manage/{id}` |
 | `stopProvider` / `pinProvider` / `unpinProvider` | removed: no provider lifecycle to stop/pin -- the server itself is stopped via `POST /v1/local/shutdown` (app-owned mode) or left running (standalone mode) |
 | `getProviderStatus` (`/v1/providers/{id}/status`) | `GET /readiness` (server-wide, not per-provider) |
 | `getProviderDescriptor` | removed: no descriptor object -- see 1's discovery contract |
 | `getActiveProviderId` / `waitForDevRuntimeDescriptor` | removed: one server, one base URL from discovery (1) -- no "which provider is active" question |
-| `LocalRuntimeProvider.listModels()` (`GET /v1/config`) | `GET /v1/local/models` or `GET /v1/models` |
+| `LocalRuntimeProvider.listModels()` (`GET /v1/config`) | `GET /models/manage` or `GET /v1/models` |
 | `LocalRuntimeProvider.transcribe()` (`POST /v1/audio/transcriptions`, `{ text }`) | same path, same multipart shape, richer response (`language`/`duration`/`segments`/`x_diagnostics`); **always send `model` going forward** even though the server now defaults it (see 5) |
 | sherpa-onnx per-runtime quirks (`prompt` dropped, no per-request `language`) | not applicable: one engine (whisper-family via `transcribe-cpp`); use the capability matrix (4.1) instead of hardcoding per-runtime quirks |
 

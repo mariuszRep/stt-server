@@ -202,7 +202,7 @@ pub fn model_view(model: &CatalogModel, installed_quant: Option<&str>) -> Value 
         "accuracy_score": model.accuracy_score,
         "benchmark_source": "Handy catalog generated 2026-08-17; scores are derived display values, not local measurements",
         "recommended_rank": model.recommended_rank,
-        "installed": installed_quant.is_some(),
+        "downloaded": installed_quant.is_some(),
         "installed_quant": installed_quant,
         "installable": true,
     })
@@ -391,7 +391,7 @@ mod tests {
         for model in &catalog.models {
             let view = model_view(model, None);
             assert_eq!(view["installable"], true, "{}", model.slug);
-            assert_eq!(view["installed"], false);
+            assert_eq!(view["downloaded"], false);
             assert!(!view["files"].as_array().unwrap().is_empty());
         }
     }

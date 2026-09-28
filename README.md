@@ -48,14 +48,14 @@ is catalog membership plus a resolvable quant/hash, not a hard-coded model ID.
 info for a client's hardware/health card -- see `docs/client-contract.md` for the full shape,
 field provenance, and a mapping from the old provider-lifecycle client calls to the new ones.
 
-`POST /v1/local/models/{id}/install` takes an optional JSON body `{"quant":"Q8_0"}`; an absent or
+`POST /models/manage/{id}/download` takes an optional JSON body `{"quant":"Q8_0"}`; an absent or
 empty body installs the model's `default_quant`. An unknown quant returns 400 `invalid_quant`;
-an already-installed model returns 409 `already_installed`. `POST /v1/local/models/import`
+an already-installed model returns 409 `already_installed`. `POST /models/manage/import`
 accepts an optional multipart `quant` field before `file` to preselect the expected catalog file;
 without it, the uploaded file's size and SHA-256 are matched against any of the model's files.
-`GET /v1/local/models` and `GET /v1/local/recommendations` list every catalog file
+`GET /models/manage` and `GET /models/manage/recommendations` list every catalog file
 (`quant`, `size_bytes`, `sha256`) plus `installed_quant` (the recorded quant, or `null`).
-`GET /v1/local/operations/{id}` also reports `created_at`, `updated_at`, and `finished_at`
+`GET /models/manage/operations/{id}` also reports `created_at`, `updated_at`, and `finished_at`
 (unix milliseconds). Verify, restart reconciliation, select, and remove all operate on the quant
 actually installed, not the catalog's current default.
 
@@ -64,7 +64,7 @@ unversioned database migrates it to the current schema in one transaction, backi
 to `state.db.bak-v<old>` first when it already had data. Schema v3 adds a machine-readable
 `error_code` on operations (`insufficient_disk_space`, `stalled`, `source_unavailable`,
 `hash_mismatch`, `cancelled`), returned alongside the free-text `error` by
-`GET /v1/local/operations/{id}`. Schema v4 adds `installed.source`
+`GET /models/manage/operations/{id}`. Schema v4 adds `installed.source`
 (`catalog_download`/`import`/`user_folder`) plus nullable `custom_name`/`custom_arch`/
 `custom_languages`/`custom_claims`/`mtime_ms`/`needs_verification` columns for drop-in models, and
 `operations.progress_items`/`total_items`/`result` (a JSON blob) for item-counted, durable
@@ -84,7 +84,7 @@ when unset to the path above) and settable via `PATCH /v1/local/config` with
 `{"user_models_dir": "<absolute path>"}`; a relative or nonexistent path returns 400
 `invalid_user_models_dir`.
 
-`POST /v1/local/models/refresh` is a durable operation (`kind: "refresh"`, 202 + operation ID,
+`POST /models/manage/refresh` is a durable operation (`kind: "refresh"`, 202 + operation ID,
 observable and cancellable like install/import/verify) that non-recursively scans the drop folder
 for `*.gguf` files (ignoring `.part`). For each file:
 
@@ -104,7 +104,7 @@ for `*.gguf` files (ignoring `.part`). For each file:
    if it was active). One whose size or mtime changed is re-hashed and re-probed by this same
    refresh (registering it under a possibly new identity if its content changed architecture/hash).
 
-The operation's `result` (visible on `GET /v1/local/operations/{id}`) lists `registered`,
+The operation's `result` (visible on `GET /models/manage/operations/{id}`) lists `registered`,
 `duplicates`, `unsupported`, `removed`, and `changed`.
 
 Startup reconciliation (`app::reconcile_installed`) treats `user_folder` rows differently from
@@ -113,14 +113,14 @@ design), only checking existence/size/mtime -- a disappeared file is unregistere
 changed-on-disk file is flagged `needs_verification` (blocking selection until an explicit refresh
 re-hashes it) without itself re-hashing anything.
 
-`GET /v1/local/models` lists custom (non-catalog) installed models alongside catalog entries, with
+`GET /models/manage` lists custom (non-catalog) installed models alongside catalog entries, with
 `source`, `custom: true`, a capability view built from the GGUF header claims
 (`evidence: "gguf_header"`), `installable: false` (they can only arrive via refresh), and
 `recommended_rank: null`; `GET /v1/models` includes any installed custom model too. Select/load and
-transcription work the same regardless of source. `DELETE /v1/local/models/{id}` on a
+transcription work the same regardless of source. `DELETE /models/manage/{id}` on a
 `user_folder` model unregisters it only -- the file is never deleted (`file_deleted: false` in the
 response); catalog/import models keep the previous move-then-delete behavior
-(`file_deleted: true`). `POST /v1/local/models/{id}/verify` on a `user_folder` model re-hashes it
+(`file_deleted: true`). `POST /models/manage/{id}/verify` on a `user_folder` model re-hashes it
 in place; a mismatch marks it `needs_verification` rather than quarantining the user's file.
 
 Downloads are hardened: a 60s stall timeout applies to connect and every chunk (not the whole
@@ -180,12 +180,12 @@ with `409 model_loading` rather than queued (the in-progress load can't be cance
 loader thread, which is torn down with the process. See `docs/client-contract.md` section 4.2 for
 the full behaviour.
 
-`POST /v1/local/models/{id}/select` (and its `/load` alias) no longer holds the inference slot
+`POST /models/manage/{id}/default` no longer holds the inference slot
 while the new model loads: the old model keeps serving in-flight and newly queued transcriptions
 off its already-loaded handle while the new model loads on a blocking thread, and only the final
 swap of `app.loaded` is briefly exclusive. A failed load leaves the previous selection in place.
 Note that both models are briefly resident in memory during the swap window; this is accepted as
-a tradeoff for non-blocking switching. `DELETE /v1/local/models/selected` now waits up to 30s for
+a tradeoff for non-blocking switching. `DELETE /models/manage/default` now waits up to 30s for
 a running inference to finish before unloading, returning 409 `model_in_use` only if that timeout
 elapses. When transcription's readiness check fails (`server_not_ready`), the error includes
 `error.details.operation_id` when an install/import/verify operation is currently queued or
@@ -254,12 +254,12 @@ stt-server-next health [--json] [--data-dir <path>]
 stt-server-next models list [--json] [--data-dir <path>]
 stt-server-next models recommended [--json] [--data-dir <path>]
 stt-server-next models selected [--json] [--data-dir <path>]
-stt-server-next models install <id> [--wait] [--json] [--data-dir <path>]
+stt-server-next models download <id> [--wait] [--json] [--data-dir <path>]  (alias: install)
 stt-server-next models import <path> --model <id> [--quant <q>] [--wait] [--json] [--data-dir <path>]
 stt-server-next models import-user [--from <per-user data dir>] [--wait] [--json] [--data-dir <path>]
 stt-server-next models verify <id> [--wait] [--json] [--data-dir <path>]
 stt-server-next models cancel <operation_id> [--data-dir <path>]
-stt-server-next models select <id> [--json] [--data-dir <path>]
+stt-server-next models default <id> [--json] [--data-dir <path>]  (alias: select)
 stt-server-next models unload [--json] [--data-dir <path>]
 stt-server-next models remove <id> [--json] [--data-dir <path>]
 stt-server-next models refresh [--wait] [--json] [--data-dir <path>]
@@ -357,14 +357,14 @@ rule.
 
 - `models list`/`recommended`/`selected` are read-only `GET`s (catalog + installed state,
   the curated recommendation order, and the currently loaded model's capability matrix).
-- `models install <id>`/`models verify <id>`/`models refresh` start a long-running operation
-  and print its `operation_id`/`state`; add `--wait` to poll `GET /v1/local/operations/{id}`
+- `models download <id>` (alias: `install`)/`models verify <id>`/`models refresh` start a long-running operation
+  and print its `operation_id`/`state`; add `--wait` to poll `GET /models/manage/operations/{id}`
   every 500ms, printing byte/item progress, until it reaches `completed`/`failed`/`cancelled`.
   `models cancel <operation_id>` aborts one. `models refresh --wait` additionally reports each
   drop-in file's outcome (registered/duplicate/changed/removed, or a retryable failure reason).
 - `models import <path> --model <id> [--quant <q>]` uploads a local GGUF file as
   `multipart/form-data` (`model` field, optional `quant`, then the file) to
-  `POST /v1/local/models/import`, then behaves like `install`/`verify` above.
+  `POST /models/manage/import`, then behaves like `install`/`verify` above.
 - `models import-user [--from <dir>]` (admin only) copies GGUFs from another install's models
   folder into this one -- the machine-wide-install-on-a-PC-with-existing-per-user-models case: an
   admin setting up a shared server can pull in models a user already downloaded instead of
@@ -375,11 +375,11 @@ rule.
   a file that doesn't match any catalog entry, or one already installed here, is reported and left
   alone; the source is never modified or deleted either way. `--wait` reports each model's
   imported/skipped/failed outcome, like `models refresh` does for drop-in files.
-- `models select <id>` loads a model (`409 needs_verification` prints a hint to verify or
+- `models default <id>` (alias: `select`) loads a model (`409 needs_verification` prints a hint to verify or
   refresh first); `models unload` deselects the current one; `models remove <id>` unregisters a
   managed or drop-in model (a drop-in file's disk copy is never deleted -- the next `refresh`
   re-registers it, matching `CONVENTIONS.md`'s "refresh and removal never delete a user's file").
-- `health` combines `/health`, `/readiness`, `/v1/local/models/selected` and `/v1/local/system`
+- `health` combines `/health`, `/readiness`, `/models/manage/default` and `/v1/local/system`
   into one report and exits non-zero when `/readiness` itself isn't `ready`.
 - Every subcommand accepts `--data-dir` and `--json` (raw server JSON, for automation); without
   `--json` output is a short human-readable rendering. An absent/dead server or a `{"error":

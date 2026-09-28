@@ -14,7 +14,7 @@ pub const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 /// Source of an installed model row (v4). See "Integration rules" in the
 /// drop-in models design: catalog/import rows backfill sensibly, new rows
-/// created by `/v1/local/models/refresh` are always `user_folder`.
+/// created by `/models/manage/refresh` are always `user_folder`.
 pub const SOURCE_CATALOG_DOWNLOAD: &str = "catalog_download";
 pub const SOURCE_IMPORT: &str = "import";
 pub const SOURCE_USER_FOLDER: &str = "user_folder";

@@ -24,13 +24,13 @@ USAGE:
     stt-server-next models list [--json] [--data-dir <path>]
     stt-server-next models recommended [--json] [--data-dir <path>]
     stt-server-next models selected [--json] [--data-dir <path>]
-    stt-server-next models install <id> [--wait] [--json] [--data-dir <path>]
+    stt-server-next models download <id> [--wait] [--json] [--data-dir <path>]  (alias: install)
     stt-server-next models import <path> --model <id> [--quant <q>] [--wait] [--json] [--data-dir <path>]
     stt-server-next models import-user [--from <per-user data dir>] [--wait] [--json] [--data-dir <path>]
                                       admin-only: copy another install's models into this one
     stt-server-next models verify <id> [--wait] [--json] [--data-dir <path>]
     stt-server-next models cancel <operation_id> [--data-dir <path>]
-    stt-server-next models select <id> [--json] [--data-dir <path>]
+    stt-server-next models default <id> [--json] [--data-dir <path>]  (alias: select)
     stt-server-next models unload [--json] [--data-dir <path>]
     stt-server-next models remove <id> [--json] [--data-dir <path>]
     stt-server-next models refresh [--wait] [--json] [--data-dir <path>]
@@ -587,7 +587,7 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
         "models" => {
             let sub = args.get(1).ok_or_else(|| {
                 CliError::usage(
-                    "models requires a subcommand: list|recommended|selected|install|import|import-user|verify|cancel|select|unload|remove|refresh",
+                    "models requires a subcommand: list|recommended|selected|download|install|import|import-user|verify|cancel|default|select|unload|remove|refresh",
                 )
             })?;
             let rest = &args[2..];
@@ -619,9 +619,9 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
                         data_dir,
                     }))
                 }
-                "install" => {
+                "download" | "install" => {
                     let (id, json, wait, data_dir) =
-                        parse_id_json_wait_data_dir(rest, "models install")?;
+                        parse_id_json_wait_data_dir(rest, "models download")?;
                     Ok(Command::Models(ModelsCommand::Install {
                         id,
                         wait,
@@ -639,8 +639,8 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
                         data_dir,
                     }))
                 }
-                "select" => {
-                    let (id, json, data_dir) = parse_id_json_data_dir(rest, "models select")?;
+                "default" | "select" => {
+                    let (id, json, data_dir) = parse_id_json_data_dir(rest, "models default")?;
                     Ok(Command::Models(ModelsCommand::Select {
                         id,
                         json,
@@ -1100,6 +1100,22 @@ mod tests {
                 json: true,
                 data_dir: Some(PathBuf::from("C:\\d"))
             })
+        );
+    }
+
+    #[test]
+    fn models_download_is_an_alias_of_install() {
+        assert_eq!(
+            parse(&args(&["models", "download", "tiny-en", "--wait"])).unwrap(),
+            parse(&args(&["models", "install", "tiny-en", "--wait"])).unwrap()
+        );
+    }
+
+    #[test]
+    fn models_default_is_an_alias_of_select() {
+        assert_eq!(
+            parse(&args(&["models", "default", "tiny-en", "--json"])).unwrap(),
+            parse(&args(&["models", "select", "tiny-en", "--json"])).unwrap()
         );
     }
 

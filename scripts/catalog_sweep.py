@@ -316,7 +316,7 @@ class Server:
 # ---------------------------------------------------------------------------
 
 def get_catalog(server: Server):
-    status, body = http_json("GET", server.base_url + "/v1/local/models", token=server.token, timeout=30.0)
+    status, body = http_json("GET", server.base_url + "/models/manage", token=server.token, timeout=30.0)
     if status != 200:
         raise RuntimeError(f"failed to list models: {status} {body}")
     entries = body.get("data") if isinstance(body, dict) else body
@@ -328,9 +328,9 @@ def get_catalog(server: Server):
 def advertised_capabilities(server: Server, model_id: str):
     """Install-time capability claims aren't reliable (catalog.rs's static
     view marks everything unsupported); the real, per-loaded-model matrix
-    only exists after select, from GET /v1/local/models/selected."""
+    only exists after select, from GET /models/manage/default."""
     status, body = http_json(
-        "GET", server.base_url + "/v1/local/models/selected", token=server.token, timeout=30.0
+        "GET", server.base_url + "/models/manage/default", token=server.token, timeout=30.0
     )
     if status != 200 or not isinstance(body, dict):
         return {}
@@ -360,7 +360,7 @@ def run_operation(server: Server, method, path, timeout_s, payload=None, poll_ev
     last = None
     while time.monotonic() < deadline:
         ostatus, obody = http_json(
-            "GET", server.base_url + f"/v1/local/operations/{op_id}", token=server.token, timeout=30.0
+            "GET", server.base_url + f"/models/manage/operations/{op_id}", token=server.token, timeout=30.0
         )
         if ostatus != 200:
             raise ApiError(ostatus, obody)
@@ -525,7 +525,7 @@ def sweep_one(server, model, quant_file, clips, out_f, only_missing_output=True)
         # --- install ---
         t0 = time.monotonic()
         op = run_operation(
-            server, "POST", f"/v1/local/models/{model_id}/install", INSTALL_TIMEOUT_S,
+            server, "POST", f"/models/manage/{model_id}/download", INSTALL_TIMEOUT_S,
             payload={"quant": quant},
         )
         record["install_s"] = round(time.monotonic() - t0, 2)
@@ -535,17 +535,17 @@ def sweep_one(server, model, quant_file, clips, out_f, only_missing_output=True)
 
         # --- verify (needed if select reports needs_verification) ---
         status, sel_body = http_json(
-            "POST", server.base_url + f"/v1/local/models/{model_id}/select",
+            "POST", server.base_url + f"/models/manage/{model_id}/default",
             token=server.token, timeout=120.0,
         )
         if status == 409 and isinstance(sel_body, dict) and sel_body.get("error", {}).get("code") == "needs_verification":
             t0 = time.monotonic()
-            vop = run_operation(server, "POST", f"/v1/local/models/{model_id}/verify", INSTALL_TIMEOUT_S)
+            vop = run_operation(server, "POST", f"/models/manage/{model_id}/verify", INSTALL_TIMEOUT_S)
             record["verify_s"] = round(time.monotonic() - t0, 2)
             if vop.get("state") != "completed":
                 raise RuntimeError(f"verify failed: {vop}")
             status, sel_body = http_json(
-                "POST", server.base_url + f"/v1/local/models/{model_id}/select",
+                "POST", server.base_url + f"/models/manage/{model_id}/default",
                 token=server.token, timeout=120.0,
             )
         if status != 200:
@@ -661,7 +661,7 @@ def sweep_one(server, model, quant_file, clips, out_f, only_missing_output=True)
         try:
             if selected:
                 http_json(
-                    "DELETE", server.base_url + "/v1/local/models/selected",
+                    "DELETE", server.base_url + "/models/manage/default",
                     token=server.token, timeout=30.0,
                 )
         except Exception:
@@ -669,7 +669,7 @@ def sweep_one(server, model, quant_file, clips, out_f, only_missing_output=True)
         if installed:
             try:
                 http_json(
-                    "DELETE", server.base_url + f"/v1/local/models/{model_id}",
+                    "DELETE", server.base_url + f"/models/manage/{model_id}",
                     token=server.token, timeout=60.0,
                 )
             except Exception as e:  # noqa: BLE001
@@ -827,7 +827,7 @@ def main():
         print(f"catalog: {len(catalog)} models, {len(work)} model/quant combos to consider", flush=True)
 
         # Need full model dicts (with slug/languages) from catalog for internal use;
-        # /v1/local/models view may already have flattened fields — normalise.
+        # /models/manage view may already have flattened fields — normalise.
         normalized_work = []
         for model, file in work:
             slug = model.get("id") or model.get("slug")
