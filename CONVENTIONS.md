@@ -32,16 +32,37 @@ goals `build-stt-server-next` and `migrate-voice-typer-to-stt-server-next`.
   then the model's first language), and the response reports what was applied.
 - Other optional fields a model cannot honour are rejected with a capability error. Clients
   read the capability matrix and omit what is not supported.
+- Capabilities come from what the engine reports for the loaded model, cross-checked against
+  its real behaviour, never from a hand-kept list or another project's rules. The catalog list
+  gives the best static answer before loading; the selected-model view is authoritative.
 - A missing `model` field means the selected model.
 - Responses report diagnostics that exist and omit fields the engine did not produce.
 
 ## Operation
 
-- Default mode: launched by the client app and stopped with it. Standalone mode: started by the
-  CLI, at Windows sign-in, or as a Windows Service; clients attach and never stop it.
-- Loopback by default. Binding beyond loopback requires the bearer token; health is the only
-  unauthenticated route. Shutdown accepts only local callers.
-- One server per data folder, discoverable through its `server.json` file.
+- Two roles. Part of an application (default): launched by the client app, stopped with it,
+  managed through the API; the CLI covers only what the API cannot (process start, update,
+  autostart, service). Shared server: runs on its own and clients attach without stopping it.
+- Two install scopes, each with exactly one data folder used by every mode: per user
+  (`%LOCALAPPDATA%\OpenVibeAI\STT Server`, no admin) and machine-wide (Program Files plus
+  `%ProgramData%\OpenVibeAI\STT Server`, admin once). Scope follows where the executable
+  lives. The Windows Service exists only for machine-wide installs.
+- One server per data folder, discoverable through its `server.json` file. Clients always read
+  the port from it: a per-user server whose preferred port is taken picks a free one; a
+  machine-wide server keeps its fixed port.
+- Two tokens: the admin token (administrators only) reaches everything; the user token
+  (readable by every local user on a machine-wide install) reaches transcription, translation,
+  model listing, readiness and system information. A user token on an admin route gets
+  `403 admin_required`.
+- Network modes: `local` (default, loopback only), `lan` (other devices only while every active
+  Windows network is Private or Domain), `tailscale` (other devices only from Tailscale
+  addresses). Anything beyond health from another device needs a token. Shutdown accepts only
+  local callers.
+- Browsers are refused by default (no CORS origins); origins are allowed only when explicitly
+  configured.
+- The server answers immediately at startup and loads the selected model in the background;
+  status and stop always work during a load.
+- Health reports the version and an `api_level` that increases whenever clients must change.
 - State lives in SQLite with versioned forward migrations and a backup before each migration.
 - Long-running model work is a durable operation that survives restarts.
 

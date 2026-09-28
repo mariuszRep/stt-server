@@ -27,7 +27,7 @@ models and serves batch transcription through an OpenAI-compatible API.
 
 | Owns | Must not own |
 |---|---|
-| Model catalog, download, import, drop-in refresh, verification, selection, loading, removal; batch transcription and translation; capability matrix; queue; CLI and process modes; auth, CORS, LAN guard; system information; SQLite state | Microphone capture, chunking, VAD, the dictation session, prompt or vocabulary construction, transcript editing (all client-side); provider processes or descriptors; hardware-based model ranking |
+| Model catalog, download, import, drop-in refresh, verification, selection, loading, removal; batch transcription and translation; capability matrix; queue; CLI and process modes; install scope and data folder; auth with admin and user tokens; network modes (local, LAN, Tailscale); CORS; self-update; system information; SQLite state | Microphone capture, chunking, VAD, the dictation session, prompt or vocabulary construction, transcript editing (all client-side); provider processes or descriptors; hardware-based model ranking |
 
 ## Layout
 
@@ -37,10 +37,15 @@ models and serves batch transcription through an OpenAI-compatible API.
   capabilities, request planning, responses
 - `src/download.rs`, `src/import.rs`, `src/verify.rs`, `src/dropin.rs`, `src/gguf_probe.rs`
 - `src/queue.rs`, `src/engine.rs` — inference queue and model load/swap
+- `src/import_user.rs` — copy a user's models into a machine-wide install
 - `src/store.rs` migrations; `src/discovery.rs`, `src/autostart.rs`, `src/service.rs`,
   `src/sysinfo.rs`
+- `src/auth.rs` access levels; `src/network.rs` network modes; `src/selfupdate.rs` updates;
+  `src/model_cli.rs` CLI model commands over the API
+- `tests/` — tests that run the real compiled binary
 - `catalog/` — Handy catalog copy (byte-identical, with `SOURCE.md`)
-- `scripts/build-local.ps1` (static release build), `scripts/bench_corpus.py` (corpus bench)
+- `scripts/build-local.ps1` (static release build), `scripts/bench_corpus.py` (corpus bench),
+  `scripts/catalog_sweep.py` (unattended every-model check, one model on disk at a time)
 
 ## Build and Verify
 
@@ -63,8 +68,14 @@ cargo test --release --offline
 scripts\build-local.ps1 -Offline   # prints binary size and SHA-256
 ```
 
+- Everyday development can use a second target folder (`CARGO_TARGET_DIR=...	`) with plain
+  `cargo clippy --all-targets -- -D warnings` and `cargo test`, so a running release or sweep
+  exe under `s\` is never locked or overwritten. The release commands above remain the gate
+  before tagging a release.
 - Real-model checks use a temporary `--data-dir` and a spare port (54400+), never the user's
-  real data folders. Stop every server you start.
+  real data folders. Stop every server you start (`stt-server-next stop --data-dir <dir>`).
+- Never install the Windows Service or change system settings yourself; give the user the
+  commands to run in an admin terminal.
 - On Windows, tests must drop the app and router before deleting temp dirs (file locks).
 - Run long commands with explicit timeouts and log output to a file; read the tail.
 - Audit native imports after dependency changes with `dumpbin /DEPENDENTS` (Visual Studio
@@ -77,3 +88,5 @@ scripts\build-local.ps1 -Offline   # prints binary size and SHA-256
 - Never commit models, audio, transcripts, databases, tokens, or anything under `s/` or
   `test-data*`.
 - Do not implement destructive data purge without explicit approval of that exact scope.
+- Architectural choices the goal does not settle are the user's to make: ask, or list them
+  as open decisions; do not settle them silently.

@@ -1,6 +1,7 @@
 # STT Server Next — Vision
 
-> Approved by the user on 2026-09-26. Change only on explicit human instruction.
+> Approved by the user on 2026-09-26; "Runs the way people need it" updated with the user's
+> decisions of 2026-09-27. Change only on explicit human instruction.
 
 ## What it is
 
@@ -24,9 +25,12 @@ only one.
 - **Transcription stays simple.** Applications send finished audio and get text back. The
   client owns the dictation session: microphone, chunking, prompts and vocabulary, and editing
   the result. The server passes a prompt through unchanged and never rewrites a transcript.
-- **Runs the way people need it.** By default it starts and stops with the app that uses it.
-  It can also run on its own: at Windows sign-in, as a Windows Service, or on the local network
-  for other devices, always behind a token.
+- **Runs the way people need it.** By default it starts and stops with the app that uses it,
+  installed just for that person. It can also run on its own: at Windows sign-in for one person,
+  or installed for the whole machine as a shared server (a Windows Service) that other users,
+  devices on a private network, or the person's own devices over Tailscale can use. Each install
+  keeps its models in one place, and shared use is always behind a token, with ordinary users
+  able to transcribe and only an administrator able to change models or settings.
 - **Open source.** It will be published as an open-source project, with public releases the
   server can update itself from.
 
