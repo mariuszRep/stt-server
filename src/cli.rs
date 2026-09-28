@@ -73,7 +73,7 @@ If the new version does not become healthy, the previous executable and
 server are restored automatically.
 ";
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct RunFlags {
     pub port: Option<u16>,
     pub host: Option<String>,
@@ -84,6 +84,39 @@ pub struct RunFlags {
     /// given at all (see `App::cors_origins` for how this combines with the
     /// stored setting and the default).
     pub cors_origins: Vec<String>,
+}
+
+impl RunFlags {
+    /// Shared by detached start, autostart and update recovery. Preserve absent
+    /// overrides: a resolved address is not an explicit --host choice.
+    pub fn arguments(&self, data_dir: &std::path::Path) -> Vec<String> {
+        let mut args = vec!["--data-dir".into(), data_dir.display().to_string()];
+        for (flag, value) in [
+            ("--port", self.port.map(|v| v.to_string())),
+            ("--host", self.host.clone()),
+            ("--network", self.network.map(|v| v.as_str().to_owned())),
+            (
+                "--queue-max-waiting",
+                self.limits.queue_max_waiting.map(|v| v.to_string()),
+            ),
+            (
+                "--queue-wait-timeout-ms",
+                self.limits.queue_wait_timeout_ms.map(|v| v.to_string()),
+            ),
+            (
+                "--inference-timeout-ms",
+                self.limits.inference_timeout_ms.map(|v| v.to_string()),
+            ),
+        ] {
+            if let Some(value) = value {
+                args.extend([flag.into(), value]);
+            }
+        }
+        for origin in &self.cors_origins {
+            args.extend(["--cors-origin".into(), origin.clone()]);
+        }
+        args
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +168,7 @@ pub enum UpdateCommand {
         yes: bool,
         json: bool,
         data_dir: Option<PathBuf>,
+        ready_timeout_seconds: u64,
     },
 }
 
@@ -673,11 +707,16 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
                     let mut json = false;
                     let mut yes = false;
                     let mut data_dir = None;
+                    let mut ready_timeout_seconds = 600;
                     let mut iter = rest.iter();
                     while let Some(flag) = iter.next() {
                         match flag.as_str() {
                             "--json" => json = true,
                             "--yes" => yes = true,
+                            "--ready-timeout-seconds" => {
+                                ready_timeout_seconds =
+                                    parse_positive_u64(flag, &next_value(&mut iter, flag)?)?;
+                            }
                             "--data-dir" => {
                                 data_dir = Some(PathBuf::from(next_value(&mut iter, flag)?))
                             }
@@ -688,6 +727,7 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
                         yes,
                         json,
                         data_dir,
+                        ready_timeout_seconds,
                     }))
                 }
                 other => Err(CliError::usage(format!(
@@ -702,6 +742,7 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|v| v.to_string()).collect()
@@ -796,6 +837,49 @@ mod tests {
             Command::Restart(flags) => assert_eq!(flags.port, Some(1)),
             _ => panic!("expected Restart"),
         }
+    }
+
+    // Regression: `start`/`restart` spawn a detached child via
+    // `RunFlags::arguments`, and it must carry every explicitly-given
+    // `--cors-origin` (repeatable) through to that child -- a dropped origin
+    // would silently disable a browser client's access after a restart.
+    #[test]
+    fn arguments_carries_repeated_cors_origins() {
+        let flags = RunFlags {
+            cors_origins: vec![
+                "https://a.example".to_owned(),
+                "https://b.example".to_owned(),
+            ],
+            ..Default::default()
+        };
+        let built = flags.arguments(Path::new("C:\\data"));
+        assert_eq!(
+            built,
+            args(&[
+                "--data-dir",
+                "C:\\data",
+                "--cors-origin",
+                "https://a.example",
+                "--cors-origin",
+                "https://b.example",
+            ])
+        );
+    }
+
+    #[test]
+    fn arguments_omits_cors_origin_when_not_given() {
+        let built = RunFlags::default().arguments(Path::new("C:\\data"));
+        assert!(!built.iter().any(|a| a == "--cors-origin"));
+    }
+
+    #[test]
+    fn arguments_carries_network_mode_when_given() {
+        let flags = RunFlags {
+            network: Some(NetworkMode::Lan),
+            ..Default::default()
+        };
+        let built = flags.arguments(Path::new("C:\\data"));
+        assert_eq!(built, args(&["--data-dir", "C:\\data", "--network", "lan"]));
     }
 
     #[test]
@@ -1098,7 +1182,8 @@ mod tests {
             Command::Update(UpdateCommand::Install {
                 yes: false,
                 json: false,
-                data_dir: None
+                data_dir: None,
+                ready_timeout_seconds: 600,
             })
         );
         assert_eq!(
@@ -1114,7 +1199,8 @@ mod tests {
             Command::Update(UpdateCommand::Install {
                 yes: true,
                 json: true,
-                data_dir: Some(PathBuf::from("C:\\d"))
+                data_dir: Some(PathBuf::from("C:\\d")),
+                ready_timeout_seconds: 600,
             })
         );
     }

@@ -7,7 +7,7 @@ type: feature
 scope: stt-server-next only
 attempt: 1
 max_attempts: 8
-last_result: implemented; unit/mock-server rehearsal green; real GitHub Releases source untested (repo private)
+last_result: reimplemented as a journalled transaction (src/update_transaction.rs); covered by unit tests and real-binary integration tests (tests/update_transaction.rs); real GitHub Releases source and live release-to-release rehearsal still untested (repo private)
 next_action: Rehearse a live N to N+1 update and forced rollback with two real tagged binaries once a release source exists.
 success_criteria:
   - A user can check for a newer released server and choose when to install it through the CLI.
@@ -117,3 +117,34 @@ needed -- attempt 1 already matches this. `next_action` updated to drop these as
 only the live two-binary/real-release-source rehearsal remains outstanding.
 
 2026-09-28: Blocked: the only remaining check is a live update from one GitHub release to the next with a forced rollback, which needs the repository to be public with a first release.
+
+2026-09-28: The self-update mechanism was redesigned and reimplemented as a journalled
+transaction (`src/update_transaction.rs`), superseding attempt 1's simpler rename-to-`.old`
+approach described above. Every step (stop, database snapshot, executable replace, restart,
+readiness validation, commit-or-rollback) is recorded to `<data dir>\update-journal.json` before
+it happens, so an interruption at any phase -- crash, power loss, a killed CLI -- is recovered by
+a registered one-shot Scheduled Task (a protected copy of the same executable) that always rolls
+back a non-`Committed`/non-`Restored` transaction it finds; normal server startup refuses to run
+while such a journal exists. The database is checkpointed and hash-verified into the work folder
+before the executable is touched, so rollback restores the exact pre-update database rather than
+relying on the older executable to simply refuse a newer schema. Launch settings (host, port,
+network mode, CORS origins, data dir, service vs. foreground) are persisted in the journal and
+reused verbatim on restart, so an update never silently changes how the server is exposed. See
+`README.md`'s "Self-update" section for the full step-by-step writeup.
+
+Covered by unit tests in `src/update_transaction.rs` (journal round-trip of full launch settings,
+database snapshot/restore round-trip, a corrupted first-run database preserved as evidence rather
+than purged, executable replace/restore round-trip, a corrupted candidate rejected before it can
+replace the running executable) and by real-binary integration tests in
+`tests/update_transaction.rs`: `expected_version_mismatch_rolls_back`,
+`readiness_failure_rolls_back`, `interrupted_journal_is_recovered_from_every_non_terminal_phase`,
+`database_backup_is_restored_on_rollback`, and `launch_settings_are_preserved_across_the_restart`
+-- i.e. the version-mismatch rollback, readiness-failure rollback, recovery from every interrupted
+phase, database restore, and launch-settings-preserved cases the orchestrator asked this pass to
+confirm are covered. A cargo test run was in progress elsewhere in the workspace at the time of
+this documentation pass, so this entry records what the tests cover and does not itself assert a
+fresh pass/fail count; confirm the run's result separately before relying on this as a gate.
+
+This does not change what remains blocked: the only outstanding check is a live update from one
+real tagged GitHub release to the next (and a forced rollback of it), which needs the repository
+to be public with a first published release -- unchanged from the 2026-09-28 entry above.

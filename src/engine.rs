@@ -35,6 +35,16 @@ impl LoadedModel {
     }
 }
 
+/// The live (loaded-model) capability view for `model`, the same computation
+/// `LoadedModel::new` does internally. Exposed separately so callers that
+/// load a model on demand (a per-request swap in `api::transcribe_or_translate`)
+/// can cache it per model id (`App::live_caps`) for `GET /v1/models` to reuse
+/// even after that model is no longer resident, without re-deriving it from a
+/// `LoadedModel` they may not otherwise construct.
+pub fn caps_for(model: &Model) -> EffectiveCaps {
+    EffectiveCaps::new(LoadedCaps::from_model(model))
+}
+
 /// Reported by `/readiness` (and the transcription handlers) while a model
 /// is loading in the background: see `spawn_tracked_load`. `started_at` is
 /// process-local monotonic time, never serialized directly -- callers read

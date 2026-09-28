@@ -10,8 +10,9 @@ use std::{
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
+use crate::capabilities::EffectiveCaps;
 use crate::catalog::{Catalog, CatalogModel};
-use crate::engine::{load_engine, spawn_tracked_load, LoadedModel, LoadingStatus};
+use crate::engine::{caps_for, load_engine, spawn_tracked_load, LoadedModel, LoadingStatus};
 use crate::queue::InferenceQueue;
 
 pub struct App {
@@ -31,6 +32,16 @@ pub struct App {
     /// blocking the request or answering as if no model were selected at
     /// all. See `engine::spawn_tracked_load`.
     pub loading: Arc<Mutex<Option<LoadingStatus>>>,
+    /// Live (loaded-model) capability view cached per model id, the moment it
+    /// is loaded -- by the startup reload below, by `select_model` (setting
+    /// the default), or by an on-demand per-request swap in
+    /// `api::transcribe_or_translate`. `GET /v1/models` prefers this over the
+    /// static catalog view for any model id this process has ever loaded,
+    /// per the "openai-model-per-request" goal (a model that is or was loaded
+    /// gets the live, verified view; everything else gets the catalog's best
+    /// static answer). Never evicted: one process loads at most a handful of
+    /// distinct models in practice, so this stays small.
+    pub live_caps: Arc<Mutex<std::collections::HashMap<String, EffectiveCaps>>>,
     pub data_dir: PathBuf,
     pub token: String,
     /// User-level token (`user.token`): satisfies `AccessLevel::User` routes
@@ -98,7 +109,7 @@ pub struct BindOverrides {
 
 /// Optional operational limits; `None` means unbounded/no-timeout, matching
 /// the current shipping server's default behavior.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeLimits {
     pub queue_max_waiting: Option<usize>,
     pub queue_wait_timeout_ms: Option<u64>,
@@ -560,15 +571,34 @@ pub fn open_app_at_full(
     crate::store::migrate(&mut db, &catalog.models, &data_dir)?;
     let now = crate::store::now_ms();
     db.execute("UPDATE operations SET state='failed', error='Interrupted by service restart', updated_at=?1, finished_at=?1 WHERE state IN ('queued','running')", params![now])?;
-    reconcile_interrupted_imports(&db, &data_dir)?;
+    // A validation start must not move import staging files: database changes
+    // can roll back, filesystem reconciliation cannot.
+    if !crate::update_transaction::maintenance(&data_dir) {
+        reconcile_interrupted_imports(&db, &data_dir)?;
+    }
     reconcile_installed(&db, &catalog.models, &data_dir)?;
-    let selected: Option<(String, String)> = db
+    let mut selected: Option<(String, String)> = db
         .query_row(
             "SELECT i.id,i.path FROM installed i JOIN settings s ON s.key='selected_model' AND s.value=i.id WHERE i.needs_verification=0",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
+    // Per-request models can leave a non-default model resident. Rehearse that
+    // same model during update without changing the stored default.
+    if let Some(journal) = crate::update_transaction::read_journal(&data_dir)? {
+        if !journal.phase.terminal() {
+            if let Some(id) = journal.ready_model {
+                selected = db
+                    .query_row(
+                        "SELECT id,path FROM installed WHERE id=?1 AND needs_verification=0",
+                        [id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+            }
+        }
+    }
     let preference: String = db
         .query_row(
             "SELECT value FROM settings WHERE key='preferred_backend'",
@@ -588,6 +618,8 @@ pub fn open_app_at_full(
     // `loading`) and swaps itself in whenever it finishes.
     let loaded: Arc<Mutex<Option<LoadedModel>>> = Arc::new(Mutex::new(None));
     let loading: Arc<Mutex<Option<LoadingStatus>>> = Arc::new(Mutex::new(None));
+    let live_caps: Arc<Mutex<std::collections::HashMap<String, EffectiveCaps>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
     let stored_limits = crate::store::read_runtime_limits(&db)?;
     let limits = RuntimeLimits {
         queue_max_waiting: cli_overrides
@@ -660,9 +692,15 @@ pub fn open_app_at_full(
         let loaded_slot = loaded.clone();
         let loading_slot = loading.clone();
         let model_id = id.clone();
+        let live_caps_slot = live_caps.clone();
         spawn_tracked_load(loading_slot, loaded_slot, model_id, move || {
-            load_engine(Path::new(&path), &preference)
-                .map(|(model, diagnostic)| LoadedModel::new(id, model, diagnostic))
+            load_engine(Path::new(&path), &preference).map(|(model, diagnostic)| {
+                live_caps_slot
+                    .lock()
+                    .expect("live_caps poisoned")
+                    .insert(id.clone(), caps_for(&model));
+                LoadedModel::new(id, model, diagnostic)
+            })
         });
     }
 
@@ -671,6 +709,7 @@ pub fn open_app_at_full(
         db: Mutex::new(db),
         loaded,
         loading,
+        live_caps,
         data_dir,
         token,
         user_token,

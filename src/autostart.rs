@@ -12,28 +12,21 @@ pub const VALUE_NAME: &str = "OpenVibeSttServer";
 
 /// Builds the command line stored in the registry value: the exe path
 /// (quoted), `start`, and `--data-dir` plus any given `--port`/`--host`.
-pub fn command_line(exe: &Path, data_dir: &Path, port: Option<u16>, host: Option<&str>) -> String {
-    let mut line = format!(
-        "\"{}\" start --data-dir \"{}\"",
-        exe.display(),
-        data_dir.display()
-    );
-    if let Some(port) = port {
-        line.push_str(&format!(" --port {port}"));
-    }
-    if let Some(host) = host {
-        line.push_str(&format!(" --host {host}"));
-    }
-    line
+pub fn command_line(exe: &Path, data_dir: &Path, flags: &crate::cli::RunFlags) -> String {
+    std::iter::once(exe.display().to_string())
+        .chain(std::iter::once("start".to_owned()))
+        .chain(flags.arguments(data_dir))
+        .map(|arg| crate::update_transaction::quote_windows_arg(&arg))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub fn enable(
     exe: &Path,
     data_dir: &Path,
-    port: Option<u16>,
-    host: Option<&str>,
+    flags: &crate::cli::RunFlags,
 ) -> Result<(), Box<dyn Error>> {
-    let value = command_line(exe, data_dir, port, host);
+    let value = command_line(exe, data_dir, flags);
     let status = Command::new("reg")
         .args([
             "add", RUN_KEY, "/v", VALUE_NAME, "/t", "REG_SZ", "/d", &value, "/f",
@@ -90,10 +83,9 @@ mod tests {
         let line = command_line(
             Path::new(r"C:\bin\stt.exe"),
             Path::new(r"C:\data"),
-            None,
-            None,
+            &crate::cli::RunFlags::default(),
         );
-        assert_eq!(line, r#""C:\bin\stt.exe" start --data-dir "C:\data""#);
+        assert_eq!(line, r#""C:\bin\stt.exe" "start" "--data-dir" "C:\data""#);
     }
 
     #[test]
@@ -101,12 +93,50 @@ mod tests {
         let line = command_line(
             Path::new(r"C:\bin\stt.exe"),
             Path::new(r"C:\data"),
-            Some(54400),
-            Some("0.0.0.0"),
+            &crate::cli::RunFlags {
+                port: Some(54400),
+                host: Some("0.0.0.0".into()),
+                ..Default::default()
+            },
         );
         assert_eq!(
             line,
-            r#""C:\bin\stt.exe" start --data-dir "C:\data" --port 54400 --host 0.0.0.0"#
+            r#""C:\bin\stt.exe" "start" "--data-dir" "C:\data" "--port" "54400" "--host" "0.0.0.0""#
+        );
+    }
+
+    // Regression: autostart's registry `Run` value must carry the explicit
+    // `--network` mode through, otherwise a LAN/Tailscale-configured server
+    // silently reverts to loopback-only on the next login.
+    #[test]
+    fn command_line_includes_network_when_given() {
+        let line = command_line(
+            Path::new(r"C:\bin\stt.exe"),
+            Path::new(r"C:\data"),
+            &crate::cli::RunFlags {
+                network: Some(crate::network::NetworkMode::Lan),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            line,
+            r#""C:\bin\stt.exe" "start" "--data-dir" "C:\data" "--network" "lan""#
+        );
+    }
+
+    #[test]
+    fn command_line_includes_cors_origins_when_given() {
+        let line = command_line(
+            Path::new(r"C:\bin\stt.exe"),
+            Path::new(r"C:\data"),
+            &crate::cli::RunFlags {
+                cors_origins: vec!["https://a.example".to_owned()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            line,
+            r#""C:\bin\stt.exe" "start" "--data-dir" "C:\data" "--cors-origin" "https://a.example""#
         );
     }
 

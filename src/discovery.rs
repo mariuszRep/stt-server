@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ServerInfo {
     pub pid: u32,
     pub host: String,
@@ -24,6 +24,12 @@ pub struct ServerInfo {
     #[serde(default)]
     pub api_level: u32,
     pub started_at: i64,
+    /// How this process was launched (executable, service flag, `RunFlags`);
+    /// read back by `update_transaction::prepare` for a running server so an
+    /// update can relaunch it identically. `None` for a `server.json` written
+    /// by a version that predates this field.
+    #[serde(default)]
+    pub launch: Option<crate::update_transaction::Launch>,
 }
 
 pub fn server_json_path(data_dir: &Path) -> PathBuf {
@@ -50,6 +56,7 @@ impl ServerInfo {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             api_level: crate::api::API_LEVEL,
             started_at: now_ms(),
+            launch: None,
         }
     }
 }

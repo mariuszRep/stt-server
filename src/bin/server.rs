@@ -31,6 +31,26 @@ fn bind_overrides(flags: &RunFlags) -> BindOverrides {
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("__update-worker") {
+        let result = match args.get(1) {
+            Some(dir) => {
+                stt_server_next::update_transaction::worker_entry(
+                    std::path::Path::new(dir),
+                    args.get(2).map(String::as_str) == Some("--recover"),
+                )
+                .await
+            }
+            None => Err("Missing recovery data directory".to_owned()),
+        };
+        let code = match result {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("{error}");
+                1
+            }
+        };
+        std::process::exit(code);
+    }
     let command = match cli::parse(&args) {
         Ok(command) => command,
         Err(error) => {
@@ -82,7 +102,16 @@ async fn cmd_update(command: UpdateCommand) -> i32 {
             yes,
             json,
             data_dir,
-        } => cmd_update_install(effective_data_dir_opt(&data_dir), yes, json).await,
+            ready_timeout_seconds,
+        } => {
+            cmd_update_install(
+                effective_data_dir_opt(&data_dir),
+                yes,
+                json,
+                ready_timeout_seconds,
+            )
+            .await
+        }
     }
 }
 
@@ -134,173 +163,14 @@ async fn cmd_update_check(json: bool) -> i32 {
     }
 }
 
-async fn cmd_update_install(data_dir: PathBuf, yes: bool, json: bool) -> i32 {
-    let http = update_http_client();
-    let endpoint = selfupdate::default_update_endpoint();
-    let check = match selfupdate::check_latest(&http, &endpoint).await {
-        Ok(check) => check,
+async fn cmd_update_install(data_dir: PathBuf, yes: bool, json: bool, timeout: u64) -> i32 {
+    match stt_server_next::update_transaction::install(data_dir, yes, json, timeout).await {
+        Ok(()) => 0,
         Err(error) => {
-            eprintln!("error: could not check for updates: {error}");
-            return 1;
-        }
-    };
-    if !check.update_available {
-        if json {
-            println!(
-                "{}",
-                serde_json::json!({"installed": false, "reason": "already_up_to_date", "current_version": check.current_version})
-            );
-        } else {
-            println!(
-                "already up to date: {} is the latest release",
-                check.current_version
-            );
-        }
-        return 0;
-    }
-    if !yes {
-        if json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "installed": false,
-                    "reason": "confirmation_required",
-                    "current_version": check.current_version,
-                    "latest_version": check.release.version,
-                })
-            );
-        } else {
-            println!(
-                "update available: {} -> {}",
-                check.current_version, check.release.version
-            );
-            println!("re-run with --yes to download, verify, and install it");
-        }
-        return 0;
-    }
-
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(error) => {
-            eprintln!("error: could not resolve current executable: {error}");
-            return 1;
-        }
-    };
-    let stage_dir = data_dir.join("update");
-    println!("downloading and verifying {} ...", check.release.version);
-    let staged = match selfupdate::download_and_verify(&http, &check.release, &stage_dir).await {
-        Ok(path) => path,
-        Err(error) => {
-            eprintln!("error: download/verification failed, nothing was changed: {error}");
-            return 1;
-        }
-    };
-
-    // Remember how the running instance was reachable (if any) so the
-    // restart after replacement uses the same bind host/port.
-    let previous_info = discovery::read_server_json(&data_dir);
-    let was_running = previous_info
-        .as_ref()
-        .map(|info| discovery::pid_is_alive(info.pid))
-        .unwrap_or(false);
-    if was_running {
-        println!("stopping the running server before replacing its executable ...");
-        let stop_code = cmd_stop(data_dir.clone()).await;
-        if stop_code != 0 {
-            eprintln!(
-                "error: could not stop the running server; update aborted, nothing was changed"
-            );
-            return 1;
+            eprintln!("error: {error}");
+            1
         }
     }
-
-    let backup = match selfupdate::replace_exe(&exe, &staged) {
-        Ok(backup) => backup,
-        Err(error) => {
-            eprintln!("error: could not install the new executable: {error}");
-            if was_running {
-                eprintln!(
-                    "the previous executable is unchanged; restart it with `stt-server-next start`"
-                );
-            }
-            return 1;
-        }
-    };
-
-    let restart_flags = RunFlags {
-        data_dir: Some(data_dir.clone()),
-        host: previous_info.as_ref().map(|info| info.host.clone()),
-        port: previous_info.as_ref().map(|info| info.port),
-        network: None,
-        limits: Default::default(),
-        cors_origins: Vec::new(),
-    };
-
-    if !was_running {
-        // Nothing was running before, so there is nothing to restart or
-        // verify health of; the swap itself (already hash-verified) is the
-        // whole job here.
-        println!(
-            "installed {} (was not running; start it with `stt-server-next start`)",
-            check.release.version
-        );
-        return 0;
-    }
-
-    println!("starting the new version ...");
-    let start_code = cmd_start(restart_flags.clone()).await;
-    if start_code == 0 {
-        if json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "installed": true,
-                    "from_version": check.current_version,
-                    "to_version": check.release.version,
-                })
-            );
-        } else {
-            println!(
-                "update installed: {} -> {}",
-                check.current_version, check.release.version
-            );
-        }
-        return 0;
-    }
-
-    eprintln!("error: new version did not become healthy; rolling back");
-    // Best-effort: stop whatever the failed new instance left behind before
-    // restoring the previous binary underneath it.
-    let _ = cmd_stop(data_dir.clone()).await;
-    if let Err(error) = selfupdate::rollback_exe(&exe, &backup) {
-        eprintln!("error: automatic rollback failed: {error}");
-        eprintln!(
-            "the previous executable is still at {}; restore it manually",
-            backup.display()
-        );
-        return 1;
-    }
-    let restore_code = cmd_start(restart_flags).await;
-    if restore_code != 0 {
-        eprintln!("error: rolled back the executable but could not restart the previous version");
-    } else {
-        eprintln!(
-            "rolled back to the previous version ({})",
-            check.current_version
-        );
-    }
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "installed": false,
-                "reason": "rolled_back",
-                "current_version": check.current_version,
-                "attempted_version": check.release.version,
-            })
-        );
-    }
-    1
 }
 
 // ---------------------------------------------------------------------------
@@ -408,6 +278,9 @@ async fn cmd_start(flags: RunFlags) -> i32 {
         args.push(v.to_string());
     }
 
+    // Use the same complete serialization as autostart and recovery.
+    args.truncate(1);
+    args.extend(flags.arguments(&data_dir));
     let mut command = std::process::Command::new(&exe);
     command.args(&args);
     #[cfg(windows)]
@@ -630,12 +503,7 @@ fn cmd_autostart(action: AutostartAction, flags: RunFlags) -> i32 {
     match action {
         AutostartAction::Enable => {
             let data_dir = effective_data_dir(&flags);
-            match stt_server_next::autostart::enable(
-                &exe,
-                &data_dir,
-                flags.port,
-                flags.host.as_deref(),
-            ) {
+            match stt_server_next::autostart::enable(&exe, &data_dir, &flags) {
                 Ok(()) => {
                     println!("autostart enabled");
                     0

@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 /// The user-settable network mode. Does not include the "custom" (explicit
 /// `--host`) case, which is tracked separately as `App::network_custom`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum NetworkMode {
     Local,
     Lan,

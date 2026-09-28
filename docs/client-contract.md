@@ -310,8 +310,19 @@ or descriptors.
   entries plus any drop-in/custom models, each with `id`, `name`,
   `installed`, `source`, capability info.
 - **OpenAI-shaped list:** `GET /v1/models` -- `{"object": "list", "data":
-  [{"id", "object": "model", "owned_by": "local"}, ...]}`, covering both
-  catalog models and custom (drop-in) ones.
+  [{"id", "object": "model", "owned_by": "local", "default": bool,
+  "capabilities": ControlCapability-map}, ...]}`, listing only **callable**
+  models: downloaded and verified, catalog or custom (drop-in). A model that
+  is downloaded but still `needs_verification` is never listed here (a
+  request naming it gets `409 needs_verification`, same as before). `default`
+  marks the one model that a request with no `model` field, or
+  `"model":"default"`, resolves to. `capabilities` is the live
+  (`capabilities::EffectiveCaps`) view for any model this server process has
+  loaded at least once (cached per model id even after it is no longer
+  resident), falling back to the catalog's static view (4.1) for a callable
+  model never yet loaded. `GET /v1/models/{id}` returns one such entry
+  directly (not wrapped in `{"data": [...]}}`), or `404 model_not_installed`
+  if `id` is not callable.
 - **Recommendations:** `GET /v1/local/recommendations` -- the curated,
   hardware-independent recommended subset in fixed rank order (`recommended`
   + `recommended_rank` from the catalog; per `CONVENTIONS.md`, hardware
@@ -324,11 +335,21 @@ or descriptors.
 - **Verify:** `POST /v1/local/models/{id}/verify` -- same operation-polling
   shape; checks the immutable revision/size/SHA-256 before a model is
   trusted (`CONVENTIONS.md`'s trust rule).
-- **Select (load):** `POST /v1/local/models/{id}/select` (alias:
-  `.../load`) -> `200 {"model": id, "backend": {"observed_backend",
+- **Select (set default and load):** `POST /v1/local/models/{id}/select`
+  (alias: `.../load`) -> `200 {"model": id, "backend": {"observed_backend",
   "fallback_reason"}}`, or `409 needs_verification` if the model needs
-  verification first. Verify a managed model, or refresh a drop-in model, then select again. Loading never triggers a download (`CONVENTIONS.md`:
-  "First start and transcription have no download side effects").
+  verification first. This is now "set the default model": it persists `id`
+  as the default (what an empty/`"default"` `model` field resolves to on
+  every future request, and what loads at startup) **and** loads it
+  immediately, same as before. Verify a managed model, or refresh a drop-in
+  model, then select again. Loading never triggers a download
+  (`CONVENTIONS.md`: "nothing ever downloads on request"). This endpoint's
+  path and "select" name are unchanged in this slice; the `/models/manage`
+  rename is a later slice of the same goal.
+- **Model per request:** every transcription/translation may name any
+  callable model directly in its `model` field (see section 5) -- the server
+  loads/swaps to it itself if it is not already resident, with no separate
+  select call needed. A per-request `model` never changes the default.
 - **Deselect / current selection:**
   `GET /v1/local/models/selected` -> the loaded model's `id` plus its full
   effective-capability matrix (see 4.1), or `{"model": null,
@@ -408,14 +429,25 @@ all -- only killing the process worked. Now:
   distinct from the plain `{"reason": "No selected model loaded"}` case
   (nothing selected at all, or the load already failed). Once it finishes,
   readiness flips straight to `200 {"status": "ready", ...}` (see 7).
-- **A transcription/translation request during the load** gets `503
-  {"error": {"code": "model_loading", "message": "...", "details": {"model",
-  "elapsed_ms"}}}` rather than the generic `server_not_ready` -- a client can
-  tell "it's on its way, poll and retry" apart from "nothing is selected, go
-  select one." Per `CONVENTIONS.md`'s "a request uses the model that was
-  loaded when it entered the queue" rule, a request never waits for a load
-  in progress and never silently ends up using whatever model finishes
-  loading later; it is rejected outright and the caller retries.
+- **A `model=default` (or omitted) request while nothing is default yet and
+  the startup reload is still in progress** gets `503 {"error": {"code":
+  "model_loading", "message": "...", "details": {"model", "elapsed_ms"}}}`
+  rather than the generic `server_not_ready` -- a client can tell "it's on
+  its way, poll and retry" apart from "nothing is selected, go select one."
+  This is checked once, up front, before the request joins the queue.
+- **A request naming a specific model (or resolving to one once a default is
+  configured) that needs a swap or a fresh load** joins the queue like any
+  other request; once it is that request's turn, the server loads/swaps to
+  the named model itself (see the model-per-request and queue rules below)
+  rather than rejecting the request. If a background load already in
+  progress targets that exact model (the startup reload case above), the
+  request waits for it in place of the old immediate 503 -- bounded by the
+  `queue_wait_timeout_ms` setting (4.2's queue timeout, same one
+  `queue_timeout` already uses): only once that is exceeded does it give up
+  with `503 model_loading`. A load the request starts itself is a plain
+  synchronous attempt: it either finishes or fails outright as
+  `409 model_load_failed`, leaving whatever model was previously resident
+  untouched and serving the next request.
 - **`POST /v1/local/models/{id}/select`** (and `.../load`) while a
   background load is already in progress is rejected with `409
   {"error": {"code": "model_loading", "details": {"model", "elapsed_ms"}}}`
@@ -434,6 +466,37 @@ all -- only killing the process worked. Now:
   the in-memory `loaded`/`loading` slots, never the database, during a
   reload; a future `select` remains the only thing that persists a chosen
   model row).
+
+### 4.3 Model per request and the queue
+
+Every transcription/translation names a model (`model` field, defaulting to
+`"default"` -- see section 5). The server resolves it before the request
+joins the queue:
+
+- **`"default"` or omitted** resolves to the current default model (the
+  model a prior `select` set, and what loads at startup).
+- **Any other value** names that model id directly, catalog or custom
+  (drop-in), regardless of whether it is currently resident.
+- **Not installed, or not a known id at all** -> `404 model_not_installed`,
+  immediately, before the request ever joins the queue. Nothing is ever
+  downloaded because of this.
+- **Installed but `needs_verification`** -> `409 needs_verification`,
+  same as `select`'s existing check.
+
+Requests are served strictly FIFO (per `CONVENTIONS.md`'s single-resident-
+model queue), and **each request keeps the model it resolved to even while
+it waits** -- a later request naming a different model never changes an
+earlier one's outcome. When a request reaches the head of the queue and the
+resident model differs from the one it asked for, the server swaps before
+running that request: loads the target model, swaps it into the single
+resident-model slot, and only then runs the request. No swap ever happens
+while another request is mid-run (the single inference permit rules this
+out), and no two requests are ever mid-swap at once. If the swap's load
+fails, the previously resident model is left untouched and only that one
+request fails, with `409 model_load_failed`; the queue continues normally
+for whatever request is next. A three-request sequence naming models A, B, A
+in that order therefore causes two swaps (A->B, B->A), not one -- the second
+A does not get to reuse the first A's load.
 
 **Timestamp gate (Bug 1, corrected):** an earlier revision of this fix
 distrusted `transcribe_cpp::Model::capabilities().max_timestamp_kind` and
@@ -488,6 +551,43 @@ sending a default or empty value. Sending an unsupported optional field is
 rejected with `422 unsupported_capability` (see the error table in 6).
 `model` itself is never gated this way -- see 5's "missing model" rule.
 
+### 4.4 Operation retry behaviour (install/verify/import/refresh)
+
+A long-running model operation (`install`, `verify`, `import`, `import-user`, `refresh`) is
+tracked as one row in the `operations` table (`GET /v1/local/operations/{id}`), polled to a
+terminal state (`completed`/`failed`/`cancelled`). What happens to it on failure, cancel, or a
+server restart -- and whether a client should expect it to come back on its own -- differs by
+cause; **the server never automatically resumes or retries an operation once its request has
+returned**, only a client starting a new operation call does:
+
+- **Failure during the operation itself** (e.g. a download's retry schedule exhausted, a hash
+  mismatch, disk full): the operation is marked `failed` with a message and, for downloads, a
+  machine-readable `error_code` (`insufficient_disk_space`, `stalled`, `source_unavailable`,
+  `hash_mismatch`; see the error table in section 6). This is terminal -- the server does not
+  requeue or retry it itself. A partially downloaded file's `.part` is left on disk rather than
+  deleted; a **new** `install`/`import` call for the same model reuses it (`resume_decision` in
+  `src/download.rs`: an exact-size partial goes straight to hash verification, a shorter one
+  resumes via HTTP `Range`, an oversized or invalid one restarts from zero) -- so retrying is
+  cheap, but it is still the client's job to issue that new call after seeing `failed`.
+- **Explicit cancel** (`POST /v1/local/operations/{id}/cancel`): the operation is marked
+  `cancelled` (a distinct terminal state, `error_code: "cancelled"`); an already-terminal operation
+  cannot be cancelled (`409 operation_finished`). Any partial download bytes are likewise left on
+  disk for a future `install` call to resume from, exactly as above -- cancel never deletes the
+  `.part` file itself.
+- **Server restart or crash while an operation was `queued`/`running`** (`app::reconcile_interrupted_imports`
+  plus the unconditional sweep in `app::open_app`): every operation still in `queued`/`running` at
+  the moment the database is reopened is marked `failed` with `error: "Interrupted by service
+  restart"` (no dedicated `error_code` for this case). An `import` interrupted mid-copy additionally
+  has its partially-copied file quarantined rather than left registered as installed. A `refresh`/
+  `install`/`verify`/`import-user` operation interrupted this way is not resumed either -- its
+  `.part` file (for a download) is still reusable by a fresh call the same way a failure's is, but
+  the operation row itself stays `failed` and the client must start over.
+- **In every case above, the client is responsible for retrying**: this server has no background
+  retry loop, no exponential-backoff requeue, and no "resume this operation" endpoint -- only
+  `state: "failed"`/`"cancelled"` plus (for downloads) a reusable `.part` file that makes the next
+  attempt fast. Do not build a client that waits for a failed/cancelled/interrupted operation to
+  change state on its own.
+
 ## 5. Transcription / translation requests
 
 `POST /v1/audio/transcriptions` and `POST /v1/audio/translations`, both
@@ -496,7 +596,7 @@ rejected with `422 unsupported_capability` (see the error table in 6).
 | Field | Required | Notes |
 |---|---|---|
 | `file` | yes | audio bytes |
-| `model` | no | **Omit entirely, or send `"default"`, to use whichever model is currently selected.** A request with no `model` field at all is treated as `model=default` -- do not synthesize a value just to satisfy a "required" assumption; the field is genuinely optional now. |
+| `model` | no | **Omit entirely, or send `"default"`, to use the current default model.** Any other value names a specific installed model directly (OpenAI-style, per model): the server loads/swaps to it itself, with no separate select call. `404 model_not_installed` if it is not downloaded or is unknown; `409 needs_verification` if it is downloaded but not yet verified. A request with no `model` field at all is treated as `model=default` -- do not synthesize a value just to satisfy a "required" assumption; the field is genuinely optional now. See 4.3 for the full per-request/queue/swap behaviour. |
 | `language` | no | BCP-47-ish hint; omit unless the selected model's `language_hint` capability is `supported` |
 | `prompt` | no | opaque, verbatim text; omit unless `prompt` capability is `supported` |
 | `temperature` | no | `0.0..=1.0`; omit unless `temperature` capability is `supported` |
@@ -595,13 +695,13 @@ source (`src/api.rs`, `src/audio.rs`, `src/auth.rs`, `src/catalog.rs`,
 | 400 | `missing_file`, `missing_model`, `duplicate_field`, `unexpected_field`, `invalid_multipart`, `invalid_body`, `invalid_audio`, `unsupported_audio`, `audio_too_short`, `invalid_temperature`, `invalid_bind_host`, `invalid_bind_port`, `invalid_network_mode`, `invalid_cors_origins`, `invalid_queue_max_waiting`, `invalid_queue_wait_timeout_ms`, `invalid_inference_timeout_ms`, `invalid_user_models_dir`, `invalid_model`, `invalid_quant`, `invalid_backend` |
 | 401 | `unauthorized` |
 | 403 | `loopback_only` (`/v1/local/shutdown` from a non-loopback caller), `admin_required` (a valid user token used on an admin-only route -- see section 3), `network_not_private` (a non-loopback caller under `network_mode: "lan"`/`"tailscale"` while the live check doesn't currently allow it -- see 3.1) |
-| 404 | `model_not_found`, `operation_not_found`, `model_not_installed` (verify, and remove of a never-installed id) |
-| 409 | `already_installed`, `operation_conflict`, `operation_finished` (cancelling a terminal operation), `model_in_use` (removing the selected model), `model_not_installed` (select, before install), **`needs_verification`** (select, before verify/refresh -- see 4), `model_load_failed`, `model_not_active` (a transcription request while nothing is loaded but the server is otherwise ready), `unowned_model_path` (refusing to remove a file outside the managed store), `model_loading` (select/load of a different model while a background load is already in progress -- see 4.2) |
+| 404 | `model_not_found`, `operation_not_found`, `model_not_installed` (verify and remove of a never-installed id; **a transcription/translation naming a model that isn't downloaded or isn't a known id at all -- see 4.3**; `GET /v1/models/{id}` for a non-callable id) |
+| 409 | `already_installed`, `operation_conflict`, `operation_finished` (cancelling a terminal operation), `model_in_use` (removing the selected model), `model_not_installed` (select, before install), **`needs_verification`** (select, or a transcription/translation naming a downloaded-but-unverified model -- see 4), `model_load_failed` (select, or a per-request swap whose load failed -- see 4.3; the previously resident model is left untouched), `unowned_model_path` (refusing to remove a file outside the managed store), `model_loading` (select/load of a different model while a background load is already in progress -- see 4.2) |
 | 413 | `audio_too_long` (payload too large) |
 | 422 | `unsupported_capability`, `engine_unsupported`, `engine_rejected_option`, `prompt_too_long`, `size_mismatch` (import exceeds catalog size), `hash_mismatch` (import/verify SHA-256 or size mismatch) |
 | 429 | `queue_full` |
 | 500 | `internal_error`, `inference_failed` (message only; not meant to be pattern-matched) |
-| 503 | `server_not_ready` (no model loaded; includes an `operation_id` in `details` when an install/verify that would fix this is already running), `not_ready`, `model_loading` (a transcription request while the selected model is still loading in the background; `details` carries `model`/`elapsed_ms` -- see 4.2), `engine_busy`, `queue_timeout` |
+| 503 | `server_not_ready` (no default model configured and nothing loading; includes an `operation_id` in `details` when an install/verify that would fix this is already running), `not_ready`, `model_loading` (a `model=default` request while the startup reload is still in progress and nothing is default yet, *or* a request whose named model is being loaded in the background for longer than `queue_wait_timeout_ms` -- `details` carries `model`/`elapsed_ms` -- see 4.2/4.3), `engine_busy`, `queue_timeout` |
 | 504 | `inference_timeout` |
 | 507 | `insufficient_memory` (insufficient storage) |
 
@@ -627,8 +727,15 @@ first:
   ```json
   { "status": "ok", "service": "stt-server-next",
     "network": { "mode": "lan", "effective": "local",
-                 "reason": "no active network connection is Private or Domain -- staying local-only" } }
+                 "reason": "no active network connection is Private or Domain -- staying local-only" },
+    "default_model": "whisper-tiny", "loaded_model": "whisper-tiny" }
   ```
+  `default_model` is the id a prior `select` set (`null` if none); `loaded_model`
+  is the id currently resident (`null` if nothing is loaded yet, e.g. still
+  starting up). They can differ: the default is what a `model=default`
+  request resolves to and what loads at startup, while `loaded_model` is
+  whatever the last-run request actually swapped in (see 4.3). Both are
+  best-effort here and never fail `/health` itself.
   `start`/`status` (1.2) check the `service` field, not just the 200 status,
   so an unrelated program answering on the configured port is never mistaken
   for this server. `network.mode` is the resolved setting (`"local"` |
@@ -641,10 +748,14 @@ first:
   network-mode UI should read this object rather than infer reachability
   from `mode` alone.
 - `GET /readiness` -- `200 {"status": "ready", "model": id, "backend":
-  {...}}` when a model is loaded; `503 {"status": "not_ready", "reason":
-  "loading model", "model": id, "elapsed_ms": n}` while it is still loading
-  in the background (see 4.2); else `503 {"status": "not_ready", "reason":
-  "No selected model loaded"}`.
+  {...}, "default_model": id_or_null, "loaded_model": id}` when a model is
+  loaded; `503 {"status": "not_ready", "reason": "loading model", "model":
+  id, "elapsed_ms": n, "default_model": id_or_null, "loaded_model": null}`
+  while it is still loading in the background (see 4.2); else `503
+  {"status": "not_ready", "reason": "No selected model loaded",
+  "default_model": id_or_null, "loaded_model": null}`. The legacy `model`
+  field is kept for compatibility within this slice; prefer `default_model`/
+  `loaded_model` going forward (see 7's `/health` note for the distinction).
 - `GET /v1/local/models/selected` -- which model, and its full capability
   matrix (4.1).
 - `GET /v1/local/system` -- hardware: see 8.

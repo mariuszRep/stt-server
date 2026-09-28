@@ -386,28 +386,63 @@ rule.
   {"code","message"}}` response from the API prints a clear message to stderr (or, under
   `--json`, the error body) and exits non-zero -- these commands never crash on a down server.
 
-**Self-update** (`src/selfupdate.rs`): the release source is GitHub Releases of this repo,
+**Self-update** (`src/selfupdate.rs` for the release check/download, `src/update_transaction.rs`
+for the journalled apply/recovery): the release source is GitHub Releases of this repo,
 overridable via `STT_NEXT_UPDATE_URL` (used to rehearse against a local/mock server while the
-repo is private). A release must publish two assets: `stt-server-next.exe` and
-`stt-server-next.exe.sha256` (a `sha256sum`-style text file: the hex digest, optionally followed
-by whitespace and a filename).
+repo is private). A release must publish exactly two assets, under these exact names:
+`stt-server-next.exe` and `stt-server-next.exe.sha256` (a `sha256sum`-style text file: the hex
+digest, optionally followed by whitespace and a filename). `update install` without `--yes`
+downloads and verifies nothing -- it only reports whether a newer version exists and what
+installing it would do.
 
 - `update check` fetches the release manifest and reports whether a newer version is available.
   It never downloads anything.
-- `update install` re-checks, downloads the executable and checksum assets into
-  `<data dir>\update\`, and verifies the executable's SHA-256 against the checksum asset
-  *before* touching anything else. Without `--yes` it stops there and prints what it would do.
-  With `--yes` it then: stops the running server (if any, via the same graceful `stop` path),
-  renames the current executable aside to `<exe>.old`, installs the verified executable in its
-  place, and restarts it with the same bind host/port. If the new process does not answer
-  `/health` within `start`'s existing 30s window, the CLI stops it, restores `<exe>.old` over the
-  current executable, and restarts the previous version automatically -- the update is reported
-  as rolled back, not failed silently.
-- Models, settings, the auth token, and operation history live in `<data dir>` and are untouched
-  by any of this; only the executable file itself is replaced.
+- `update install --yes` runs the update as a **journalled transaction**: every step is recorded
+  to `<data dir>\update-journal.json` (`Phase`: `Prepared` -> `Stopping` -> `Snapshot` ->
+  `Replacing` -> `Validating` -> `Committed`, or `RollingBack` -> `Restored` on any failure) before
+  it happens, so an interruption at any point -- crash, power loss, a killed process -- leaves
+  enough on disk to finish the job correctly rather than guessing. The sequence:
+  1. **Check and download.** Re-checks the release, downloads the executable and checksum assets
+     into a protected per-update work folder beside the executable (`.stt-update-<uuid>`, ACL'd to
+     the installing user or `SYSTEM` for a service install), and verifies the executable's SHA-256
+     against the checksum asset before anything existing is touched. A preflight also confirms
+     enough free disk space beside the executable and beside the data folder for the swap and the
+     database snapshot.
+  2. **Stop.** Stops the running server the same way `stop` does (graceful, authenticated
+     shutdown, or the Windows Service `stop` command for a service install).
+  3. **Snapshot the database.** `state.db` is checkpointed and copied to the work folder
+     (`state.snapshot`) before the executable is touched, so a rollback can restore the exact
+     pre-update database contents, hash-verified on the way back in.
+  4. **Replace the executable.** The current executable is moved aside (`retired.exe`) and the
+     verified candidate takes its place, both steps hash-checked.
+  5. **Restart and validate.** The new executable is started with the *same* launch settings
+     (host, port, network mode, CORS origins, data dir, service vs. foreground) recorded at
+     prepare time -- an update never changes how the server is exposed. It must then report its
+     expected version, an API level at least as high as required, the same network mode, and (if a
+     model was loaded before the update) that model ready again, within a bounded readiness
+     timeout.
+  6. **Commit or roll back.** If validation succeeds, the transaction is marked `Committed` and the
+     server is left running the new version (stopped again afterwards if it wasn't running before
+     the update). If any step from Stop onward fails -- download/verify failure never gets this
+     far -- the previous executable and database snapshot are restored, the previous version is
+     started back up and validated the same way, and the transaction is marked `Restored`; the CLI
+     reports the update as rolled back, not failed silently.
+  - **Recovery after interruption.** A registered, one-shot Scheduled Task (a protected copy of
+    this same executable, not a separate program) runs at the next boot/logon if the process
+    doing the update is killed or the machine loses power mid-transaction. It always rolls back
+    any transaction it finds not yet `Committed`/`Restored` -- it never assumes an interrupted
+    update succeeded. Normal server startup refuses to run while a non-terminal, armed journal
+    exists ("Update recovery is pending"), so nothing can start against half-updated state; only
+    the exact recovery worker (or the exact update-transaction server instance mid-validation) may
+    proceed. The task is removed once recovery finishes either way.
+- **Models are never touched.** Models, settings, the auth token, and operation history live in
+  `<data dir>` and are untouched by any of this; only the executable file itself is replaced, and
+  the database snapshot/restore exists purely to protect against a schema migration by the new
+  version that a rollback would otherwise leave in place.
 - An older executable refuses to open a database with a newer `PRAGMA user_version` (see
   `src/store.rs::migrate`) with a clear error instead of silently reading it, so a rolled-back
-  older binary can never misinterpret state a newer version already migrated.
+  older binary can never misinterpret state a newer version already migrated -- the database
+  snapshot/restore above is what makes the rollback path avoid this case in the first place.
 
 ## Local build
 

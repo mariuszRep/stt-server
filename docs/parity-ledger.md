@@ -59,7 +59,7 @@ or commit was made as part of this goal.
 A full-catalog sweep (69 models, default quant, Vulkan; `scripts/catalog_sweep.py`, results
 in `default_results.jsonl`) against the selected-model endpoint found:
 
-1. **Bug 1 (timestamp over-claim) -- root cause corrected after reading the vendored engine.**
+1. **RESOLVED (2026-09-27, uncommitted at time of writing) -- Bug 1 (timestamp over-claim) -- root cause corrected after reading the vendored engine.**
    33 models advertised `timestamp_granularity: supported` in the effective (selected-model)
    view but a `response_format=verbose_json` + `timestamp_granularities` request returned a raw
    `422 engine_unsupported`: canary-*, cohere-*, Voxtral-Mini-*, Qwen3-ASR-*, Fun-ASR-*,
@@ -119,7 +119,7 @@ in `default_results.jsonl`) against the selected-model endpoint found:
      not exist in Handy's engine set), so "parity with Handy" does not apply to them; the
      correct standard is transcribe-cpp's own, verified, ground truth.
 
-2. **Bug 2 (gigaam-v3-*, medasr: `200` but no usable timestamps) -- also root-caused in the
+2. **RESOLVED (2026-09-27) -- Bug 2 (gigaam-v3-*, medasr: `200` but no usable timestamps) -- also root-caused in the
    engine, not gated away.** `arch/gigaam/model.cpp` and `arch/medasr/model.cpp`'s `run()`
    ignores the requested timestamp granularity entirely (the `params` argument to `run()` is
    unused for this purpose) and always fills only `transcript.tokens` (real per-token
@@ -139,7 +139,7 @@ in `default_results.jsonl`) against the selected-model endpoint found:
      than nothing).
    - **Gap vs. Handy:** N/A -- GigaAM/MedASR do not exist in Handy at all.
 
-3. **Bug 3 (catalog list always "unsupported") -- same correction applied.** `GET
+3. **RESOLVED (2026-09-27) -- Bug 3 (catalog list always "unsupported") -- same correction applied.** `GET
    /v1/local/models`'s `catalog::capability_matrix` hard-coded `"status": "unsupported"` for
    every control of every model via its `unimplemented(...)` helper, regardless of the catalog's
    own claims -- a left-over placeholder, not a truthful static answer.
@@ -153,10 +153,12 @@ in `default_results.jsonl`) against the selected-model endpoint found:
      `"unknown"` never counts as a `catalog_mismatch` against the live view, and the catalog view
      is documented (`docs/client-contract.md` 4.1) as non-authoritative once a model is loaded.
 
-4. **Bug 4 (moonshine-streaming-tiny timeout) -- investigated further, still open.** See the
-   dedicated section below.
+4. **OPEN -- Bug 4 (moonshine-streaming-tiny timeout).** Investigated further (see the dedicated
+   section below) but not reproduced on the 2026-09-27 re-sweep (see the `handy-gguf-parity-evidence`
+   goal's Verification Log, 2026-09-27 entry) -- treated as a real but currently non-reproducing
+   issue, not resolved. If it recurs, capture a debug-build trace before re-investigating.
 
-5. **Bug 5 (language_hint truthfulness) -- verified, one new gap found, not yet fixed.**
+5. **RESOLVED (2026-09-27) -- Bug 5 (language_hint truthfulness) -- verified, one new gap found and fixed.**
    `run_plan::resolve_language` already tracks `language_hint_applied` separately from whether a
    hint was *provided* and from `language_evidence_hint`, so a hint dropped for a model with no
    language mechanism at all (empty `caps.languages`) is reported honestly. However, reading
@@ -245,11 +247,13 @@ run against that specific model, which is out of scope for this read-only pass.
 
 ### Remaining gaps vs. Handy (this pass)
 
-- Granite `language_hint` may be falsely advertised as supported (see the mechanism table
-  above) -- not yet fixed.
-- Moonshine-streaming-tiny timeout (Bug 4) is unresolved -- root cause narrowed to the one-shot
+- **RESOLVED (2026-09-27):** Granite `language_hint` is no longer advertised as supported (see the
+  `handy-gguf-parity-evidence` goal's 2026-09-27 Verification Log entry -- fixed alongside the
+  timestamp-matrix corrections above).
+- **OPEN:** Moonshine-streaming-tiny timeout (Bug 4) -- root cause narrowed to the one-shot
   encode/adapter/cross-KV stages, not the bounded decode loop, but not confirmed without a real
-  run.
+  debug-build run; the 2026-09-27 re-sweep did not reproduce it, so it is unresolved but not
+  currently blocking (see the dedicated section above).
 - No `prompt_max_tokens` ceiling is exposed by transcribe-cpp 0.2.3 (documented in
   `capabilities.rs`'s field doc already); Handy does not expose one either via its own
   `WhisperRunOptions`, so this is parity, not a gap.
@@ -262,7 +266,15 @@ run against that specific model, which is out of scope for this read-only pass.
 ### Verification
 
 See the Verification Log entry in
-`.projectflows/goals/ready/handy-gguf-parity-evidence/GOAL.md` for gate results and per-model
+`.projectflows/goals/done/handy-gguf-parity-evidence/GOAL.md` for gate results and per-model
 before/after sweep evidence for this pass. The orchestrator is running the real-model sweep
 verification directly against the debug build; this document records the source-level root
 cause analysis and the code fix, not sweep output captured by this pass.
+
+**Status as of 2026-09-28:** `handy-gguf-parity-evidence` closed 2026-09-28. All 69 catalog models
+at default quantisation install, load, and transcribe. **OPEN:** Voxtral-Small-24B-2507 is a
+documented hardware-limit exception, not a bug -- it needs more GPU memory than the test laptop
+has (Vulkan out-of-memory) and CPU fallback is too slow to be usable; no fix is planned for this,
+it is a hardware requirement to note for users, not a defect to resolve. Bugs 1, 2, 3, and 5 above
+are resolved and covered by tests; Bug 4 (moonshine-streaming-tiny timeout) remains genuinely open
+per the note above.

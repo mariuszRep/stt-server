@@ -9,13 +9,14 @@ goals `build-stt-server-next` and `migrate-voice-typer-to-stt-server-next`.
   Vulkan. The GPU driver, the Vulkan loader, and Windows system libraries are the only external
   runtime dependencies. No provider processes, connection descriptors, or ONNX runtime.
 - One resident model. Transcriptions run one at a time in arrival order. The queue has no
-  default length or wait limit; limits are optional settings. A request uses the model that was
-  loaded when it entered the queue, so switching models never strands queued work.
+  default length or wait limit; limits are optional settings. Each request keeps the model it
+  asked for even while it waits; if the model at the head of the queue differs from the one
+  resident, the server swaps before running that request, never mid-request.
 
 ## Models
 
-- Nothing downloads on first start, and transcription never triggers a download or a model
-  change.
+- Nothing downloads on first start. A request may load a downloaded model that is not yet
+  resident; a request never triggers a download or changes what model is the default.
 - Downloads come from HuggingFace only, at pinned revisions, and are accepted only after the
   size and SHA-256 match the catalog.
 - Files dropped into the user model folder become models only after an explicit refresh hashes
@@ -35,7 +36,9 @@ goals `build-stt-server-next` and `migrate-voice-typer-to-stt-server-next`.
 - Capabilities come from what the engine reports for the loaded model, cross-checked against
   its real behaviour, never from a hand-kept list or another project's rules. The catalog list
   gives the best static answer before loading; the selected-model view is authoritative.
-- A missing `model` field means the selected model.
+- A missing `model` field, or `"model":"default"`, means the default model. Any other value
+  names an installed model directly: the server loads it if needed, refuses with a clear error
+  if it isn't installed or isn't yet verified, and never downloads it.
 - Responses report diagnostics that exist and omit fields the engine did not produce.
 
 ## Operation

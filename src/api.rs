@@ -21,19 +21,19 @@ use uuid::Uuid;
 use crate::app::App;
 use crate::audio::decode_wav;
 use crate::auth::{authorize, authorized, AccessLevel};
-use crate::capabilities::catalog_mismatch;
+use crate::capabilities::{catalog_mismatch, EffectiveCaps};
 use crate::catalog::{capability_matrix, catalog_model, model_view};
 use crate::download::install_model;
 use crate::dropin::run_refresh;
-use crate::engine::{load_engine, CancelWhenDropped, LoadedModel};
+use crate::engine::{load_engine, BackendDiagnostic, CancelWhenDropped, LoadedModel};
 use crate::errors::{classify_run_result, internal, ApiError, ApiResult, RunOutcome};
 use crate::format::{format_response, DiagnosticsExtra, Formatted, LanguageEvidence};
 use crate::import::import_model;
 use crate::operations::{cancel_operation, operation};
 use crate::run_plan::{plan as build_plan, Endpoint, ParsedRequest};
 use crate::store::{
-    all_installed, backend_preference, installed_file, installed_path, is_valid_cors_origin,
-    selected_id, user_models_dir_setting, SOURCE_USER_FOLDER,
+    all_installed, backend_preference, installed_file, is_valid_cors_origin, selected_id,
+    user_models_dir_setting, SOURCE_USER_FOLDER,
 };
 use crate::verify::verify_model;
 
@@ -363,12 +363,24 @@ pub async fn health(State(app): State<Arc<App>>) -> Json<Value> {
         .read()
         .map(|state| state.to_json())
         .unwrap_or_else(|_| json!({"mode": app.network_mode.as_str(), "effective": "local"}));
+    // `default_model`/`loaded_model` (the "openai-model-per-request" goal:
+    // "the existing selected model becomes the default model ... /health and
+    // /readiness report default_model and loaded_model"): best-effort, never
+    // failing `/health` itself if the DB or lock is unavailable.
+    let default_model = selected_id(&app).ok().flatten();
+    let loaded_model = app
+        .loaded
+        .lock()
+        .ok()
+        .and_then(|loaded| loaded.as_ref().map(|active| active.id.clone()));
     Json(json!({
         "status": "ok",
         "service": SERVICE_ID,
         "version": env!("CARGO_PKG_VERSION"),
         "api_level": API_LEVEL,
         "network": network,
+        "default_model": default_model,
+        "loaded_model": loaded_model,
     }))
 }
 
@@ -377,12 +389,19 @@ pub async fn readiness(
     headers: HeaderMap,
 ) -> ApiResult<impl IntoResponse> {
     authorize(&headers, &app, AccessLevel::User)?;
+    let default_model = selected_id(&app)?;
     {
         let loaded = app.loaded.lock().map_err(internal)?;
         if let Some(active) = loaded.as_ref() {
             return Ok((
                 StatusCode::OK,
-                Json(json!({"status":"ready", "model":active.id, "backend":active.diagnostic})),
+                Json(json!({
+                    "status":"ready",
+                    "model":active.id,
+                    "backend":active.diagnostic,
+                    "default_model": default_model,
+                    "loaded_model": active.id,
+                })),
             ));
         }
     }
@@ -401,12 +420,19 @@ pub async fn readiness(
                 "reason":"loading model",
                 "model": status.model_id,
                 "elapsed_ms": status.elapsed_ms(),
+                "default_model": default_model,
+                "loaded_model": Value::Null,
             })),
         ));
     }
     Ok((
         StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({"status":"not_ready", "reason":"No selected model loaded"})),
+        Json(json!({
+            "status":"not_ready",
+            "reason":"No selected model loaded",
+            "default_model": default_model,
+            "loaded_model": Value::Null,
+        })),
     ))
 }
 
@@ -553,21 +579,99 @@ pub async fn local_models(
     Ok(Json(json!({"object":"list", "data":data})))
 }
 
+/// The capability view for a callable (downloaded+verified) model, for the
+/// OpenAI-shaped list: the live `EffectiveCaps` view if this process has ever
+/// loaded it (`App::live_caps`, refreshed every time it loads), falling back
+/// to the catalog's static best answer otherwise. Custom (drop-in) models
+/// have no catalog entry, so they fall back to their own unknown-by-default
+/// view (`custom_model_view`'s `effective_capabilities`) when never loaded.
+fn callable_capabilities(app: &App, id: &str, catalog_fallback: Option<Value>) -> ApiResult<Value> {
+    if let Some(cached) = app.live_caps.lock().map_err(internal)?.get(id) {
+        return Ok(cached.to_json());
+    }
+    Ok(catalog_fallback.unwrap_or_else(|| {
+        json!({
+            "prompt": {"status": "unknown"},
+            "temperature": {"status": "unknown"},
+            "language_hint": {"status": "unknown"},
+            "language_detect": {"status": "unknown"},
+            "translation": {"status": "unknown"},
+            "timestamp_granularity": {"status": "unknown"},
+            "streaming": {"status": "unsupported"},
+            "response_formats": {"json": "supported", "text": "unsupported", "verbose_json": "unsupported"},
+        })
+    }))
+}
+
+/// One `GET /v1/models`/`GET /v1/models/{id}` entry for a callable
+/// (downloaded, verified) model: OpenAI's `{id, object, owned_by}` shape plus
+/// this server's extension fields `default` and `capabilities`. See
+/// `docs/client-contract.md`.
+fn openai_model_entry(app: &App, id: &str, default_id: Option<&str>) -> ApiResult<Value> {
+    let catalog_fallback = catalog_model(app, id).ok().map(capability_matrix);
+    let capabilities = callable_capabilities(app, id, catalog_fallback)?;
+    Ok(json!({
+        "id": id,
+        "object": "model",
+        "owned_by": "local",
+        "default": Some(id) == default_id,
+        "capabilities": capabilities,
+    }))
+}
+
+/// Every callable model id: downloaded and verified catalog models plus
+/// registered custom (drop-in) models. A `needs_verification` model is never
+/// callable and never listed here (matches the 409 a request for it gets).
+fn callable_model_ids(app: &App) -> ApiResult<Vec<String>> {
+    let mut ids = Vec::new();
+    for model in &app.catalog {
+        if let Some(installed) = installed_file(app, &model.slug)? {
+            if !installed.needs_verification {
+                ids.push(model.slug.clone());
+            }
+        }
+    }
+    for custom in installed_custom_models(app)? {
+        if !custom.needs_verification {
+            ids.push(custom.id);
+        }
+    }
+    Ok(ids)
+}
+
 pub async fn openai_models(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     authorize(&headers, &app, AccessLevel::User)?;
-    let mut data = Vec::new();
-    for model in &app.catalog {
-        if installed_path(&app, &model.slug)?.is_some() {
-            data.push(json!({"id":model.slug,"object":"model","owned_by":"local"}));
-        }
-    }
-    for custom in installed_custom_models(&app)? {
-        data.push(json!({"id":custom.id,"object":"model","owned_by":"local"}));
-    }
+    let default_id = selected_id(&app)?;
+    let data = callable_model_ids(&app)?
+        .into_iter()
+        .map(|id| openai_model_entry(&app, &id, default_id.as_deref()))
+        .collect::<ApiResult<Vec<_>>>()?;
     Ok(Json(json!({"object":"list", "data":data})))
+}
+
+/// `GET /v1/models/{id}`: one callable model, 404 `model_not_installed` if
+/// `id` is unknown, not downloaded, or still `needs_verification`.
+pub async fn openai_model_by_id(
+    State(app): State<Arc<App>>,
+    UrlPath(id): UrlPath<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    authorize(&headers, &app, AccessLevel::User)?;
+    if !callable_model_ids(&app)?
+        .iter()
+        .any(|candidate| candidate == &id)
+    {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "model_not_installed",
+            "This model is not installed",
+        ));
+    }
+    let default_id = selected_id(&app)?;
+    Ok(Json(openai_model_entry(&app, &id, default_id.as_deref())?))
 }
 
 /// True when `id` is either a known catalog model, or an installed custom
@@ -711,6 +815,10 @@ pub async fn select_model(
         )
         .map_err(internal)?;
     }
+    app.live_caps
+        .lock()
+        .map_err(internal)?
+        .insert(loader_id.clone(), crate::engine::caps_for(&model));
     *app.loaded.lock().map_err(internal)? =
         Some(LoadedModel::new(loader_id, model, diagnostic.clone()));
     Ok(Json(json!({"model":id,"backend":diagnostic})))
@@ -930,10 +1038,168 @@ fn formatted_into_response(formatted: Formatted) -> Response {
     }
 }
 
+/// Resolve `id` to an installed, verified model, or the specific errors a
+/// per-request model choice can hit (see the "openai-model-per-request"
+/// goal): 404 `model_not_installed` for an unknown or not-downloaded id, 409
+/// `needs_verification` for one that is downloaded but not yet verified.
+/// Never triggers a download or any other side effect.
+fn require_installed_verified(app: &App, id: &str) -> ApiResult<crate::store::InstalledFile> {
+    match installed_file(app, id)? {
+        Some(file) if !file.needs_verification => Ok(file),
+        Some(_) => Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "needs_verification",
+            "This model needs verification before it can serve requests; run verify, or refresh for a drop-in model",
+        )),
+        None => Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "model_not_installed",
+            "This model is not installed",
+        )),
+    }
+}
+
+/// Resolve the `model` multipart field to the model id this request must run
+/// against: `"default"` (or, per convention, an omitted field -- see
+/// `parse_transcription_multipart`) resolves to the default model, anything
+/// else names that model directly. When `"default"` has nothing configured
+/// yet, preserves the original distinction between "the default is still
+/// loading at startup" (503 `model_loading`) and "nothing is default at all"
+/// (503 `server_not_ready`) -- this is about the *startup* reload, not a
+/// per-request swap, so it is checked once, up front, without touching the
+/// queue.
+fn resolve_requested_model(app: &App, requested: &str) -> ApiResult<String> {
+    if requested != "default" {
+        return Ok(requested.to_owned());
+    }
+    if let Some(id) = selected_id(app)? {
+        return Ok(id);
+    }
+    if let Ok(loading) = app.loading.lock() {
+        if let Some(status) = loading.as_ref() {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "model_loading",
+                "The selected model is still loading",
+            )
+            .with_details(json!({"model": status.model_id, "elapsed_ms": status.elapsed_ms()})));
+        }
+    }
+    let mut error = ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "server_not_ready",
+        "No model loaded",
+    );
+    if let Ok(Some(operation_id)) = crate::operations::active_operation_id(app) {
+        error = error.with_details(json!({"operation_id": operation_id}));
+    }
+    Err(error)
+}
+
+/// How often `bind_or_swap_model` polls while waiting out a background load
+/// for the same model it needs (see the loop's comment below).
+const MODEL_SWAP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Called once this request holds the sole inference permit: make `target`
+/// the loaded model, swapping it in if some other model (or nothing) is
+/// loaded, then return a clone of the handle, id, backend diagnostic and
+/// effective capabilities to run against. Never runs two loads at once and
+/// never swaps mid-request -- the permit this request holds is the same one
+/// a running inference holds, so nothing else can be mid-run while this
+/// function is loading or swapping.
+///
+/// If a background load already in progress (currently only the startup
+/// reload -- see `engine::spawn_tracked_load`) targets this exact model, this
+/// waits for it instead of loading a second copy, bounded by
+/// `wait_timeout` (the same `queue_wait_timeout_ms` setting the queue itself
+/// honours) -- only once that is exceeded does this give up with 503
+/// `model_loading`. A load this function starts itself is a plain blocking
+/// call with no such wait: it either finishes or fails outright.
+async fn bind_or_swap_model(
+    app: &App,
+    target: &str,
+    wait_timeout: Option<Duration>,
+) -> ApiResult<(
+    transcribe_cpp::Model,
+    String,
+    BackendDiagnostic,
+    EffectiveCaps,
+)> {
+    let mut waited = Duration::ZERO;
+    loop {
+        {
+            let active = app.loaded.lock().map_err(internal)?;
+            if let Some(loaded) = active.as_ref() {
+                if loaded.id == target {
+                    return Ok((
+                        loaded.model.clone(),
+                        loaded.id.clone(),
+                        loaded.diagnostic.clone(),
+                        loaded.caps.clone(),
+                    ));
+                }
+            }
+        }
+        let loading_same_target = app
+            .loading
+            .lock()
+            .map_err(internal)?
+            .as_ref()
+            .map(|status| status.model_id == target)
+            .unwrap_or(false);
+        if loading_same_target {
+            if let Some(timeout) = wait_timeout {
+                if waited >= timeout {
+                    return Err(ApiError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "model_loading",
+                        "The requested model is still loading",
+                    )
+                    .with_details(json!({"model": target})));
+                }
+            }
+            tokio::time::sleep(MODEL_SWAP_POLL_INTERVAL).await;
+            waited += MODEL_SWAP_POLL_INTERVAL;
+            continue;
+        }
+        // Nothing is already loading this exact model: load it ourselves.
+        // Re-check installed/verified here too -- cheap, and closes the race
+        // where a model was removed or started verification between the
+        // pre-queue check and this request's turn.
+        let installed = require_installed_verified(app, target)?;
+        let path = installed.path.clone();
+        let preference = backend_preference(app)?;
+        let target_owned = target.to_owned();
+        let load_result = tokio::task::spawn_blocking(move || load_engine(&path, &preference))
+            .await
+            .map_err(internal)?;
+        match load_result {
+            Ok((model, diagnostic)) => {
+                let caps = crate::engine::caps_for(&model);
+                app.live_caps
+                    .lock()
+                    .map_err(internal)?
+                    .insert(target_owned.clone(), caps);
+                *app.loaded.lock().map_err(internal)? =
+                    Some(LoadedModel::new(target_owned, model, diagnostic));
+                // Loop back around to read it out of `app.loaded` uniformly.
+            }
+            Err(error) => {
+                // The previous model, if any, was never touched -- only this
+                // request fails.
+                return Err(
+                    ApiError::new(StatusCode::CONFLICT, "model_load_failed", error)
+                        .with_details(json!({"model": target})),
+                );
+            }
+        }
+    }
+}
+
 /// The shared pipeline behind `/v1/audio/transcriptions` and
-/// `/v1/audio/translations`: parse -> decode -> grab the loaded model +
-/// effective capabilities -> plan -> queue -> run -> format. See
-/// `parity-design.md` "Handler".
+/// `/v1/audio/translations`: parse -> decode -> resolve the requested model
+/// -> queue -> bind/swap the loaded model -> plan -> run -> format. See
+/// `parity-design.md` "Handler" and the "openai-model-per-request" goal.
 async fn transcribe_or_translate(
     app: Arc<App>,
     headers: HeaderMap,
@@ -949,77 +1215,11 @@ async fn transcribe_or_translate(
     let samples = pcm.len();
     let audio_ms = (pcm.len() as u64 * 1000) / 16_000;
 
-    // The model binds when the request is admitted: clone the handle (and
-    // its effective capabilities) before queueing, so the model can be
-    // swapped underneath without affecting an in-flight or already-queued
-    // request.
-    let (model, active_id, backend, caps) = {
-        let active = app.loaded.lock().map_err(internal)?;
-        let loaded = active.as_ref().ok_or_else(|| {
-            // Distinguish "the selected model is still loading in the
-            // background" (see `app::open_app_at_full`) from "nothing is
-            // selected at all": a client retrying blindly on `server_not_ready`
-            // would otherwise get the same unhelpful answer throughout a
-            // multi-minute startup load. Dedicated `model_loading` code (see
-            // docs/client-contract.md's 503 table) rather than reusing
-            // `server_not_ready`, so a client can tell "wait, it's on its
-            // way" apart from "nothing selected, go select one". A request
-            // that lands here entered the queue (or would have) before the
-            // model was ready, so per convention it is rejected outright
-            // rather than queued -- it never silently uses whatever model
-            // finishes loading later.
-            if let Ok(loading) = app.loading.lock() {
-                if let Some(status) = loading.as_ref() {
-                    return ApiError::new(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "model_loading",
-                        "The selected model is still loading",
-                    )
-                    .with_details(
-                        json!({"model": status.model_id, "elapsed_ms": status.elapsed_ms()}),
-                    );
-                }
-            }
-            let mut error = ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "server_not_ready",
-                "No model loaded",
-            );
-            if let Ok(Some(operation_id)) = crate::operations::active_operation_id(&app) {
-                error = error.with_details(json!({"operation_id": operation_id}));
-            }
-            error
-        })?;
-        if fields.model != "default" && fields.model != loaded.id {
-            return Err(ApiError::new(
-                StatusCode::CONFLICT,
-                "model_not_active",
-                "The requested model is not active",
-            ));
-        }
-        (
-            loaded.model.clone(),
-            loaded.id.clone(),
-            loaded.diagnostic.clone(),
-            loaded.caps.clone(),
-        )
-    };
-
-    let parsed = ParsedRequest {
-        language: fields.language,
-        prompt: fields.prompt,
-        temperature: fields.temperature,
-        response_format: fields.response_format,
-        timestamp_granularities: fields.timestamp_granularities,
-    };
-    let tokenizer_model = model.clone();
-    let tokenize = move |text: &str| -> Option<usize> {
-        tokenizer_model
-            .tokenize(text)
-            .ok()
-            .map(|tokens| tokens.len())
-    };
-    let plan = build_plan(&parsed, &caps, endpoint, Some(&tokenize))?;
+    // Resolve which model this request wants (never a download, never a
+    // load yet) and confirm it is callable before this request ever joins
+    // the queue.
+    let target = resolve_requested_model(&app, &fields.model)?;
+    require_installed_verified(&app, &target)?;
 
     // Read live: a value set (or cleared) via `PATCH /v1/local/config`, or a
     // CLI override supplied at process start, applies to this request
@@ -1042,6 +1242,29 @@ async fn transcribe_or_translate(
                 "Timed out waiting for a turn in the inference queue",
             ),
         })?;
+
+    // Now that this request holds the sole inference permit, make sure the
+    // model it asked for is the one loaded -- swapping if needed. This is
+    // the only place a swap happens: never before a request has its turn,
+    // never while another request is mid-run (the permit rules that out).
+    let (model, active_id, backend, caps) = bind_or_swap_model(&app, &target, wait_timeout).await?;
+
+    let parsed = ParsedRequest {
+        language: fields.language,
+        prompt: fields.prompt,
+        temperature: fields.temperature,
+        response_format: fields.response_format,
+        timestamp_granularities: fields.timestamp_granularities,
+    };
+    let tokenizer_model = model.clone();
+    let tokenize = move |text: &str| -> Option<usize> {
+        tokenizer_model
+            .tokenize(text)
+            .ok()
+            .map(|tokens| tokens.len())
+    };
+    let plan = build_plan(&parsed, &caps, endpoint, Some(&tokenize))?;
+
     let cancellation = CancelToken::new();
     let _cancel_on_disconnect = CancelWhenDropped(cancellation.clone());
     let run_options = plan.to_run_options();
@@ -1212,8 +1435,10 @@ pub fn router(app: Arc<App>) -> Router {
     let cors = cors_layer(&app.cors_origins);
     Router::new()
         .route("/health", get(health))
+        .route("/v1/local/update/validation", get(update_validation))
         .route("/readiness", get(readiness))
         .route("/v1/models", get(openai_models))
+        .route("/v1/models/{id}", get(openai_model_by_id))
         .route(
             "/v1/audio/transcriptions",
             post(transcriptions).layer(DefaultBodyLimit::max(40 * 1024 * 1024)),
@@ -1248,7 +1473,70 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/local/operations/{id}", get(operation))
         .route("/v1/local/operations/{id}/cancel", post(cancel_operation))
         .layer(cors)
+        .layer(axum::middleware::from_fn_with_state(
+            app.clone(),
+            update_gate,
+        ))
         .with_state(app)
+}
+
+async fn update_validation(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    authorized(&headers, &app)?;
+    let ready_model = app
+        .loaded
+        .lock()
+        .map_err(internal)?
+        .as_ref()
+        .map(|m| m.id.clone());
+    let loading = app.loading.lock().map_err(internal)?.is_some();
+    let journal = crate::update_transaction::read_journal(&app.data_dir).map_err(internal)?;
+    let active_operations: i64 = app
+        .db
+        .lock()
+        .map_err(internal)?
+        .query_row(
+            "SELECT count(*) FROM operations WHERE state IN ('queued','running')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(internal)?;
+    Ok(Json(json!({
+        "version": env!("CARGO_PKG_VERSION"), "api_level": API_LEVEL,
+        "network_mode": if app.network_custom { "custom" } else { app.network_mode.as_str() },
+        "ready_model": ready_model, "loading": loading, "active_operations": active_operations,
+        "transaction": journal.filter(|j| !j.phase.terminal()).map(|j| j.id),
+    })))
+}
+
+async fn update_gate(
+    State(app): State<Arc<App>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if crate::update_transaction::maintenance(&app.data_dir) {
+        let allowed = matches!(
+            (request.method().as_str(), request.uri().path()),
+            (
+                "GET",
+                "/health" | "/readiness" | "/v1/local/update/validation"
+            ) | ("POST", "/v1/local/shutdown")
+        );
+        if !allowed {
+            if let Err(error) = authorize(request.headers(), &app, AccessLevel::User) {
+                return error.into_response();
+            }
+            return ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "update_in_progress",
+                "Update validation/recovery is in progress",
+            )
+            .into_response();
+        }
+    }
+    next.run(request).await
 }
 
 pub async fn run_http(
@@ -1321,6 +1609,8 @@ pub async fn run_http_full(
 ) -> Result<(), ServeError> {
     // Single-instance guard: held for the process lifetime (the returned
     // file's lock releases on drop/exit).
+    let startup_guard = crate::update_transaction::startup_guard(&data_dir)
+        .map_err(|e| ServeError::Other(e.into()))?;
     let _lock =
         crate::discovery::acquire_lock(&data_dir).map_err(|_| ServeError::AlreadyRunning)?;
 
@@ -1432,11 +1722,27 @@ pub async fn run_http_full(
         "listening on {address}; token file: {}",
         app.data_dir.join("auth.token").display()
     );
-    let info = crate::discovery::ServerInfo::new(app.bind_host.clone(), app.bind_port);
+    let mut info = crate::discovery::ServerInfo::new(app.bind_host.clone(), app.bind_port);
+    let launch = crate::update_transaction::Launch {
+        executable: std::env::current_exe().map_err(|e| ServeError::Other(e.into()))?,
+        service: crate::app::is_service_mode(),
+        flags: crate::cli::RunFlags {
+            data_dir: Some(data_dir.clone()),
+            host: bind_overrides.host,
+            port: bind_overrides.port,
+            network: network_override,
+            limits: cli_overrides,
+            cors_origins: bind_overrides.cors_origins.unwrap_or_default(),
+        },
+    };
+    crate::update_transaction::atomic_json(&data_dir.join("last-launch.json"), &launch)
+        .map_err(|e| ServeError::Other(e.into()))?;
+    info.launch = Some(launch);
     if let Err(error) = crate::discovery::write_server_json(&data_dir, &info) {
         eprintln!("warning: could not write server.json: {error}");
     }
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    drop(startup_guard);
     *app.shutdown.lock().unwrap() = Some(shutdown_tx);
     // Periodic recheck (every `network::RECHECK_INTERVAL`) so a `lan`/
     // `tailscale` server picks up a network change (a laptop moving from a
@@ -2068,6 +2374,193 @@ mod router_tests {
         std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
     }
 
+    /// A transcription naming a model id that is neither a known catalog
+    /// model nor an installed custom one is refused before ever joining the
+    /// queue -- see the "openai-model-per-request" goal's "not installed /
+    /// unknown -> 404 model_not_installed" rule. Never a download.
+    #[tokio::test]
+    async fn transcription_naming_an_unknown_model_is_404_model_not_installed() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let router = router(app.clone());
+        let boundary = "X-BOUNDARY";
+        let body = multipart_body(
+            boundary,
+            &[("model", "not-a-real-model-id")],
+            &sample_wav_bytes(),
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", format!("Bearer {token}"))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "model_not_installed");
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    /// A transcription naming a model that is installed but still
+    /// `needs_verification` is refused with `409 needs_verification`, the
+    /// same check `select` already makes -- never silently served and never
+    /// auto-verified.
+    #[tokio::test]
+    async fn transcription_naming_an_unverified_model_is_409_needs_verification() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let dropdir = parent.join(format!("stt-server-next-dropin-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dropdir).unwrap();
+        let file_path = dropdir.join("mine.gguf");
+        std::fs::write(&file_path, b"user file bytes").unwrap();
+        {
+            let db = app.db.lock().unwrap();
+            db.execute(
+                "INSERT INTO installed(id,path,sha256,source,needs_verification) VALUES('custom-mine-abc12345',?1,'x','user_folder',1)",
+                rusqlite::params![file_path.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        }
+        let router = router(app.clone());
+        let boundary = "X-BOUNDARY";
+        let body = multipart_body(
+            boundary,
+            &[("model", "custom-mine-abc12345")],
+            &sample_wav_bytes(),
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", format!("Bearer {token}"))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "needs_verification");
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    /// `GET /v1/models` lists only callable (installed and verified) models,
+    /// never a `needs_verification` one, and marks the default with
+    /// `"default": true`. `GET /v1/models/{id}` mirrors the same rule for one
+    /// model, 404 for a non-callable id.
+    #[tokio::test]
+    async fn openai_models_lists_only_callable_models_with_default_flag() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let dropdir = parent.join(format!("stt-server-next-dropin-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dropdir).unwrap();
+        let verified_path = dropdir.join("verified.gguf");
+        std::fs::write(&verified_path, b"verified file bytes").unwrap();
+        let unverified_path = dropdir.join("unverified.gguf");
+        std::fs::write(&unverified_path, b"unverified file bytes").unwrap();
+        {
+            let db = app.db.lock().unwrap();
+            db.execute(
+                "INSERT INTO installed(id,path,sha256,source,custom_arch) VALUES('custom-verified-aaaaaaaa',?1,'x','user_folder','whisper')",
+                rusqlite::params![verified_path.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO installed(id,path,sha256,source,needs_verification,custom_arch) VALUES('custom-unverified-bbbbbbbb',?1,'x','user_folder',1,'whisper')",
+                rusqlite::params![unverified_path.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO settings(key,value) VALUES('selected_model','custom-verified-aaaaaaaa')",
+                [],
+            )
+            .unwrap();
+        }
+        let router = router(app.clone());
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let ids: Vec<&str> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"custom-verified-aaaaaaaa"));
+        assert!(
+            !ids.contains(&"custom-unverified-bbbbbbbb"),
+            "an unverified model must never be listed as callable"
+        );
+        let default_entry = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == "custom-verified-aaaaaaaa")
+            .unwrap();
+        assert_eq!(default_entry["object"], "model");
+        assert_eq!(default_entry["owned_by"], "local");
+        assert_eq!(default_entry["default"], true);
+        assert!(default_entry["capabilities"].is_object());
+
+        // GET /v1/models/{id}: 200 for the callable one, 404 for the
+        // unverified (not-yet-callable) one.
+        let get_one = |id: &'static str, token: String| {
+            let router = router.clone();
+            async move {
+                let request = Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/models/{id}"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap();
+                router.oneshot(request).await.unwrap()
+            }
+        };
+        let response = get_one("custom-verified-aaaaaaaa", token.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["default"], true);
+
+        let response = get_one("custom-unverified-bbbbbbbb", token.clone()).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        drop(router);
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
     /// `/readiness` while a background load is in progress (see
     /// `engine::spawn_tracked_load`/`app::open_app_at_full`): 503 with a
     /// `"loading model"` reason, the loading model's id, and `elapsed_ms`,
@@ -2515,6 +3008,46 @@ mod router_tests {
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(body["api_level"], API_LEVEL);
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    /// `default_model`/`loaded_model` (the "openai-model-per-request" goal):
+    /// both `null` when nothing has ever been selected or loaded.
+    #[tokio::test]
+    async fn health_and_readiness_report_default_and_loaded_model_fields() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let router = router(app.clone());
+
+        let request = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body["default_model"].is_null());
+        assert!(body["loaded_model"].is_null());
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/readiness")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body["default_model"].is_null());
+        assert!(body["loaded_model"].is_null());
         drop(app);
         std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
     }

@@ -26,4 +26,5 @@ pub mod selfupdate;
 pub mod service;
 pub mod store;
 pub mod sysinfo;
+pub mod update_transaction;
 pub mod verify;

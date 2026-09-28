@@ -7,8 +7,8 @@ type: feature
 scope: stt-server-next only
 attempt: 1
 max_attempts: 8
-last_result: partial
-next_action: Slices 1 (install scope and data folder; service only in machine-wide) and 2 (port fallback and discovery) done. Remaining slices: access levels; network modes including Tailscale; version reporting and model import.
+last_result: all six slices implemented and gated; real-machine rehearsal (second Windows account, cross-account import-user, clean-VM service reinstall) still outstanding, tracked in hands-on-acceptance-tests
+next_action: All six planned slices (install scope/data folder, port fallback/discovery, access levels, network modes including Tailscale, versions and moving models between scopes) are implemented, gated, and documented. What remains is real-machine rehearsal only: a genuine second Windows account exercising a machine-wide install's user.token, a real `models import-user` run between a per-user account and a machine-wide service install, and a clean-VM service install/uninstall recheck -- tracked in `ready/hands-on-acceptance-tests` sections B/D/E.
 success_criteria:
   - Each install has exactly one data folder, and the app, CLI, start-with-Windows and service all use it; a model is never stored twice within one install.
   - A per-user install needs no admin; a machine-wide install needs admin once and serves every user on the PC.
