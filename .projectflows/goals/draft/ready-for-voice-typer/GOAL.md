@@ -8,7 +8,7 @@ scope: stt-server-next only
 attempt: 0
 max_attempts: 8
 last_result: none
-next_action: Track the four focused ready goals, then complete clean-machine, CPU-only, service, LAN, fault and release acceptance before moving this umbrella goal to ready.
+next_action: Run hands-on-acceptance-tests; after the first public release, the self-update rehearsal; then move this goal to ready/done.
 success_criteria:
   - A user can keep the server up to date from public releases without losing models or settings, and a failed update rolls back automatically.
   - The server installs and runs correctly on a clean Windows machine, on a machine without a GPU or Vulkan, and when upgrading from an earlier version.
@@ -49,7 +49,7 @@ and proof.
 ## Current status and remaining acceptance gates (2026-09-26)
 
 - The safe-stop/startup/model-file recovery goal is done locally, with 173 tests and a real start/restart/stop check. Its source and evidence are still uncommitted in this repository; review and commit them first. Older installed models need one explicit verification to establish their recorded fingerprint.
-- Focused ready goals: safe-self-update; model-management-cli; handy-gguf-parity-evidence; management-contract-hardening. None has started.
+- (Updated 2026-09-28) Focused goals: model-management-cli, management-contract-hardening, handy-gguf-parity-evidence and safe-stop-startup-model-recovery are done; safe-self-update is blocked on the first public release; install-scope-and-shared-access is implemented and waits on hands-on-acceptance-tests.
 - Prove a fresh Windows installation and CPU-only startup without a usable GPU or Vulkan loader. Check supported CPU instruction sets and additional GPU/driver combinations.
 - Rehearse a real Windows Service install, run, restart and uninstall, including the user drop-in folder.
 - Test authenticated LAN use from another device. Confirm unauthenticated requests cannot reach protected routes and token-file permissions are restrictive in both service and user mode, including custom data folders.
@@ -60,11 +60,13 @@ and proof.
 
 ## Focused goals
 
-- `ready/safe-self-update` — chosen update, verification and automatic rollback.
-- `ready/model-management-cli` — existing model-management API through a usable CLI.
-- `ready/handy-gguf-parity-evidence` — model/function matrix and human-checked speech evidence.
-- `ready/management-contract-hardening` — token permissions, import responsiveness, identity and API contract.
-- `done/safe-stop-startup-model-recovery` — implemented locally; commit remains.
+- `done/management-contract-hardening`
+- `done/model-management-cli`
+- `done/handy-gguf-parity-evidence`
+- `done/safe-stop-startup-model-recovery`
+- `blocked/safe-self-update` — only the live release-to-release rehearsal remains.
+- `in_progress/install-scope-and-shared-access` — implemented; waits on hands-on tests.
+- `ready/hands-on-acceptance-tests` — VM, phone, Tailscale, shared-machine checks.
 
 ## Out of scope
 
