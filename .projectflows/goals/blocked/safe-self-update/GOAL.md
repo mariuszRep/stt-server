@@ -2,7 +2,7 @@
 name: safe-self-update
 title: Safely update and roll back STT Server Next
 description: Let a standalone server install a verified public release and recover automatically if the new program cannot start.
-status: in_progress
+status: blocked
 type: feature
 scope: stt-server-next only
 attempt: 1
@@ -115,3 +115,5 @@ server pair or the real GitHub Releases source. Left in `in_progress` pending re
 continues to only report what it would do (no interactive stdin prompt). No implementation change
 needed -- attempt 1 already matches this. `next_action` updated to drop these as open decisions;
 only the live two-binary/real-release-source rehearsal remains outstanding.
+
+2026-09-28: Blocked: the only remaining check is a live update from one GitHub release to the next with a forced rollback, which needs the repository to be public with a first release.
