@@ -277,10 +277,10 @@ fn migrate_dir_once(new_dir: &Path, old_dir: &Path) -> PathBuf {
 
 /// This install's single data folder: every mode (run/start/stop/status/
 /// models/update CLI, autostart, service) resolves to the same path for a
-/// given scope. `STT_NEXT_DATA_DIR` always overrides, taking precedence over
+/// given scope. `STT_SERVER_DATA_DIR` always overrides, taking precedence over
 /// scope resolution entirely.
 pub fn data_dir() -> PathBuf {
-    if let Some(over) = std::env::var_os("STT_NEXT_DATA_DIR") {
+    if let Some(over) = std::env::var_os("STT_SERVER_DATA_DIR") {
         return PathBuf::from(over);
     }
     match install_scope() {
@@ -292,7 +292,7 @@ pub fn data_dir() -> PathBuf {
                 Some(old_dir) => migrate_dir_once(&new_dir, &old_dir),
                 None => new_dir,
             },
-            None => PathBuf::from(".stt-server-next"),
+            None => PathBuf::from(".stt-server"),
         },
     }
 }
@@ -304,10 +304,10 @@ pub fn data_dir() -> PathBuf {
 /// is `%LOCALAPPDATA%\OpenVibeAI\STT Server\models`; machine-wide this is
 /// `%ProgramData%\OpenVibeAI\STT Server\models`, shared by every user of the
 /// machine rather than tied to whichever user happened to install the
-/// service. `STT_NEXT_USER_MODELS_DIR_DEFAULT` overrides this for tests,
-/// mirroring `STT_NEXT_DATA_DIR`'s role for the data directory.
+/// service. `STT_SERVER_USER_MODELS_DIR_DEFAULT` overrides this for tests,
+/// mirroring `STT_SERVER_DATA_DIR`'s role for the data directory.
 pub fn default_user_models_dir() -> Option<PathBuf> {
-    if let Some(over) = std::env::var_os("STT_NEXT_USER_MODELS_DIR_DEFAULT") {
+    if let Some(over) = std::env::var_os("STT_SERVER_USER_MODELS_DIR_DEFAULT") {
         return Some(PathBuf::from(over));
     }
     Some(data_dir().join("models"))
@@ -661,7 +661,7 @@ pub fn open_app_at_full(
     // built -- `spawn_tracked_load` only needs clones of these two `Arc`s,
     // not the whole `App`. Never blocks: `open_app_at_full` returns as soon
     // as this call returns, regardless of how long the real load takes.
-    // Test-only seam (`STT_NEXT_TEST_SLOW_LOAD_MS`, milliseconds): simulates
+    // Test-only seam (`STT_SERVER_TEST_SLOW_LOAD_MS`, milliseconds): simulates
     // a slow/huge-model startup load without needing a real multi-gigabyte
     // GGUF, so CLI-level tests (`src/bin/server.rs`'s `slow_load_cli_tests`)
     // can exercise "server.json/`/health` available immediately, `stop`
@@ -672,10 +672,10 @@ pub fn open_app_at_full(
     // a real model is selected, and is mutually exclusive with the real
     // reload below since neither test data dir nor a real deployment ever
     // sets both.
-    if let Ok(raw) = std::env::var("STT_NEXT_TEST_SLOW_LOAD_MS") {
-        let delay_ms: u64 = raw
-            .parse()
-            .map_err(|_| std::io::Error::other("STT_NEXT_TEST_SLOW_LOAD_MS must be an integer"))?;
+    if let Ok(raw) = std::env::var("STT_SERVER_TEST_SLOW_LOAD_MS") {
+        let delay_ms: u64 = raw.parse().map_err(|_| {
+            std::io::Error::other("STT_SERVER_TEST_SLOW_LOAD_MS must be an integer")
+        })?;
         let loaded_slot = loaded.clone();
         let loading_slot = loading.clone();
         spawn_tracked_load(
@@ -684,7 +684,7 @@ pub fn open_app_at_full(
             "test-slow-model".to_owned(),
             move || -> Result<LoadedModel, &'static str> {
                 std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                Err("STT_NEXT_TEST_SLOW_LOAD_MS test seam never resolves to a real model")
+                Err("STT_SERVER_TEST_SLOW_LOAD_MS test seam never resolves to a real model")
             },
         );
     } else if let Some((id, path)) = selected {
@@ -799,10 +799,11 @@ mod install_scope_tests {
         assert!(machine_wide_data_dir()
             .join("models")
             .starts_with(machine_wide_data_dir()));
-        assert!(per_user_data_dir_opt()
-            .unwrap()
-            .join("models")
-            .starts_with(per_user_data_dir_opt().unwrap()));
+        // No per-user folder exists when LOCALAPPDATA is unset (service-like
+        // environments); the machine-wide check above still applies.
+        if let Some(per_user) = per_user_data_dir_opt() {
+            assert!(per_user.join("models").starts_with(&per_user));
+        }
     }
 
     #[test]
@@ -865,7 +866,7 @@ mod tests {
     #[test]
     fn restart_quarantines_an_interrupted_import() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let op = Uuid::new_v4().to_string();
         let stage = path.join("staging").join(format!("{op}.part"));
@@ -898,7 +899,7 @@ mod tests {
     #[test]
     fn first_start_is_empty_and_offline() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         assert!(selected_id(&app).unwrap().is_none());
         assert!(app.loaded.lock().unwrap().is_none());
@@ -920,7 +921,7 @@ mod tests {
             .file_name()
             .unwrap()
             .to_string_lossy()
-            .starts_with("stt-server-next-test-"));
+            .starts_with("stt-server-test-"));
         fs::remove_dir_all(resolved).unwrap();
     }
 
@@ -932,8 +933,8 @@ mod tests {
     #[test]
     fn startup_reconcile_leaves_user_folder_files_untouched() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
-        let dropdir = parent.join(format!("stt-server-next-dropin-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
+        let dropdir = parent.join(format!("stt-server-dropin-{}", Uuid::new_v4()));
         fs::create_dir_all(&dropdir).unwrap();
         let kept = dropdir.join("kept.gguf");
         fs::write(&kept, b"kept bytes").unwrap();

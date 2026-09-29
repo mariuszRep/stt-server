@@ -16,7 +16,7 @@ for ($i = 0; $i -lt 60; $i++) {
     }
 }
 if ($null -eq $after) { throw 'Service did not restart with a new process ID.' }
-$token = Get-Content 'C:\ProgramData\OpenVibeAI\STT Server Next\auth.token' -Raw
+$token = Get-Content 'C:\ProgramData\OpenVibeAI\STT Server\auth.token' -Raw
 $headers = @{ Authorization = "Bearer $token" }
 $ready = $null
 for ($i = 0; $i -lt 60; $i++) {
@@ -36,4 +36,4 @@ if ($null -eq $ready -or $ready.status -ne 'ready') {
     status = $ready.status
     model = $ready.model
     backend = $ready.backend.observed_backend
-} | ConvertTo-Json | Set-Content -LiteralPath 'D:\Users\mariu\Projects\stt-server-next\docs\service-recovery-result.json'
+} | ConvertTo-Json | Set-Content -LiteralPath 'D:\Users\mariu\Projects\voice-typer\stt-server\docs\service-recovery-result.json'

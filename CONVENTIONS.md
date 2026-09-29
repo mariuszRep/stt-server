@@ -1,7 +1,7 @@
 # Conventions
 
 Architecture and behaviour rules. They reflect the user's decisions recorded in the workspace
-goals `build-stt-server-next` and `migrate-voice-typer-to-stt-server-next`.
+goals `build-stt-server` and `migrate-voice-typer-to-stt-server`.
 
 ## Shape
 

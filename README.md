@@ -1,4 +1,4 @@
-# STT Server Next
+# STT Server
 
 Standalone Windows-first prototype of a single-process GGUF speech server. This repository is
 independent of the shipping Voice Typer component worktrees. The current executable hosts an
@@ -16,7 +16,7 @@ model, and diagnostics report the backend actually used and any CPU fallback rea
 -- `version` is this build's `CARGO_PKG_VERSION`, and `api_level` is an integer, starting at 1,
 bumped only when a client must change to keep working (a breaking shape change, a removed route, a
 new required field -- never for an additive, backward-compatible one). A client should refuse or
-warn when the server's `api_level` is lower than the level it requires; `stt-server-next health`
+warn when the server's `api_level` is lower than the level it requires; `stt-server health`
 and `status` also print both fields (`status --json`'s `server.json`-derived `api_level` defaults
 to `0` for a `server.json` written before this field existed, meaning "older than any level a
 client requires"). `GET /v1/local/system`'s `server` section reports the same two fields.
@@ -208,7 +208,7 @@ allowed origin only lets a browser *see* the response, it doesn't bypass `Author
 
 **Allowing a browser origin:**
 
-- CLI, at start: `stt-server-next run --cors-origin http://localhost:3000` (repeatable for more
+- CLI, at start: `stt-server run --cors-origin http://localhost:3000` (repeatable for more
   than one origin; wins for that process's lifetime over the stored setting). Also accepted by
   `start`/`restart`.
 - Config API, persisted across restarts:
@@ -237,34 +237,34 @@ requires the token exactly as before.
 
 ## CLI
 
-`stt-server-next.exe` is hand-parsed (no argument-parsing dependency); `--help`/`-h`/`help`
+`stt-server.exe` is hand-parsed (no argument-parsing dependency); `--help`/`-h`/`help`
 prints usage, and an unknown command or flag prints an error and exits with code 2.
 
 ```
-stt-server-next [run] [flags]              foreground (default when no command given)
-stt-server-next start [flags]              detached background process; no-op if already running
-stt-server-next stop [--data-dir <path>]   graceful stop of the running instance
-stt-server-next restart [flags]            stop then start
-stt-server-next status [--json] [--data-dir <path>]
-stt-server-next autostart enable [flags]   per-user "start with Windows" (no admin)
-stt-server-next autostart disable
-stt-server-next autostart status
-stt-server-next service install|uninstall|run   existing Windows Service host
-stt-server-next health [--json] [--data-dir <path>]
-stt-server-next models list [--json] [--data-dir <path>]
-stt-server-next models recommended [--json] [--data-dir <path>]
-stt-server-next models selected [--json] [--data-dir <path>]
-stt-server-next models download <id> [--wait] [--json] [--data-dir <path>]  (alias: install)
-stt-server-next models import <path> --model <id> [--quant <q>] [--wait] [--json] [--data-dir <path>]
-stt-server-next models import-user [--from <per-user data dir>] [--wait] [--json] [--data-dir <path>]
-stt-server-next models verify <id> [--wait] [--json] [--data-dir <path>]
-stt-server-next models cancel <operation_id> [--data-dir <path>]
-stt-server-next models default <id> [--json] [--data-dir <path>]  (alias: select)
-stt-server-next models unload [--json] [--data-dir <path>]
-stt-server-next models remove <id> [--json] [--data-dir <path>]
-stt-server-next models refresh [--wait] [--json] [--data-dir <path>]
-stt-server-next update check [--json]
-stt-server-next update install [--yes] [--json] [--data-dir <path>]
+stt-server [run] [flags]              foreground (default when no command given)
+stt-server start [flags]              detached background process; no-op if already running
+stt-server stop [--data-dir <path>]   graceful stop of the running instance
+stt-server restart [flags]            stop then start
+stt-server status [--json] [--data-dir <path>]
+stt-server autostart enable [flags]   per-user "start with Windows" (no admin)
+stt-server autostart disable
+stt-server autostart status
+stt-server service install|uninstall|run   existing Windows Service host
+stt-server health [--json] [--data-dir <path>]
+stt-server models list [--json] [--data-dir <path>]
+stt-server models recommended [--json] [--data-dir <path>]
+stt-server models selected [--json] [--data-dir <path>]
+stt-server models download <id> [--wait] [--json] [--data-dir <path>]  (alias: install)
+stt-server models import <path> --model <id> [--quant <q>] [--wait] [--json] [--data-dir <path>]
+stt-server models import-user [--from <per-user data dir>] [--wait] [--json] [--data-dir <path>]
+stt-server models verify <id> [--wait] [--json] [--data-dir <path>]
+stt-server models cancel <operation_id> [--data-dir <path>]
+stt-server models default <id> [--json] [--data-dir <path>]  (alias: select)
+stt-server models unload [--json] [--data-dir <path>]
+stt-server models remove <id> [--json] [--data-dir <path>]
+stt-server models refresh [--wait] [--json] [--data-dir <path>]
+stt-server update check [--json]
+stt-server update install [--yes] [--json] [--data-dir <path>]
 ```
 
 `run`/`start`/`restart`/`autostart enable` share: `--port <n>` (default 54321), `--host <addr>`
@@ -280,7 +280,7 @@ spellings and bare `service` (no subcommand vs. `service run`) keep working as a
 `127.0.0.1:54321`. An explicit `--host` (or a stored `bind_host`) is an *advanced override* that
 always wins over `--network`/the stored `network_mode` setting entirely; `/health` then reports
 network mode `"custom"` instead of `local`/`lan`/`tailscale`. `--data-dir` overrides
-`STT_NEXT_DATA_DIR` and the `%LOCALAPPDATA%`-based default the same way.
+`STT_SERVER_DATA_DIR` and the `%LOCALAPPDATA%`-based default the same way.
 
 **Network modes** (used instead of `--host` by anyone who doesn't need the advanced override):
 `--network local` (default) binds loopback only. `--network lan` binds every interface but only
@@ -388,9 +388,9 @@ rule.
 
 **Self-update** (`src/selfupdate.rs` for the release check/download, `src/update_transaction.rs`
 for the journalled apply/recovery): the release source is GitHub Releases of this repo,
-overridable via `STT_NEXT_UPDATE_URL` (used to rehearse against a local/mock server while the
+overridable via `STT_SERVER_UPDATE_URL` (used to rehearse against a local/mock server while the
 repo is private). A release must publish exactly two assets, under these exact names:
-`stt-server-next.exe` and `stt-server-next.exe.sha256` (a `sha256sum`-style text file: the hex
+`stt-server.exe` and `stt-server.exe.sha256` (a `sha256sum`-style text file: the hex
 digest, optionally followed by whitespace and a filename). `update install` without `--yes`
 downloads and verifies nothing -- it only reports whether a newer version exists and what
 installing it would do.
@@ -461,7 +461,7 @@ cargo run --release --bin stt-proof -- "C:\path\to\model.gguf" "C:\path\to\sampl
 cargo run --release --bin stt-proof -- "C:\path\to\model.gguf" "C:\path\to\sample.wav" --cpu
 ```
 
-Set `STT_NEXT_DATA_DIR` to a test directory and run `stt-server-next.exe start` (or plain `run`
+Set `STT_SERVER_DATA_DIR` to a test directory and run `stt-server.exe start` (or plain `run`
 for the foreground default) for a local instance on `127.0.0.1:54321`; see "CLI" above for the
 full command surface.
 
@@ -469,7 +469,7 @@ full command surface.
 
 Every install has exactly one data folder, and every mode of that install -- `run`/`start`/
 `stop`/`status`/`models`/`update`, `autostart`, and the Windows Service -- resolves to it, so a
-model is never stored twice. `--data-dir`/`STT_NEXT_DATA_DIR` always overrides this resolution.
+model is never stored twice. `--data-dir`/`STT_SERVER_DATA_DIR` always overrides this resolution.
 
 - **Per-user (default, no admin):** data under `%LOCALAPPDATA%\OpenVibeAI\STT Server`. Use
   `autostart enable` for "start with Windows".

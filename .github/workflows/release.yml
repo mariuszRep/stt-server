@@ -1,0 +1,92 @@
+name: Release
+
+# Promotes the exact files a successful candidate already produced for the
+# tagged commit. It never rebuilds. Dispatched by `npm run vt -- server prod
+# <version>` after the tag exists; fails hard when no candidate exists for the
+# SHA or when the files do not match the candidate's checksum.
+# (`prod <version> --local` does the same promotion from this machine.)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.3.0"
+        required: true
+        type: string
+      sha:
+        description: "The tested commit the tag points to"
+        required: true
+        type: string
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download candidate files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          gh release download "candidate-${{ inputs.sha }}" --dir artifacts
+
+      - name: Verify the candidate is complete, matches the commit, and is intact
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd artifacts
+          for f in stt-server.exe stt-server.exe.sha256 manifest.json; do
+            [ -f "$f" ] || { echo "::error::candidate lacks $f"; exit 1; }
+          done
+          commit=$(sed -n 's/.*"commit":"\([0-9a-f]*\)".*/\1/p' manifest.json)
+          [ "$commit" = "${{ inputs.sha }}" ] || { echo "::error::manifest commit $commit != ${{ inputs.sha }}"; exit 1; }
+          sha256sum -c stt-server.exe.sha256
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: artifacts/stt-server.exe
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ inputs.tag }}" \
+            --title "${{ inputs.tag }}" \
+            --generate-notes \
+            --verify-tag \
+            artifacts/stt-server.exe artifacts/stt-server.exe.sha256 artifacts/manifest.json
+
+      - name: Remove promoted private candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete "candidate-${{ inputs.sha }}" --yes --cleanup-tag
+
+      - name: Checkout integration branch
+        uses: actions/checkout@v4
+        with:
+          ref: voice-typer-windows
+          path: source
+
+      - name: Bump to the next patch version on the integration branch
+        working-directory: source
+        run: |
+          set -euo pipefail
+          current=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          IFS='.' read -r major minor patch <<< "$current"
+          next="${major}.${minor}.$((patch + 1))"
+          sed -i "0,/^version = \"${current}\"/s//version = \"${next}\"/" Cargo.toml
+          # Keep the lockfile entry for this package in step.
+          sed -i "/^name = \"stt-server\"$/{n;s/^version = \".*\"/version = \"${next}\"/}" Cargo.lock
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore: bump version to ${next} (post-release)"
+          git push origin voice-typer-windows

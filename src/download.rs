@@ -771,7 +771,7 @@ mod http_tests {
         std::env::temp_dir()
             .canonicalize()
             .unwrap()
-            .join(format!("stt-server-next-dl-test-{}", Uuid::new_v4()))
+            .join(format!("stt-server-dl-test-{}", Uuid::new_v4()))
     }
 
     /// Binds an axum server to 127.0.0.1:0 serving `body` at `/file`, honoring

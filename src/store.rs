@@ -483,9 +483,9 @@ pub fn migrate(
     let version = user_version(conn)?;
     if version > CURRENT_SCHEMA_VERSION {
         return Err(format!(
-            "This database was created by a newer version of stt-server-next (schema v{version}); \
+            "This database was created by a newer version of stt-server (schema v{version}); \
              this executable only understands up to schema v{CURRENT_SCHEMA_VERSION}. \
-             Update stt-server-next before opening this data directory, or point --data-dir at a \
+             Update stt-server before opening this data directory, or point --data-dir at a \
              different (older-schema) directory."
         )
         .into());
@@ -640,7 +640,7 @@ mod tests {
 
     fn temp_dir() -> PathBuf {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()))
+        parent.join(format!("stt-server-test-{}", Uuid::new_v4()))
     }
 
     fn cleanup(path: PathBuf) {

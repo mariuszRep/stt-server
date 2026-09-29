@@ -1,7 +1,7 @@
 # Client discovery and API contract
 
 The authoritative guide for any client (the Whisper Vibes desktop app, the
-`stt-sdk` package, or a third party) that talks to `stt-server-next`. It
+`stt-sdk` package, or a third party) that talks to `stt-server`. It
 supersedes the old `stt-server`/faster-whisper/sherpa-onnx provider-lifecycle
 contract entirely -- there is one engine, one selected model at a time, and
 no provider descriptors. See the bottom of this document for the exact
@@ -18,10 +18,10 @@ All request/response shapes here are read from this repository's source
 The app spawns the server as its own child process and owns its lifecycle:
 
 ```
-stt-server-next run --port <p> --data-dir <d>
+stt-server run --port <p> --data-dir <d>
 ```
 
-(or `stt-server-next --port <p> --data-dir <d>`, or omit both flags for the
+(or `stt-server --port <p> --data-dir <d>`, or omit both flags for the
 CLI defaults `127.0.0.1:54321` and `crate::app::data_dir()`.)
 
 Steps:
@@ -29,7 +29,7 @@ Steps:
 1. Spawn the process with the desired `--port`/`--data-dir` (and optionally
    `--host` for LAN mode, see 3 below).
 2. Poll `GET http://<host>:<port>/health` until it returns `200 {"status":
-   "ok", "service": "stt-server-next", "version": "0.1.0", "api_level": 1,
+   "ok", "service": "stt-server", "version": "0.1.0", "api_level": 1,
    "network": {...}}`. `/health` needs no token and is the only route that
    doesn't; check the `service` field, not just the status code, so an
    unrelated program already listening on that port is never mistaken for
@@ -46,12 +46,12 @@ Steps:
 
 This is the process model the desktop app's Tauri sidecar (`lib.rs`, the
 `stt run --port` spawn around lines 430-910) already assumes; only the
-binary name and CLI surface change (`stt run --port` -> `stt-server-next run
+binary name and CLI surface change (`stt run --port` -> `stt-server run
 --port <p> --data-dir <d>`).
 
 ### 1.2 Standalone mode
 
-The server runs independently (started via `stt-server-next start`, a
+The server runs independently (started via `stt-server start`, a
 per-user autostart entry, or a Windows Service). The app attaches without
 starting or stopping it:
 
@@ -70,11 +70,11 @@ starting or stopping it:
 4. Attach: use the token for all further calls. Never send
    `POST /v1/local/shutdown` or kill the PID in this mode.
 
-`stt-server-next status --json` is the CLI-side equivalent of steps 1 and 3,
+`stt-server status --json` is the CLI-side equivalent of steps 1 and 3,
 for a client that can shell out instead of reading the file directly:
 ```json
 { "running": true, "pid": 12345, "host": "127.0.0.1", "port": 54321,
-  "data_dir": "C:\\Users\\...\\STT Server Next", "version": "0.1.0" }
+  "data_dir": "C:\\Users\\...\\STT Server", "version": "0.1.0" }
 ```
 (exact key set per `Command::Status`'s JSON in `src/cli.rs`/`src/bin/server.rs`
 -- treat `status --json`'s `running: false` the same as a missing/dead
@@ -110,7 +110,7 @@ never require an old client to change, so they don't need a new level.
 A client that requires a minimum `api_level` should read it from `/health` before relying on any
 other route (it's checkable before a token is even available, unlike every other route) and either
 refuse to proceed or warn the user that the server is too old, rather than calling routes that may
-not behave as the client expects. `stt-server-next health` and `status --json` print the same two
+not behave as the client expects. `stt-server health` and `status --json` print the same two
 fields for CLI/script use; `status --json`'s `api_level` comes from `server.json` (written at
 server startup) and defaults to `0` on a `server.json` written by a version of this server that
 predates the field -- treat `0` the same as "older than any level you require."
@@ -119,7 +119,7 @@ predates the field -- treat `0` the same as "older than any level you require."
 already has models installed under their own per-user install, an admin can import those models
 into the machine-wide install instead of downloading them again --
 `POST /models/manage/import-user` (admin only; see section 3's route table), or the CLI
-`stt-server-next models import-user [--from <per-user data dir>] [--wait]`. `--from` defaults to
+`stt-server models import-user [--from <per-user data dir>] [--wait]`. `--from` defaults to
 the invoking OS user's own per-user data folder. Every `.gguf` under `<from>\models` is hashed and
 matched against the catalog (the same check `POST /models/manage/refresh` uses for drop-in
 files) before being copied into this install's managed store and re-verified in place; a file
@@ -134,11 +134,11 @@ with a `result` object of `{"imported":[{"model"}], "skipped":[{"model","reason"
 
 From `crate::app::data_dir()`:
 
-- **Non-service (per-user) run:** `%LOCALAPPDATA%\STT Server Next`, or
-  `%STT_NEXT_DATA_DIR%` if set (test/override hook only -- a real client
+- **Non-service (per-user) run:** `%LOCALAPPDATA%\STT Server`, or
+  `%STT_SERVER_DATA_DIR%` if set (test/override hook only -- a real client
   should not rely on this env var).
-- **Windows Service run** (`stt-server-next service run`, launched by SCM):
-  `%PROGRAMDATA%\OpenVibeAI\STT Server Next` (falls back to
+- **Windows Service run** (`stt-server service run`, launched by SCM):
+  `%PROGRAMDATA%\OpenVibeAI\STT Server` (falls back to
   `C:\ProgramData\...` if `PROGRAMDATA` is unset).
 
 The drop-in models folder (manually copied `.gguf` files, picked up by
@@ -179,7 +179,7 @@ where to drop files should read `GET /v1/local/config`'s
   | User (admin token also works) | `GET /readiness`, `GET /v1/models`, `GET /models/manage`, `GET /models/manage/default`, `GET /v1/local/system`, `GET /models/manage/recommendations`, `GET /models/manage/operations/{id}`, `POST /v1/audio/transcriptions`, `POST /v1/audio/translations` |
   | Admin only | `GET`/`PATCH /v1/local/config`, `POST /models/manage/{id}/download`, `POST /models/manage/{id}/verify`, `POST /models/manage/{id}/default` (set default and load), `DELETE /models/manage/default` (unload), `DELETE /models/manage/{id}` (remove), `POST /models/manage/refresh` (drop-in refresh), `POST /models/manage/import`, `POST /models/manage/import-user` (copy another install's models in; see section 1.4), `POST /models/manage/operations/{id}/cancel`, `POST /v1/local/shutdown` |
 
-  The CLI (`stt-server-next models ...`, `status`, `stop`, `update`, ...)
+  The CLI (`stt-server models ...`, `status`, `stop`, `update`, ...)
   reads `auth.token` when it can, falling back to `user.token` only when
   `auth.token` can't be read (`src/model_cli.rs::read_token` -- the case of
   an ordinary local user on a machine-wide install). A command that then
@@ -295,7 +295,7 @@ object reports `mode: "custom"` (see 7a below) instead of resolving
   (any web page probing `GET /health`, the one unauthenticated route) is what
   the 2026-09-27 decision above no longer accepts.
 - **No idle timeout.** Unlike the old `stt`/faster-whisper CLI's
-  `--idle-timeout-secs`, `stt-server-next` never shuts itself down for lack
+  `--idle-timeout-secs`, `stt-server` never shuts itself down for lack
   of requests. An app-owned launch (1.1) that used to rely on an idle timeout
   as a safety net must instead explicitly stop the server (`POST
   /v1/local/shutdown` or killing the child) -- the server will otherwise run
@@ -738,7 +738,7 @@ first:
 
 - `GET /health` -- liveness only, no token needed:
   ```json
-  { "status": "ok", "service": "stt-server-next",
+  { "status": "ok", "service": "stt-server",
     "network": { "mode": "lan", "effective": "local",
                  "reason": "no active network connection is Private or Domain -- staying local-only" },
     "default_model": "whisper-tiny", "loaded_model": "whisper-tiny" }
@@ -789,7 +789,7 @@ key's presence before reading it:
                            "memory_bytes": 17179869184 } ] },
   "process": { "pid": 12345, "uptime_ms": 60000, "rss_bytes": 52428800 },
   "server": { "version": "0.1.0", "host": "127.0.0.1", "port": 54321,
-              "data_dir": "C:\\Users\\...\\STT Server Next" } }
+              "data_dir": "C:\\Users\\...\\STT Server" } }
 ```
 
 Notes:
@@ -829,7 +829,7 @@ From `whisper-vibes/apps/web/src/lib/stt-server-client.ts` and
 
 | Old call | New call |
 |---|---|
-| `getOrStartProviderDescriptor(providerId, opts)` | App-owned mode: spawn `stt-server-next run --port <p> --data-dir <d>` directly (1.1); no descriptor, no per-provider install |
+| `getOrStartProviderDescriptor(providerId, opts)` | App-owned mode: spawn `stt-server run --port <p> --data-dir <d>` directly (1.1); no descriptor, no per-provider install |
 | `installVariant` / `removeProviderVariant` | removed: no provider variants -- see model install/remove (4) instead |
 | `cancelOperation` / `pollInstallOperation` (`/v1/install-operations/{id}`) | `POST /models/manage/operations/{id}/cancel` / `GET /models/manage/operations/{id}` (same polling shape, different path, model-scoped not provider-scoped) |
 | `getProviders()` (`/v1/providers`) | removed: no provider catalog -- use `GET /models/manage` |

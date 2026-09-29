@@ -135,8 +135,10 @@ pub fn startup_guard(data_dir: &Path) -> Result<Option<File>> {
     fs::create_dir_all(data_dir).map_err(err)?;
     if let Some(journal) = read_journal(data_dir)? {
         if !journal.phase.terminal() && journal.armed {
-            let worker_launch =
-                std::env::var("STT_NEXT_UPDATE_TRANSACTION").ok().as_deref() == Some(&journal.id);
+            let worker_launch = std::env::var("STT_SERVER_UPDATE_TRANSACTION")
+                .ok()
+                .as_deref()
+                == Some(&journal.id);
             let service_launch = journal.launch.service && crate::app::is_service_mode();
             if matches!(journal.phase, Phase::Validating | Phase::RollingBack)
                 && (worker_launch || service_launch)
@@ -496,7 +498,7 @@ fn start(journal: &Journal) -> Result<()> {
     command
         .arg("run")
         .args(journal.launch.flags.arguments(&journal.data_dir))
-        .env("STT_NEXT_UPDATE_TRANSACTION", &journal.id);
+        .env("STT_SERVER_UPDATE_TRANSACTION", &journal.id);
     let log = OpenOptions::new()
         .create(true)
         .append(true)
@@ -956,7 +958,7 @@ mod tests {
             data_dir,
             work_dir,
             launch: Launch {
-                executable: PathBuf::from(r"C:\bin\stt-server-next.exe"),
+                executable: PathBuf::from(r"C:\bin\stt-server.exe"),
                 service: false,
                 flags: RunFlags::default(),
             },
@@ -1163,7 +1165,7 @@ mod tests {
         let data_dir = temp_dir("exe-swap");
         let work_dir = data_dir.join("work");
         fs::create_dir_all(&work_dir).unwrap();
-        let exe_path = data_dir.join("stt-server-next.exe");
+        let exe_path = data_dir.join("stt-server.exe");
         fs::write(&exe_path, b"old exe bytes").unwrap();
 
         let mut journal = sample_journal(work_dir, data_dir.clone());
@@ -1187,7 +1189,7 @@ mod tests {
         let data_dir = temp_dir("exe-corrupt");
         let work_dir = data_dir.join("work");
         fs::create_dir_all(&work_dir).unwrap();
-        let exe_path = data_dir.join("stt-server-next.exe");
+        let exe_path = data_dir.join("stt-server.exe");
         fs::write(&exe_path, b"old exe bytes").unwrap();
 
         let mut journal = sample_journal(work_dir, data_dir.clone());

@@ -1,10 +1,10 @@
-//! Safe self-update: check GitHub Releases for a newer `stt-server-next`,
+//! Safe self-update: check GitHub Releases for a newer `stt-server`,
 //! download and verify it before it ever touches the running executable, and
 //! replace the running binary in a way that can always be undone.
 //!
 //! Design (see `.projectflows/goals/*/safe-self-update/GOAL.md`):
 //! - The release source is GitHub Releases of this repo. It is private today,
-//!   so `default_update_endpoint` can be overridden with `STT_NEXT_UPDATE_URL`
+//!   so `default_update_endpoint` can be overridden with `STT_SERVER_UPDATE_URL`
 //!   to point at a local/mock server for rehearsal; production defaults to
 //!   the real GitHub API "latest release" endpoint.
 //! - A release is expected to publish two assets: the executable
@@ -28,17 +28,17 @@ use serde_json::Value;
 
 use crate::verify::sha256_file;
 
-/// Asset names a release must publish for `stt-server-next` to recognize it.
-pub const EXE_ASSET_NAME: &str = "stt-server-next.exe";
-pub const CHECKSUM_ASSET_NAME: &str = "stt-server-next.exe.sha256";
+/// Asset names a release must publish for `stt-server` to recognize it.
+pub const EXE_ASSET_NAME: &str = "stt-server.exe";
+pub const CHECKSUM_ASSET_NAME: &str = "stt-server.exe.sha256";
 
 /// Default production release source: the GitHub API's "latest release" for
-/// this repo. Overridable via `STT_NEXT_UPDATE_URL` so tests (and a rehearsal
+/// this repo. Overridable via `STT_SERVER_UPDATE_URL` so tests (and a rehearsal
 /// against a controlled source, per the goal) can point at a local server
 /// without touching the network or requiring the repo to be public.
 pub fn default_update_endpoint() -> String {
-    std::env::var("STT_NEXT_UPDATE_URL").unwrap_or_else(|_| {
-        "https://api.github.com/repos/mariuszRep/stt-server-next/releases/latest".to_owned()
+    std::env::var("STT_SERVER_UPDATE_URL").unwrap_or_else(|_| {
+        "https://api.github.com/repos/mariuszRep/stt-server/releases/latest".to_owned()
     })
 }
 
@@ -172,7 +172,7 @@ pub async fn check_latest(
 ) -> Result<UpdateCheck, UpdateError> {
     let response = http
         .get(endpoint)
-        .header(reqwest::header::USER_AGENT, "stt-server-next-self-update")
+        .header(reqwest::header::USER_AGENT, "stt-server-self-update")
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .timeout(Duration::from_secs(15))
         .send()
@@ -207,7 +207,7 @@ async fn download_to_file(
 ) -> Result<u64, UpdateError> {
     let response = http
         .get(url)
-        .header(reqwest::header::USER_AGENT, "stt-server-next-self-update")
+        .header(reqwest::header::USER_AGENT, "stt-server-self-update")
         .timeout(Duration::from_secs(300))
         .send()
         .await
@@ -253,8 +253,8 @@ pub async fn download_and_verify(
     release: &ReleaseInfo,
     stage_dir: &Path,
 ) -> Result<PathBuf, UpdateError> {
-    let staged_exe = stage_dir.join(format!("stt-server-next-{}.exe", release.version));
-    let staged_checksum = stage_dir.join(format!("stt-server-next-{}.exe.sha256", release.version));
+    let staged_exe = stage_dir.join(format!("stt-server-{}.exe", release.version));
+    let staged_checksum = stage_dir.join(format!("stt-server-{}.exe.sha256", release.version));
     download_to_file(http, &release.exe.url, &staged_exe).await?;
     let checksum_result = download_to_file(http, &release.checksum.url, &staged_checksum).await;
     if let Err(error) = checksum_result {
@@ -440,7 +440,7 @@ mod pure_tests {
     #[test]
     fn parse_checksum_body_takes_first_token_lowercased() {
         assert_eq!(
-            parse_checksum_body("DEADBEEF  stt-server-next.exe\n"),
+            parse_checksum_body("DEADBEEF  stt-server.exe\n"),
             Some("deadbeef".to_owned())
         );
         assert_eq!(parse_checksum_body("   \n"), None);
@@ -448,16 +448,16 @@ mod pure_tests {
 
     #[test]
     fn backup_path_appends_old_suffix() {
-        let exe = PathBuf::from(r"C:\Program Files\OpenVibeAI\stt-server-next.exe");
+        let exe = PathBuf::from(r"C:\Program Files\OpenVibeAI\stt-server.exe");
         assert_eq!(
             backup_path(&exe),
-            PathBuf::from(r"C:\Program Files\OpenVibeAI\stt-server-next.exe.old")
+            PathBuf::from(r"C:\Program Files\OpenVibeAI\stt-server.exe.old")
         );
     }
 
     fn temp_dir() -> PathBuf {
         std::env::temp_dir().canonicalize().unwrap().join(format!(
-            "stt-server-next-selfupdate-test-{}",
+            "stt-server-selfupdate-test-{}",
             uuid::Uuid::new_v4()
         ))
     }
@@ -466,7 +466,7 @@ mod pure_tests {
     fn replace_then_rollback_round_trips_file_contents() {
         let dir = temp_dir();
         std::fs::create_dir_all(&dir).unwrap();
-        let current = dir.join("stt-server-next.exe");
+        let current = dir.join("stt-server.exe");
         let staged = dir.join("staged.exe");
         std::fs::write(&current, b"old version bytes").unwrap();
         std::fs::write(&staged, b"new version bytes").unwrap();
@@ -487,7 +487,7 @@ mod pure_tests {
     fn replace_exe_overwrites_a_stale_prior_backup() {
         let dir = temp_dir();
         std::fs::create_dir_all(&dir).unwrap();
-        let current = dir.join("stt-server-next.exe");
+        let current = dir.join("stt-server.exe");
         let staged = dir.join("staged.exe");
         let stale_backup = backup_path(&current);
         std::fs::write(&current, b"gen2").unwrap();
@@ -505,7 +505,7 @@ mod pure_tests {
     fn rollback_without_a_backup_fails_clearly() {
         let dir = temp_dir();
         std::fs::create_dir_all(&dir).unwrap();
-        let current = dir.join("stt-server-next.exe");
+        let current = dir.join("stt-server.exe");
         std::fs::write(&current, b"only version").unwrap();
         let missing_backup = dir.join("nope.old");
         let error = rollback_exe(&current, &missing_backup).unwrap_err();
@@ -522,7 +522,7 @@ mod http_tests {
 
     fn temp_dir() -> PathBuf {
         std::env::temp_dir().canonicalize().unwrap().join(format!(
-            "stt-server-next-selfupdate-http-test-{}",
+            "stt-server-selfupdate-http-test-{}",
             uuid::Uuid::new_v4()
         ))
     }
@@ -614,7 +614,7 @@ mod http_tests {
         let base = serve_release(
             "v9.9.9",
             EXE,
-            format!("{}  stt-server-next.exe\n", hash_hex(EXE)),
+            format!("{}  stt-server.exe\n", hash_hex(EXE)),
         )
         .await;
         let release = ReleaseInfo {

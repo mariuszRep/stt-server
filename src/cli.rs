@@ -8,35 +8,35 @@ use crate::app::RuntimeLimits;
 use crate::network::NetworkMode;
 
 pub const USAGE: &str = "\
-stt-server-next -- local batch STT server
+stt-server -- local batch STT server
 
 USAGE:
-    stt-server-next [run] [flags]           foreground (default when no command given)
-    stt-server-next start [flags]           detached background process
-    stt-server-next stop                    graceful stop of the running instance
-    stt-server-next restart [flags]         stop then start
-    stt-server-next status [--json]         running?, pid, host:port, data dir, version
-    stt-server-next autostart enable [flags]   per-user \"start with Windows\"
-    stt-server-next autostart disable
-    stt-server-next autostart status
-    stt-server-next service install|uninstall|run
-    stt-server-next health [--json] [--data-dir <path>]
-    stt-server-next models list [--json] [--data-dir <path>]
-    stt-server-next models recommended [--json] [--data-dir <path>]
-    stt-server-next models selected [--json] [--data-dir <path>]
-    stt-server-next models download <id> [--wait] [--json] [--data-dir <path>]  (alias: install)
-    stt-server-next models import <path> --model <id> [--quant <q>] [--wait] [--json] [--data-dir <path>]
-    stt-server-next models import-user [--from <per-user data dir>] [--wait] [--json] [--data-dir <path>]
+    stt-server [run] [flags]           foreground (default when no command given)
+    stt-server start [flags]           detached background process
+    stt-server stop                    graceful stop of the running instance
+    stt-server restart [flags]         stop then start
+    stt-server status [--json]         running?, pid, host:port, data dir, version
+    stt-server autostart enable [flags]   per-user \"start with Windows\"
+    stt-server autostart disable
+    stt-server autostart status
+    stt-server service install|uninstall|run
+    stt-server health [--json] [--data-dir <path>]
+    stt-server models list [--json] [--data-dir <path>]
+    stt-server models recommended [--json] [--data-dir <path>]
+    stt-server models selected [--json] [--data-dir <path>]
+    stt-server models download <id> [--wait] [--json] [--data-dir <path>]  (alias: install)
+    stt-server models import <path> --model <id> [--quant <q>] [--wait] [--json] [--data-dir <path>]
+    stt-server models import-user [--from <per-user data dir>] [--wait] [--json] [--data-dir <path>]
                                       admin-only: copy another install's models into this one
-    stt-server-next models verify <id> [--wait] [--json] [--data-dir <path>]
-    stt-server-next models cancel <operation_id> [--data-dir <path>]
-    stt-server-next models default <id> [--json] [--data-dir <path>]  (alias: select)
-    stt-server-next models unload [--json] [--data-dir <path>]
-    stt-server-next models remove <id> [--json] [--data-dir <path>]
-    stt-server-next models refresh [--wait] [--json] [--data-dir <path>]
-    stt-server-next update check [--json]
-    stt-server-next update install [--yes] [--json] [--data-dir <path>]
-    stt-server-next --help
+    stt-server models verify <id> [--wait] [--json] [--data-dir <path>]
+    stt-server models cancel <operation_id> [--data-dir <path>]
+    stt-server models default <id> [--json] [--data-dir <path>]  (alias: select)
+    stt-server models unload [--json] [--data-dir <path>]
+    stt-server models remove <id> [--json] [--data-dir <path>]
+    stt-server models refresh [--wait] [--json] [--data-dir <path>]
+    stt-server update check [--json]
+    stt-server update install [--yes] [--json] [--data-dir <path>]
+    stt-server --help
 
 FLAGS:
     --port <n>                    bind port (default 54321)
@@ -65,7 +65,7 @@ they do not start or manage the process themselves. `--wait` polls the
 returned operation until it reaches a terminal state, printing progress.
 
 `update check` looks at the release source (GitHub Releases; overridable via
-STT_NEXT_UPDATE_URL for local rehearsal) and reports whether a newer version
+STT_SERVER_UPDATE_URL for local rehearsal) and reports whether a newer version
 is available; it never downloads anything. `update install` downloads and
 verifies the release, then stops the running server (if any), replaces this
 executable, and restarts it; without `--yes` it asks for confirmation first.

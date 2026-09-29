@@ -1,13 +1,13 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use stt_server_next::app::{self, BindOverrides, DEFAULT_BIND_HOST};
-use stt_server_next::cli::{
+use stt_server::app::{self, BindOverrides, DEFAULT_BIND_HOST};
+use stt_server::cli::{
     self, AutostartAction, Command, ModelsCommand, RunFlags, ServiceAction, UpdateCommand,
 };
-use stt_server_next::discovery;
-use stt_server_next::model_cli::{self, ConnectError};
-use stt_server_next::selfupdate;
+use stt_server::discovery;
+use stt_server::model_cli::{self, ConnectError};
+use stt_server::selfupdate;
 
 fn effective_data_dir(flags: &RunFlags) -> PathBuf {
     flags.data_dir.clone().unwrap_or_else(app::data_dir)
@@ -34,7 +34,7 @@ async fn main() {
     if args.first().map(String::as_str) == Some("__update-worker") {
         let result = match args.get(1) {
             Some(dir) => {
-                stt_server_next::update_transaction::worker_entry(
+                stt_server::update_transaction::worker_entry(
                     std::path::Path::new(dir),
                     args.get(2).map(String::as_str) == Some("--recover"),
                 )
@@ -87,7 +87,7 @@ async fn dispatch(command: Command) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// update: check GitHub Releases (or STT_NEXT_UPDATE_URL for local rehearsal),
+// update: check GitHub Releases (or STT_SERVER_UPDATE_URL for local rehearsal),
 // then, on `install`, download+verify, stop, replace this executable, and
 // restart -- rolling back automatically if the new version never becomes
 // healthy. See `src/selfupdate.rs` for the download/verify/replace/rollback
@@ -140,7 +140,7 @@ async fn cmd_update_check(json: bool) -> i32 {
                     "update available: {} -> {}",
                     check.current_version, check.release.version
                 );
-                println!("run `stt-server-next update install --yes` to install it");
+                println!("run `stt-server update install --yes` to install it");
             } else {
                 println!(
                     "up to date: {} is the latest release",
@@ -164,7 +164,7 @@ async fn cmd_update_check(json: bool) -> i32 {
 }
 
 async fn cmd_update_install(data_dir: PathBuf, yes: bool, json: bool, timeout: u64) -> i32 {
-    match stt_server_next::update_transaction::install(data_dir, yes, json, timeout).await {
+    match stt_server::update_transaction::install(data_dir, yes, json, timeout).await {
         Ok(()) => 0,
         Err(error) => {
             eprintln!("error: {error}");
@@ -182,7 +182,7 @@ async fn cmd_run(flags: RunFlags) -> i32 {
     let overrides = bind_overrides(&flags);
     let network = flags.network;
     let limits = flags.limits;
-    let result = stt_server_next::api::run_http_full(
+    let result = stt_server::api::run_http_full(
         data_dir,
         limits,
         overrides,
@@ -195,11 +195,11 @@ async fn cmd_run(flags: RunFlags) -> i32 {
     .await;
     match result {
         Ok(()) => 0,
-        Err(stt_server_next::api::ServeError::AlreadyRunning) => {
+        Err(stt_server::api::ServeError::AlreadyRunning) => {
             eprintln!("error: another instance is already running on this data directory");
             3
         }
-        Err(stt_server_next::api::ServeError::BindFailed(error)) => {
+        Err(stt_server::api::ServeError::BindFailed(error)) => {
             eprintln!("error: failed to bind: {error}");
             4
         }
@@ -341,7 +341,7 @@ fn probe_host(host: &str) -> String {
 /// True only when something that identifies itself as this server answers
 /// `/health` (independent review L2): checking the status code alone would
 /// misreport an unrelated program already listening on the configured port
-/// as a running `stt-server-next` instance.
+/// as a running `stt-server` instance.
 async fn health_ok(host: &str, port: u16) -> bool {
     let url = format!("http://{host}:{port}/health");
     let client = match reqwest::Client::builder()
@@ -360,7 +360,7 @@ async fn health_ok(host: &str, port: u16) -> bool {
     let Ok(body) = response.json::<serde_json::Value>().await else {
         return false;
     };
-    body.get("service").and_then(|v| v.as_str()) == Some(stt_server_next::api::SERVICE_ID)
+    body.get("service").and_then(|v| v.as_str()) == Some(stt_server::api::SERVICE_ID)
 }
 
 // ---------------------------------------------------------------------------
@@ -503,7 +503,7 @@ fn cmd_autostart(action: AutostartAction, flags: RunFlags) -> i32 {
     match action {
         AutostartAction::Enable => {
             let data_dir = effective_data_dir(&flags);
-            match stt_server_next::autostart::enable(&exe, &data_dir, &flags) {
+            match stt_server::autostart::enable(&exe, &data_dir, &flags) {
                 Ok(()) => {
                     println!("autostart enabled");
                     0
@@ -514,7 +514,7 @@ fn cmd_autostart(action: AutostartAction, flags: RunFlags) -> i32 {
                 }
             }
         }
-        AutostartAction::Disable => match stt_server_next::autostart::disable() {
+        AutostartAction::Disable => match stt_server::autostart::disable() {
             Ok(()) => {
                 println!("autostart disabled");
                 0
@@ -524,7 +524,7 @@ fn cmd_autostart(action: AutostartAction, flags: RunFlags) -> i32 {
                 1
             }
         },
-        AutostartAction::Status => match stt_server_next::autostart::query() {
+        AutostartAction::Status => match stt_server::autostart::query() {
             Ok(Some(value)) => {
                 println!("enabled: {value}");
                 0
@@ -554,9 +554,9 @@ fn cmd_autostart(_action: AutostartAction, _flags: RunFlags) -> i32 {
 #[cfg(windows)]
 fn cmd_service(action: ServiceAction) -> i32 {
     let result = match action {
-        ServiceAction::Install => stt_server_next::service::install(),
-        ServiceAction::Uninstall => stt_server_next::service::uninstall(),
-        ServiceAction::Run => stt_server_next::service::dispatch(),
+        ServiceAction::Install => stt_server::service::install(),
+        ServiceAction::Uninstall => stt_server::service::uninstall(),
+        ServiceAction::Run => stt_server::service::dispatch(),
     };
     match result {
         Ok(()) => 0,
@@ -1161,10 +1161,10 @@ mod recovery_tests {
         server.abort();
 
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", uuid::Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", uuid::Uuid::new_v4()));
         let real_app = app::open_app_at(path.clone()).unwrap();
         let real = axum::Router::new()
-            .route("/health", axum::routing::get(stt_server_next::api::health))
+            .route("/health", axum::routing::get(stt_server::api::health))
             .with_state(real_app.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1193,7 +1193,7 @@ mod recovery_tests {
 #[cfg(test)]
 mod models_cli_tests {
     use super::*;
-    use stt_server_next::cli::ModelsCommand;
+    use stt_server::cli::ModelsCommand;
 
     struct TestServer {
         data_dir: PathBuf,
@@ -1220,7 +1220,7 @@ mod models_cli_tests {
                 port: Some(port),
                 cors_origins: None,
             };
-            let _ = stt_server_next::api::run_http_full(
+            let _ = stt_server::api::run_http_full(
                 dir_for_task,
                 Default::default(),
                 overrides,
@@ -1358,10 +1358,7 @@ mod models_cli_tests {
                 .unwrap()
                 .execute(
                     "INSERT INTO settings(key,value) VALUES(?1,?2)",
-                    rusqlite::params![
-                        stt_server_next::store::SETTING_BIND_PORT,
-                        busy_port.to_string()
-                    ],
+                    rusqlite::params![stt_server::store::SETTING_BIND_PORT, busy_port.to_string()],
                 )
                 .unwrap();
             drop(app);
@@ -1376,7 +1373,7 @@ mod models_cli_tests {
             };
             // A machine-wide install would fail clearly instead; PerUser is
             // what's eligible to fall back here.
-            let _ = stt_server_next::api::run_http_full(
+            let _ = stt_server::api::run_http_full(
                 dir_for_task,
                 Default::default(),
                 overrides,

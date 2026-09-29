@@ -199,7 +199,7 @@ pub fn install() -> Result<(), Box<dyn Error>> {
     require_elevated_for_install()?;
     let install_dir = install_dir();
     fs::create_dir_all(&install_dir)?;
-    let binary = install_dir.join("stt-server-next.exe");
+    let binary = install_dir.join("stt-server.exe");
     let source = std::env::current_exe()?;
     if source != binary {
         fs::copy(source, &binary)?;
@@ -238,7 +238,7 @@ pub fn install() -> Result<(), Box<dyn Error>> {
     )?;
     let info = ServiceInfo {
         name: OsString::from(NAME),
-        display_name: OsString::from("OpenVibe STT Server Next"),
+        display_name: OsString::from("OpenVibe STT Server"),
         service_type: ServiceType::OWN_PROCESS,
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
@@ -340,7 +340,7 @@ mod tests {
             .join(format!("stt-service-test-{}", std::process::id()))
             .join("STT Server");
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("stt-server-next.exe"), b"x").unwrap();
+        fs::write(dir.join("stt-server.exe"), b"x").unwrap();
         let status = delayed_remove_dir(&dir).status().unwrap();
         assert!(status.success());
         assert!(!dir.exists());

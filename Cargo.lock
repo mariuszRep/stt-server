@@ -1260,8 +1260,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fe895eb47f22e2ddd4dabc02bce419d2e643c8e3b585c78158b349195bc24d82"
 
 [[package]]
-name = "stt-server-next"
-version = "0.1.2"
+name = "stt-server"
+version = "0.3.0"
 dependencies = [
  "axum",
  "fs4",

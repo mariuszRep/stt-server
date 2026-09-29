@@ -355,7 +355,7 @@ mod tests {
 
     fn temp_dir() -> PathBuf {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()))
+        parent.join(format!("stt-server-test-{}", Uuid::new_v4()))
     }
 
     fn fake_model(slug: &str, bytes: &[u8]) -> CatalogModel {

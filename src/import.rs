@@ -334,7 +334,7 @@ mod tests {
     #[tokio::test]
     async fn import_completes_with_full_progress_recorded() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let mut app = open_app_at(path.clone()).unwrap();
         let file_bytes = vec![0x42u8; 5_000];
         let model = fake_model(&file_bytes);
@@ -385,7 +385,7 @@ mod tests {
     #[test]
     fn interrupted_import_is_failed_and_quarantined() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let op = Uuid::new_v4().to_string();
         let stage = path.join("staging").join(format!("{op}.part"));

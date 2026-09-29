@@ -22,7 +22,7 @@ fn read_wav(path: &Path) -> Result<Vec<f32>, Box<dyn Error>> {
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = env::args().collect();
     if !(3..=4).contains(&args.len()) {
-        eprintln!("usage: stt-server-next MODEL.gguf AUDIO.wav [--cpu]");
+        eprintln!("usage: stt-server MODEL.gguf AUDIO.wav [--cpu]");
         return Err("expected model and audio".into());
     }
     let model_path = Path::new(&args[1]);

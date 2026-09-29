@@ -1,11 +1,11 @@
 [package]
-name = "stt-server-next"
-version = "0.1.2"
+name = "stt-server"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 
 [lib]
-name = "stt_server_next"
+name = "stt_server"
 path = "src/lib.rs"
 
 [dependencies]
@@ -49,7 +49,7 @@ name = "stt-proof"
 path = "src/main.rs"
 
 [[bin]]
-name = "stt-server-next"
+name = "stt-server"
 path = "src/bin/server.rs"
 
 [profile.release]

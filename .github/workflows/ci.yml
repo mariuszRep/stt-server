@@ -1,0 +1,41 @@
+name: CI
+
+# workflow_dispatch-only, deliberately: build and test happen locally first
+# (npm run vt -- server dev), and candidate-server.yml (npm run vt -- server
+# uat) is the real on-demand cloud check. Not wired to push or PR, so merging
+# never spends Actions minutes. Still runnable by hand.
+on:
+  workflow_dispatch:
+
+jobs:
+  rust:
+    runs-on: windows-latest
+    env:
+      TRANSCRIBE_CMAKE_ARGS: "-DGGML_NATIVE=OFF -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded"
+      RUSTFLAGS: "-C target-feature=+crt-static"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The engine's Vulkan backend links against the Vulkan SDK import library.
+      - name: Install the Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          vulkan_version: 1.4.309.0
+          install_runtime: false
+          cache: true
+          stripdown: true
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --release --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --release

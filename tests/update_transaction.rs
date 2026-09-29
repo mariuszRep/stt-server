@@ -8,11 +8,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use stt_server_next::cli::RunFlags;
-use stt_server_next::update_transaction::{self, Journal, Launch, Phase, TaskRunner};
-use stt_server_next::verify::sha256_file;
+use stt_server::cli::RunFlags;
+use stt_server::update_transaction::{self, Journal, Launch, Phase, TaskRunner};
+use stt_server::verify::sha256_file;
 
-const EXE: &str = env!("CARGO_BIN_EXE_stt-server-next");
+const EXE: &str = env!("CARGO_BIN_EXE_stt-server");
 
 /// No-op recovery-task registration: these tests drive `worker()` directly
 /// and never rely on Task Scheduler.
@@ -37,7 +37,7 @@ impl Drop for Fixture {
     }
 }
 
-/// Lays out `<root>/bin/stt-server-next.exe` (a writable copy of the real
+/// Lays out `<root>/bin/stt-server.exe` (a writable copy of the real
 /// binary) and `<root>/data`, matching what `update_transaction` expects:
 /// the work dir is a sibling of the executable, named after the journal id.
 fn fixture(label: &str) -> Fixture {
@@ -49,7 +49,7 @@ fn fixture(label: &str) -> Fixture {
     let data_dir = root.join("data");
     fs::create_dir_all(&bin_dir).unwrap();
     fs::create_dir_all(&data_dir).unwrap();
-    let exe_path = bin_dir.join("stt-server-next.exe");
+    let exe_path = bin_dir.join("stt-server.exe");
     fs::copy(EXE, &exe_path).unwrap();
     Fixture {
         root,
@@ -92,7 +92,7 @@ fn journal_for(fixture: &Fixture, port: u16, phase: Phase) -> Journal {
         ready_model: None,
         old_version: version.clone(),
         new_version: version,
-        api_level: stt_server_next::api::API_LEVEL,
+        api_level: stt_server::api::API_LEVEL,
         network_mode: "local".into(),
         old_sha256: hash.clone(),
         new_sha256: hash,
@@ -262,7 +262,7 @@ fn launch_settings_are_preserved_across_the_restart() {
     journal.launch.flags = RunFlags {
         port: Some(54449),
         host: Some("0.0.0.0".into()),
-        network: Some(stt_server_next::network::NetworkMode::Lan),
+        network: Some(stt_server::network::NetworkMode::Lan),
         data_dir: Some(fx.data_dir.clone()),
         cors_origins: vec!["https://client.example".into()],
         ..Default::default()

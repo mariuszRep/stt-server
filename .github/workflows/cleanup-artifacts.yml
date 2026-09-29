@@ -1,0 +1,74 @@
+name: Cleanup Artifacts
+
+# Deletes Actions artifacts older than `older_than_days`, always keeping the
+# newest artifact per name (so the latest candidate run's complete set —
+# the set release.yml would promote — is never pruned out from under it).
+# Weekly cron runs for real; manual dispatch dry-runs by default.
+
+on:
+  schedule:
+    - cron: "23 4 * * 1" # Mondays 04:23 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Report what would be deleted without deleting anything"
+        required: false
+        type: boolean
+        default: true
+      older_than_days:
+        description: "Delete artifacts older than this many days (newest per name is always kept)"
+        required: false
+        type: number
+        default: 7
+
+# actions:write covers artifact deletion AND the reads below; contents:read
+# is listed because declaring any `permissions` block zeroes unlisted scopes.
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    env:
+      # No checkout in this job — gh does not read GITHUB_REPOSITORY on its
+      # own, so GH_REPO must be set explicitly.
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Prune old artifacts
+        shell: bash
+        env:
+          DRY: ${{ github.event_name == 'schedule' && 'false' || inputs.dry_run }}
+          DAYS: ${{ inputs.older_than_days || '7' }}
+        run: |
+          set -euo pipefail
+          cutoff=$(date -u -d "${DAYS} days ago" +%Y-%m-%dT%H:%M:%SZ)
+          tmp=$(mktemp)
+          gh api "repos/${GH_REPO}/actions/artifacts?per_page=100" --paginate \
+            -q '.artifacts[] | select(.expired==false) | [.name, .created_at, .id, .size_in_bytes] | @tsv' \
+            | sort -t$'\t' -k1,1 -k2,2r > "$tmp"
+
+          # First row per name is the newest — always kept. Everything else is
+          # deleted only if older than the cutoff (ISO strings compare
+          # chronologically as plain strings).
+          awk -F'\t' -v cutoff="$cutoff" 'BEGIN{OFS="\t"}
+            { c[$1]++; if (c[$1] > 1 && $2 < cutoff) print $3, $1, $2 }' "$tmp" > "$tmp.del"
+
+          total=$(wc -l < "$tmp.del" | tr -d ' ')
+          echo "Cutoff: ${cutoff} (${DAYS}d). Candidates for deletion: ${total}"
+          cat "$tmp.del" || true
+
+          if [ "${DRY}" = "true" ]; then
+            echo "Dry run — nothing deleted."
+            exit 0
+          fi
+
+          n=0
+          while IFS=$'\t' read -r id name created; do
+            gh api -X DELETE "repos/${GH_REPO}/actions/artifacts/${id}" >/dev/null
+            n=$((n+1))
+            echo "deleted ${n}/${total}  ${name} (${created})"
+            if [ $((n % 5)) -eq 0 ]; then sleep 3; fi
+          done < "$tmp.del"
+          echo "Done: ${n} artifacts deleted."

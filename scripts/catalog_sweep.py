@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unattended catalog sweep for stt-server-next.
+"""Unattended catalog sweep for stt-server.
 
 Starts an isolated server instance (own --data-dir and port, never the
 user's real data/models), then walks every model+quant in the pinned
@@ -47,8 +47,8 @@ from pathlib import Path
 # Defaults
 # ---------------------------------------------------------------------------
 
-DEFAULT_EXE_DEBUG = r"D:\Users\mariu\Projects\stt-server-next\s\debug\stt-server-next.exe"
-DEFAULT_EXE_RELEASE = r"D:\Users\mariu\Projects\stt-server-next\s\release\stt-server-next.exe"
+DEFAULT_EXE_DEBUG = r"D:\Users\mariu\Projects\voice-typer\stt-server\s\debug\stt-server.exe"
+DEFAULT_EXE_RELEASE = r"D:\Users\mariu\Projects\voice-typer\stt-server\s\release\stt-server.exe"
 DEFAULT_DATA_DIR = os.path.expandvars(
     r"%LOCALAPPDATA%\OpenVibeAI\STT Server Sweep"
 )
@@ -268,7 +268,7 @@ class Server:
                 )
             try:
                 status, body = http_json("GET", self.base_url + "/health", timeout=2.0)
-                if status == 200 and isinstance(body, dict) and body.get("service") == "stt-server-next":
+                if status == 200 and isinstance(body, dict) and body.get("service") == "stt-server":
                     break
             except Exception:
                 pass

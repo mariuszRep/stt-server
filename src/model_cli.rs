@@ -28,7 +28,7 @@ impl std::fmt::Display for ConnectError {
         match self {
             ConnectError::NotRunning => write!(
                 f,
-                "server is not running for this data directory (start it with `stt-server-next start`)"
+                "server is not running for this data directory (start it with `stt-server start`)"
             ),
             ConnectError::TokenUnreadable(error) => {
                 write!(f, "could not read the auth token: {error}")

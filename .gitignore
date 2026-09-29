@@ -16,3 +16,7 @@ stereo-smoke.err
 *.db-shm
 *.db-wal
 __pycache__/
+candidate-build/
+local-candidate-promote/
+candidate-download/
+.last-candidate.json

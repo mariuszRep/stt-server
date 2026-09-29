@@ -1,14 +1,14 @@
 //! "Instant startup, model loads in background": run against the real
-//! compiled binary. `STT_NEXT_TEST_SLOW_LOAD_MS` (see `app::open_app_at_full`)
+//! compiled binary. `STT_SERVER_TEST_SLOW_LOAD_MS` (see `app::open_app_at_full`)
 //! simulates a huge or CPU-fallback model's slow load without a real GGUF.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use stt_server_next::discovery;
+use stt_server::discovery;
 
-const EXE: &str = env!("CARGO_BIN_EXE_stt-server-next");
+const EXE: &str = env!("CARGO_BIN_EXE_stt-server");
 
 struct ChildGuard {
     child: Child,
@@ -31,7 +31,7 @@ fn cli(args: &[&str], data_dir: &Path) -> i32 {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .expect("failed to run stt-server-next")
+        .expect("failed to run stt-server")
         .code()
         .unwrap_or(-1)
 }
@@ -51,11 +51,11 @@ fn stop_and_status_work_while_a_slow_model_load_is_in_progress() {
             ])
             .arg(&data_dir)
             // Much longer than the deadlines below, so every check runs mid-load.
-            .env("STT_NEXT_TEST_SLOW_LOAD_MS", "30000")
+            .env("STT_SERVER_TEST_SLOW_LOAD_MS", "30000")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("failed to launch stt-server-next"),
+            .expect("failed to launch stt-server"),
         data_dir: data_dir.clone(),
     };
 

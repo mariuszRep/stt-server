@@ -346,7 +346,7 @@ fn cors_layer(origins: &[String]) -> CorsLayer {
 /// never mistake an unrelated program answering "200 OK" on the configured
 /// port for this server (independent review L2): a `service` field identity
 /// check, not just a successful status code.
-pub const SERVICE_ID: &str = "stt-server-next";
+pub const SERVICE_ID: &str = "stt-server";
 
 /// Bumped whenever a client must change to keep working against this
 /// server -- a breaking request/response shape change, a route removed, a
@@ -2036,7 +2036,7 @@ mod router_tests {
     #[tokio::test]
     async fn options_preflight_default_locked_down_reports_no_cors_headers() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         assert!(app.cors_origins.is_empty());
         let router = router(app.clone());
@@ -2063,7 +2063,7 @@ mod router_tests {
     #[tokio::test]
     async fn request_without_origin_header_is_unaffected_by_cors() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let router = router(app.clone());
@@ -2091,7 +2091,7 @@ mod router_tests {
     #[tokio::test]
     async fn allowed_origin_gets_cors_headers_and_preflight_others_do_not() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = crate::app::open_app_at_full(
             path.clone(),
             crate::app::RuntimeLimits::default(),
@@ -2157,7 +2157,7 @@ mod router_tests {
     #[tokio::test]
     async fn wildcard_when_explicitly_set_allows_any_origin() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = crate::app::open_app_at_full(
             path.clone(),
             crate::app::RuntimeLimits::default(),
@@ -2189,7 +2189,7 @@ mod router_tests {
     #[tokio::test]
     async fn get_protected_route_without_token_is_unauthorized() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let router = router(app.clone());
         let request = Request::builder()
@@ -2206,7 +2206,7 @@ mod router_tests {
     #[tokio::test]
     async fn patch_config_rejects_a_bad_origin() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let router = router(app.clone());
@@ -2226,7 +2226,7 @@ mod router_tests {
     #[tokio::test]
     async fn patch_config_accepts_valid_origins_and_requires_restart() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let router = router(app.clone());
@@ -2254,7 +2254,7 @@ mod router_tests {
     #[tokio::test]
     async fn get_config_defaults_to_unbounded_limits() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let router = router(app.clone());
@@ -2280,7 +2280,7 @@ mod router_tests {
     #[tokio::test]
     async fn patch_config_sets_and_clears_limits_live_and_round_trips_via_get() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let router = router(app.clone());
@@ -2361,7 +2361,7 @@ mod router_tests {
     #[tokio::test]
     async fn patch_config_rejects_zero_and_negative_limits() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let router = router(app.clone());
@@ -2390,7 +2390,7 @@ mod router_tests {
     #[tokio::test]
     async fn install_with_invalid_quant_returns_400() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let router = router(app.clone());
@@ -2454,7 +2454,7 @@ mod router_tests {
     #[tokio::test]
     async fn translations_without_token_is_unauthorized() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let router = router(app.clone());
         let boundary = "X-BOUNDARY";
@@ -2477,7 +2477,7 @@ mod router_tests {
     #[tokio::test]
     async fn translations_with_token_and_no_model_loaded_is_server_not_ready() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let router = router(app.clone());
@@ -2511,7 +2511,7 @@ mod router_tests {
     #[tokio::test]
     async fn transcription_naming_an_unknown_model_is_404_model_not_installed() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let router = router(app.clone());
@@ -2549,10 +2549,10 @@ mod router_tests {
     #[tokio::test]
     async fn transcription_naming_an_unverified_model_is_409_needs_verification() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
-        let dropdir = parent.join(format!("stt-server-next-dropin-{}", Uuid::new_v4()));
+        let dropdir = parent.join(format!("stt-server-dropin-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dropdir).unwrap();
         let file_path = dropdir.join("mine.gguf");
         std::fs::write(&file_path, b"user file bytes").unwrap();
@@ -2599,10 +2599,10 @@ mod router_tests {
     #[tokio::test]
     async fn openai_models_lists_only_callable_models_with_default_flag() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
-        let dropdir = parent.join(format!("stt-server-next-dropin-{}", Uuid::new_v4()));
+        let dropdir = parent.join(format!("stt-server-dropin-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dropdir).unwrap();
         let verified_path = dropdir.join("verified.gguf");
         std::fs::write(&verified_path, b"verified file bytes").unwrap();
@@ -2697,7 +2697,7 @@ mod router_tests {
     #[tokio::test]
     async fn openai_model_entry_reports_catalog_languages_when_unloaded() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let model = app.catalog[0].clone();
@@ -2738,7 +2738,7 @@ mod router_tests {
     #[tokio::test]
     async fn openai_model_entry_reports_live_languages_when_loaded() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let model = app.catalog[0].clone();
@@ -2824,7 +2824,7 @@ mod router_tests {
     #[tokio::test]
     async fn openai_model_entry_reports_catalog_name() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let model = app.catalog[0].clone();
@@ -2861,7 +2861,7 @@ mod router_tests {
     #[tokio::test]
     async fn openai_model_entry_reports_custom_name_or_friendly_fallback() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         {
@@ -2917,7 +2917,7 @@ mod router_tests {
     #[tokio::test]
     async fn custom_model_view_reports_custom_name_or_friendly_fallback() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         {
@@ -2969,7 +2969,7 @@ mod router_tests {
     #[tokio::test]
     async fn readiness_reports_loading_model_and_elapsed_while_loading() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         *app.loading.lock().unwrap() = Some(crate::engine::LoadingStatus::new(
             "voxtral-small-24b".to_owned(),
@@ -3002,7 +3002,7 @@ mod router_tests {
     #[tokio::test]
     async fn transcription_while_model_is_loading_is_503_model_loading() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         *app.loading.lock().unwrap() =
             Some(crate::engine::LoadingStatus::new("slow-model".to_owned()));
@@ -3039,7 +3039,7 @@ mod router_tests {
     #[tokio::test]
     async fn select_model_while_loading_is_409_model_loading() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         *app.loading.lock().unwrap() =
             Some(crate::engine::LoadingStatus::new("slow-model".to_owned()));
@@ -3069,7 +3069,7 @@ mod router_tests {
         // loaded-model check (503 `server_not_ready`, no model loaded in this
         // test) proves the multipart parse no longer rejects it.
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let router = router(app.clone());
@@ -3102,7 +3102,7 @@ mod router_tests {
         // happens before the loaded-model / capability-aware planning check,
         // so this is 422 even with no model loaded.
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let router = router(app.clone());
@@ -3136,7 +3136,7 @@ mod router_tests {
     #[tokio::test]
     async fn transcriptions_duplicate_field_is_400() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let router = router(app.clone());
@@ -3170,7 +3170,7 @@ mod router_tests {
     #[tokio::test]
     async fn patch_config_rejects_nonexistent_or_relative_user_models_dir() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let router = router(app.clone());
@@ -3196,11 +3196,11 @@ mod router_tests {
     #[tokio::test]
     async fn patch_config_accepts_and_round_trips_an_existing_absolute_user_models_dir() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let router = router(app.clone());
-        let dropdir = parent.join(format!("stt-server-next-dropin-{}", Uuid::new_v4()));
+        let dropdir = parent.join(format!("stt-server-dropin-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dropdir).unwrap();
         let dropdir_json = serde_json::to_string(&dropdir.to_string_lossy()).unwrap();
 
@@ -3238,13 +3238,26 @@ mod router_tests {
     #[tokio::test]
     async fn refresh_returns_202_and_the_operation_completes() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let router = router(app.clone());
-        // No user_models_dir configured and no LOCALAPPDATA default in this
-        // test process, so the operation completes fast (an unconfigured
-        // folder is a `failed` terminal state, still reachable via polling).
+        // Point the drop-in folder at an empty temp dir so the scan never
+        // touches the real per-user models folder of whoever runs the tests.
+        let dropdir = parent.join(format!("stt-server-dropin-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dropdir).unwrap();
+        let dropdir_json = serde_json::to_string(&dropdir.to_string_lossy()).unwrap();
+        let patch_request = Request::builder()
+            .method("PATCH")
+            .uri("/v1/local/config")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                "{{\"user_models_dir\":{dropdir_json}}}"
+            )))
+            .unwrap();
+        let response = router.clone().oneshot(patch_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
         let request = Request::builder()
             .method("POST")
             .uri("/models/manage/refresh")
@@ -3285,16 +3298,17 @@ mod router_tests {
 
         drop(router);
         drop(app);
-        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+        // A background refresh can still hold a file briefly; a leftover temp dir is harmless.
+        let _ = std::fs::remove_dir_all(path.canonicalize().unwrap());
     }
 
     #[tokio::test]
     async fn remove_of_user_folder_model_keeps_the_file() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
-        let dropdir = parent.join(format!("stt-server-next-dropin-{}", Uuid::new_v4()));
+        let dropdir = parent.join(format!("stt-server-dropin-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dropdir).unwrap();
         let file_path = dropdir.join("mine.gguf");
         std::fs::write(&file_path, b"user file bytes").unwrap();
@@ -3334,10 +3348,10 @@ mod router_tests {
     #[tokio::test]
     async fn select_of_a_needs_verification_model_is_refused() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
-        let dropdir = parent.join(format!("stt-server-next-dropin-{}", Uuid::new_v4()));
+        let dropdir = parent.join(format!("stt-server-dropin-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dropdir).unwrap();
         let file_path = dropdir.join("mine.gguf");
         std::fs::write(&file_path, b"user file bytes").unwrap();
@@ -3394,7 +3408,7 @@ mod router_tests {
     #[tokio::test]
     async fn health_reports_version_and_api_level() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let router = router(app.clone());
         let request = Request::builder()
@@ -3418,7 +3432,7 @@ mod router_tests {
     #[tokio::test]
     async fn health_and_readiness_report_default_and_loaded_model_fields() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let router = router(app.clone());
@@ -3456,7 +3470,7 @@ mod router_tests {
     #[tokio::test]
     async fn health_reports_local_mode_by_default_with_no_reason_or_addresses() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let router = router(app.clone());
         let request = Request::builder()
@@ -3480,7 +3494,7 @@ mod router_tests {
     #[tokio::test]
     async fn health_reports_custom_mode_for_an_explicit_host_override() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = crate::app::open_app_at_full(
             path.clone(),
             crate::app::RuntimeLimits::default(),
@@ -3520,7 +3534,7 @@ mod router_tests {
     #[tokio::test]
     async fn network_gate_allows_health_from_anywhere_ungated() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let router = gated_router(app.clone());
         let request = with_peer(
@@ -3539,7 +3553,7 @@ mod router_tests {
     #[tokio::test]
     async fn network_gate_rejects_lan_peer_when_mode_is_local() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let router = gated_router(app.clone());
@@ -3565,7 +3579,7 @@ mod router_tests {
     #[tokio::test]
     async fn network_gate_allows_loopback_peer_regardless_of_mode() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let router = gated_router(app.clone());
@@ -3586,7 +3600,7 @@ mod router_tests {
     #[tokio::test]
     async fn network_gate_allows_lan_peer_once_the_live_report_says_lan() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = crate::app::open_app_at_full(
             path.clone(),
             crate::app::RuntimeLimits::default(),
@@ -3617,7 +3631,7 @@ mod router_tests {
     #[tokio::test]
     async fn network_gate_allows_a_custom_host_override_from_any_peer() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = crate::app::open_app_at_full(
             path.clone(),
             crate::app::RuntimeLimits::default(),
@@ -3648,7 +3662,7 @@ mod router_tests {
     #[tokio::test]
     async fn config_patch_rejects_invalid_network_mode() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let router = router(app.clone());
@@ -3673,7 +3687,7 @@ mod router_tests {
     #[tokio::test]
     async fn config_patch_accepts_a_valid_network_mode_and_reports_restart_required() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let router = router(app.clone());
@@ -3711,7 +3725,7 @@ mod router_tests {
     #[tokio::test]
     async fn shutdown_without_token_is_unauthorized() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let router = router(app.clone());
         let request = with_peer(
@@ -3731,7 +3745,7 @@ mod router_tests {
     #[tokio::test]
     async fn shutdown_from_non_loopback_peer_is_forbidden_even_with_a_valid_token() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let router = router(app.clone());
@@ -3753,7 +3767,7 @@ mod router_tests {
     #[tokio::test]
     async fn shutdown_from_loopback_with_valid_token_succeeds_and_fires_the_signal() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -3778,7 +3792,7 @@ mod router_tests {
     #[tokio::test]
     async fn config_get_reports_effective_and_stored_bind() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = crate::app::open_app_at_full(
             path.clone(),
             crate::app::RuntimeLimits::default(),
@@ -3811,7 +3825,7 @@ mod router_tests {
     #[tokio::test]
     async fn config_patch_rejects_invalid_bind_host_and_port() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let router = router(app.clone());
@@ -3841,7 +3855,7 @@ mod router_tests {
     #[tokio::test]
     async fn config_patch_accepts_valid_bind_host_and_port_and_reports_restart_required() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let router = router(app.clone());
@@ -3926,7 +3940,7 @@ mod router_tests {
     #[tokio::test]
     async fn user_token_is_allowed_on_every_user_route() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let user_token = app.user_token.clone();
         for (method, route_path, body) in user_routes() {
@@ -3951,7 +3965,7 @@ mod router_tests {
     #[tokio::test]
     async fn user_token_is_forbidden_with_admin_required_on_every_admin_route() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let user_token = app.user_token.clone();
         for (method, route_path, body) in admin_routes() {
@@ -4012,7 +4026,7 @@ mod router_tests {
     #[tokio::test]
     async fn admin_token_is_allowed_on_every_route_user_and_admin() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let admin_token = app.token.clone();
         for (method, route_path, body) in
@@ -4041,7 +4055,8 @@ mod router_tests {
         // outcome; here we only need it to be done, not what it did).
         tokio::time::sleep(Duration::from_millis(100)).await;
         drop(app);
-        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+        // A background refresh can still hold a file briefly; a leftover temp dir is harmless.
+        let _ = std::fs::remove_dir_all(path.canonicalize().unwrap());
     }
 
     /// The old `/v1/local/models*`, `/v1/local/recommendations` and
@@ -4051,7 +4066,7 @@ mod router_tests {
     #[tokio::test]
     async fn old_local_models_paths_are_gone() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let old_paths: Vec<(&str, &str)> = vec![
@@ -4094,7 +4109,7 @@ mod router_tests {
     #[tokio::test]
     async fn static_models_manage_routes_take_precedence_over_id_capture() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
 
@@ -4161,7 +4176,8 @@ mod router_tests {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         drop(app);
-        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+        // A background refresh can still hold a file briefly; a leftover temp dir is harmless.
+        let _ = std::fs::remove_dir_all(path.canonicalize().unwrap());
     }
 }
 

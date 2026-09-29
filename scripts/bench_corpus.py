@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark harness for running the stt-server-next transcription API over a
+"""Benchmark harness for running the stt-server transcription API over a
 corpus of recorded voice-typer sessions.
 
 Python 3 stdlib only. See CLAUDE.md task spec for details.

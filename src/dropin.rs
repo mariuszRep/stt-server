@@ -585,7 +585,7 @@ mod tests {
 
     fn temp_dir() -> PathBuf {
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        parent.join(format!("stt-server-next-test-{}", uuid::Uuid::new_v4()))
+        parent.join(format!("stt-server-test-{}", uuid::Uuid::new_v4()))
     }
 
     #[cfg(windows)]

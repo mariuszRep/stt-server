@@ -1,0 +1,72 @@
+name: Server Candidate
+
+# Builds the one Windows executable that release.yml later promotes and stores
+# it, with its checksum and provenance manifest, in a private draft Release
+# named candidate-<sha>. That candidate is what a human acceptance-tests before
+# tagging. workflow_dispatch-only, deliberately: merging never builds anything.
+# Run it with `npm run vt -- server uat` from voice-typer/ root, or use
+# `npm run vt -- server uat --local` to build on this machine with zero
+# Actions minutes (same assets, same contract).
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch or commit to build (defaults to the current default branch)"
+        required: false
+        type: string
+
+jobs:
+  candidate:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      TRANSCRIBE_CMAKE_ARGS: "-DGGML_NATIVE=OFF -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded"
+      RUSTFLAGS: "-C target-feature=+crt-static"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install the Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          vulkan_version: 1.4.309.0
+          install_runtime: false
+          cache: true
+          stripdown: true
+
+      - name: Build
+        run: cargo build --release --bin stt-server
+
+      - name: Stage candidate files
+        shell: bash
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/stt-server.exe dist/stt-server.exe
+          (cd dist && sha256sum stt-server.exe | sed 's/  / */' > stt-server.exe.sha256 && cat stt-server.exe.sha256)
+          printf '{"commit":"%s","run_id":"%s","run_url":"%s","builder":"%s","built_at":"%s"}\n' \
+            "$(git rev-parse HEAD)" "${{ github.run_id }}" "${RUN_URL}" \
+            "${{ github.workflow }}/${{ github.job }}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > dist/manifest.json
+
+      - name: Store the candidate in a private draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          tag="candidate-${sha}"
+          gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$tag" --draft --target "$sha" \
+            --title "UAT candidate ${sha}" \
+            --notes "Private server UAT candidate from ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}." \
+            dist/*
