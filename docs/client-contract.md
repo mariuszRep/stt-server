@@ -313,23 +313,30 @@ or descriptors.
   models the OpenAI-shaped `/v1/models` list never shows (not-yet-downloaded
   catalog entries), deliberately outside `/v1`.
 - **OpenAI-shaped list:** `GET /v1/models` -- `{"object": "list", "data":
-  [{"id", "object": "model", "owned_by": "local", "default": bool,
-  "capabilities": ControlCapability-map, "languages": [string, ...],
+  [{"id", "object": "model", "owned_by": "local", "name": string, "default":
+  bool, "capabilities": ControlCapability-map, "languages": [string, ...],
   "language_detect": bool}, ...]}`, listing only **callable** models:
   downloaded and verified, catalog or custom (drop-in). A model that is
   downloaded but still `needs_verification` is never listed here (a request
-  naming it gets `409 needs_verification`, same as before). `default` marks
-  the one model that a request with no `model` field, or `"model":"default"`,
-  resolves to. `capabilities` is the live (`capabilities::EffectiveCaps`) view
-  for any model this server process has loaded at least once (cached per
-  model id even after it is no longer resident), falling back to the
-  catalog's static view (4.1) for a callable model never yet loaded.
-  `languages` and `language_detect` are top-level convenience fields derived
-  from that same live-or-catalog view: the loaded model's supported language
-  codes and whether it can auto-detect language, or the catalog/custom
-  model's static claim when never loaded. `GET /v1/models/{id}` returns one
-  such entry directly (not wrapped in `{"data": [...]}}`), or `404
-  model_not_installed` if `id` is not callable.
+  naming it gets `409 needs_verification`, same as before). `name` is a
+  friendly display name: the catalog's `name` for a catalog model; for a
+  custom/drop-in model, the user-set `custom_name` if present, otherwise a
+  friendly name derived from the installed file's filename (extension
+  stripped, words split on `-`/`_`/spaces and title-cased, with
+  quantization/precision tokens such as `Q5_K_M`, `Q4_0`, `F16`, `F32` kept
+  upper-case) -- the same derivation `GET /models/manage` uses for a
+  drop-in's `name`. `default` marks the one model that a request with no
+  `model` field, or `"model":"default"`, resolves to. `capabilities` is the
+  live (`capabilities::EffectiveCaps`) view for any model this server
+  process has loaded at least once (cached per model id even after it is no
+  longer resident), falling back to the catalog's static view (4.1) for a
+  callable model never yet loaded. `languages` and `language_detect` are
+  top-level convenience fields derived from that same live-or-catalog view:
+  the loaded model's supported language codes and whether it can
+  auto-detect language, or the catalog/custom model's static claim when
+  never loaded. `GET /v1/models/{id}` returns one such entry directly (not
+  wrapped in `{"data": [...]}}`), or `404 model_not_installed` if `id` is
+  not callable.
 - **Recommendations:** `GET /models/manage/recommendations` -- the curated,
   hardware-independent recommended subset in fixed rank order (`recommended`
   + `recommended_rank` from the catalog; per `CONVENTIONS.md`, hardware

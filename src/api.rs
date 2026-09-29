@@ -499,6 +499,72 @@ fn effective_view_if_loaded(app: &App, id: &str) -> ApiResult<Option<Value>> {
         }))
 }
 
+/// A quantization/precision token (`Q5_K_M`, `Q4_0`, `F16`, `F32`, `Q8_0`,
+/// ...) is kept upper-case rather than title-cased when deriving a friendly
+/// name from a filename: a leading `Q<digit>` (optionally followed by more
+/// `_`-joined alphanumeric groups) or a bare `F16`/`F32`.
+fn is_quant_token(word: &str) -> bool {
+    let upper = word.to_ascii_uppercase();
+    let mut chars = upper.chars();
+    match chars.next() {
+        Some('Q') => matches!(chars.next(), Some(c) if c.is_ascii_digit()),
+        Some('F') => upper == "F16" || upper == "F32",
+        _ => false,
+    }
+}
+
+/// Derive a friendly display name for a drop-in (custom) model from its
+/// underlying `.gguf` file name: strip the extension, split on `-`, `_` and
+/// spaces, title-case each word, but keep known quantization tokens (e.g.
+/// `Q5_K_M`, `Q4_0`, `F16`, `F32`, `Q8_0`) upper-case instead of
+/// title-casing them.
+pub fn friendly_model_name(filename: &str) -> String {
+    let stem = filename.strip_suffix(".gguf").unwrap_or(filename);
+    // Split on `-` and whitespace first, *not* `_`: a quant token like `Q5_K_M` is itself
+    // `_`-joined, and splitting on `_` unconditionally would break it into `Q5`/`K`/`M` before
+    // `is_quant_token` (which matches on the whole token) ever gets a chance to see it. Each
+    // `-`/whitespace-delimited chunk is checked whole first; only a non-quant chunk is split
+    // further on `_` into individual words.
+    stem.split(|c: char| c == '-' || c.is_whitespace())
+        .filter(|chunk| !chunk.is_empty())
+        .flat_map(|chunk| {
+            if is_quant_token(chunk) {
+                vec![chunk.to_ascii_uppercase()]
+            } else {
+                chunk
+                    .split('_')
+                    .filter(|word| !word.is_empty())
+                    .map(|word| {
+                        let mut chars = word.chars();
+                        match chars.next() {
+                            Some(first) => {
+                                first.to_uppercase().collect::<String>()
+                                    + &chars.as_str().to_ascii_lowercase()
+                            }
+                            None => String::new(),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The `name` field for an installed custom (drop-in) model: the user-set
+/// `custom_name` if present, otherwise a friendly name derived from the
+/// underlying file name (falling back to the model `id` if no file name is
+/// on record).
+fn custom_model_name(installed: &crate::store::InstalledFile) -> String {
+    installed.custom_name.clone().unwrap_or_else(|| {
+        installed
+            .filename
+            .as_deref()
+            .map(friendly_model_name)
+            .unwrap_or_else(|| installed.id.clone())
+    })
+}
+
 /// Build the `/models/manage` view for an installed custom model (a
 /// drop-in file whose header, not the catalog, is the source of its
 /// metadata). See "Integration rules": `source`, `custom: true`, an
@@ -510,7 +576,7 @@ fn custom_model_view(installed: &crate::store::InstalledFile) -> Value {
     let multi_language = languages.len() > 1;
     json!({
         "id": installed.id,
-        "name": installed.custom_name.clone().unwrap_or_else(|| installed.id.clone()),
+        "name": custom_model_name(installed),
         "architecture": installed.custom_arch,
         "languages": languages,
         "source": installed.source,
@@ -626,6 +692,16 @@ fn openai_model_entry(app: &App, id: &str, default_id: Option<&str>) -> ApiResul
     let catalog_fallback = catalog_model.map(capability_matrix);
     let capabilities = callable_capabilities(app, id, catalog_fallback)?;
 
+    let name = if let Some(model) = catalog_model {
+        model.name.clone()
+    } else {
+        let installed = installed_file(app, id)?;
+        installed
+            .as_ref()
+            .map(custom_model_name)
+            .unwrap_or_else(|| id.to_string())
+    };
+
     let languages_from_capabilities = capabilities["language_hint"]["languages"]
         .as_array()
         .cloned();
@@ -663,6 +739,7 @@ fn openai_model_entry(app: &App, id: &str, default_id: Option<&str>) -> ApiResul
         "id": id,
         "object": "model",
         "owned_by": "local",
+        "name": name,
         "default": Some(id) == default_id,
         "capabilities": capabilities,
         "languages": languages,
@@ -2706,6 +2783,180 @@ mod router_tests {
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["languages"], json!(live_languages));
         assert_eq!(body["language_detect"], json!(true));
+
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    /// `friendly_model_name` strips the `.gguf` extension, splits on `-`,
+    /// `_` and spaces, title-cases each word, and keeps quantization tokens
+    /// (`Q5_K_M`, `Q4_0`, `F16`, `Q8_0`) upper-case.
+    #[test]
+    fn friendly_model_name_derives_from_various_filename_patterns() {
+        assert_eq!(
+            friendly_model_name("ggml-tiny-en-q5_k_m.gguf"),
+            "Ggml Tiny En Q5_K_M"
+        );
+        assert_eq!(
+            friendly_model_name("parakeet_tdt_v2-Q4_0.gguf"),
+            "Parakeet Tdt V2 Q4_0"
+        );
+        assert_eq!(
+            friendly_model_name("My Custom Model F16.gguf"),
+            "My Custom Model F16"
+        );
+        assert_eq!(
+            friendly_model_name("whisper-large-v3-q8_0.gguf"),
+            "Whisper Large V3 Q8_0"
+        );
+        assert_eq!(
+            friendly_model_name("no-extension-here"),
+            "No Extension Here"
+        );
+        assert_eq!(
+            friendly_model_name("mixed_Case-AND spaces.gguf"),
+            "Mixed Case And Spaces"
+        );
+    }
+
+    /// `GET /v1/models/{id}` reports the catalog's `name` field verbatim
+    /// for a catalog model.
+    #[tokio::test]
+    async fn openai_model_entry_reports_catalog_name() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let model = app.catalog[0].clone();
+        {
+            let db = app.db.lock().unwrap();
+            db.execute(
+                "INSERT INTO installed(id,path,sha256,source) VALUES(?1,'unused','x','catalog_download')",
+                rusqlite::params![model.slug],
+            )
+            .unwrap();
+        }
+        let router = router(app.clone());
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/models/{}", model.slug))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["name"], json!(model.name));
+
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    /// `GET /v1/models/{id}` for a drop-in (custom) model: a user-set
+    /// `custom_name` wins over the derived friendly name; without one, the
+    /// name is derived from the installed file's `filename`.
+    #[tokio::test]
+    async fn openai_model_entry_reports_custom_name_or_friendly_fallback() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        {
+            let db = app.db.lock().unwrap();
+            db.execute(
+                "INSERT INTO installed(id,path,sha256,filename,source,custom_arch,custom_name) VALUES('custom-named-aaaaaaaa','unused','x','some-model-q4_0.gguf','user_folder','whisper','My Named Model')",
+                [],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO installed(id,path,sha256,filename,source,custom_arch) VALUES('custom-unnamed-bbbbbbbb','unused','x','ggml-tiny-en-q5_k_m.gguf','user_folder','whisper')",
+                [],
+            )
+            .unwrap();
+        }
+        let router = router(app.clone());
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/models/custom-named-aaaaaaaa")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["name"], "My Named Model");
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/models/custom-unnamed-bbbbbbbb")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["name"], "Ggml Tiny En Q5_K_M");
+
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    /// `/models/manage`'s `custom_model_view` applies the same
+    /// custom_name-override / friendly-name-derivation rule as
+    /// `openai_model_entry`.
+    #[tokio::test]
+    async fn custom_model_view_reports_custom_name_or_friendly_fallback() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-next-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        {
+            let db = app.db.lock().unwrap();
+            db.execute(
+                "INSERT INTO installed(id,path,sha256,filename,source,custom_arch,custom_name) VALUES('custom-named-aaaaaaaa','unused','x','some-model-q4_0.gguf','user_folder','whisper','My Named Model')",
+                [],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO installed(id,path,sha256,filename,source,custom_arch) VALUES('custom-unnamed-bbbbbbbb','unused','x','parakeet_tdt_v2-Q4_0.gguf','user_folder','whisper')",
+                [],
+            )
+            .unwrap();
+        }
+        let router = router(app.clone());
+        let request = Request::builder()
+            .method("GET")
+            .uri("/models/manage")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let data = body["data"].as_array().unwrap();
+        let named = data
+            .iter()
+            .find(|entry| entry["id"] == "custom-named-aaaaaaaa")
+            .unwrap();
+        assert_eq!(named["name"], "My Named Model");
+        let unnamed = data
+            .iter()
+            .find(|entry| entry["id"] == "custom-unnamed-bbbbbbbb")
+            .unwrap();
+        assert_eq!(unnamed["name"], "Parakeet Tdt V2 Q4_0");
 
         drop(app);
         std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
