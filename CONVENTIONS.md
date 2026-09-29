@@ -1,61 +1,78 @@
-# CONVENTIONS.md — STT Server
+# Conventions
 
-## Scope
+Architecture and behaviour rules. They reflect the user's decisions recorded in the workspace
+goals `build-stt-server-next` and `migrate-voice-typer-to-stt-server-next`.
 
-Applies to `stt-server` (https://github.com/mariuszRep/stt-server).
+## Shape
 
-## Architecture
+- One executable, one process, one engine: statically linked transcribe-cpp with CPU and
+  Vulkan. The GPU driver, the Vulkan loader, and Windows system libraries are the only external
+  runtime dependencies. No provider processes, connection descriptors, or ONNX runtime.
+- One resident model. Transcriptions run one at a time in arrival order. The queue has no
+  default length or wait limit; limits are optional settings. Each request keeps the model it
+  asked for even while it waits; if the model at the head of the queue differs from the one
+  resident, the server swaps before running that request, never mid-request.
 
-- Rust remains the server and CLI implementation direction.
-- The server is a local provider-management control plane.
-- Managed provider runtimes perform inference and expose the versioned local provider protocol.
-- The server returns runtime connection descriptors; it does not proxy transcription.
+## Models
 
-## Required APIs
+- Nothing downloads on first start. A request may load a downloaded model that is not yet
+  resident; a request never triggers a download or changes what model is the default.
+- Downloads come from HuggingFace only, at pinned revisions, and are accepted only after the
+  size and SHA-256 match the catalog.
+- Files dropped into the user model folder become models only after an explicit refresh hashes
+  them and reads their GGUF header. Refresh and removal never delete a user's file.
+- Recommendations use the fixed Handy-informed order. Hardware is reported, never used to rank.
+- Keep source benchmarks, editorial rank, and local measurements as separately labelled facts.
 
-- Hardware and health discovery.
-- Provider catalog, installation, update, removal, status, and runtime descriptor APIs.
-- Model catalog, download/progress, verification, selection, removal, and compatibility APIs.
-- Recommendations based on detected hardware and installed runtimes.
+## Requests
 
-## Required Conventions
+- The API follows OpenAI's audio endpoints: transcriptions, and translations to English.
+- The prompt is opaque: passed verbatim to models that accept one, rejected by models that do
+  not. The server never composes, trims, or stores prompt text.
+- A language hint the model cannot honour falls back as Handy does (auto-detect, then English,
+  then the model's first language), and the response reports what was applied.
+- Other optional fields a model cannot honour are rejected with a capability error. Clients
+  read the capability matrix and omit what is not supported.
+- Capabilities come from what the engine reports for the loaded model, cross-checked against
+  its real behaviour, never from a hand-kept list or another project's rules. The catalog list
+  gives the best static answer before loading; the selected-model view is authoritative.
+- A missing `model` field, or `"model":"default"`, means the default model. Any other value
+  names an installed model directly: the server loads it if needed, refuses with a clear error
+  if it isn't installed or isn't yet verified, and never downloads it.
+- Responses report diagnostics that exist and omit fields the engine did not produce.
 
-- Loopback is default; remote binding is explicit and authenticated.
-- Provider/model identifiers are validated, not raw paths.
-- Install/update/remove operations are observable and recover safely from partial failure.
-- A provider install may target a specific hardware-variant build (e.g. CPU vs GPU); variants are cached independently (installing one never evicts another), and an install that requires a large download reports observable async progress rather than blocking silently.
-- Runtime descriptors include provider identity, status, protocol/version, transport, endpoint, and capabilities.
-- Consume the published, versioned `stt-sdk` library for shared provider communication and contract validation where it prevents duplication; never import SDK source by repository-relative path.
-- Keep hardware detection, installation, model storage, and process supervision server-owned.
+## Operation
 
-## Forbidden
+- Two roles. Part of an application (default): launched by the client app, stopped with it,
+  managed through the API; the CLI covers only what the API cannot (process start, update,
+  autostart, service). Shared server: runs on its own and clients attach without stopping it.
+- Two install scopes, each with exactly one data folder used by every mode: per user
+  (`%LOCALAPPDATA%\OpenVibeAI\STT Server`, no admin) and machine-wide (Program Files plus
+  `%ProgramData%\OpenVibeAI\STT Server`, admin once). Scope follows where the executable
+  lives. The Windows Service exists only for machine-wide installs.
+- One server per data folder, discoverable through its `server.json` file. Clients always read
+  the port from it: a per-user server whose preferred port is taken picks a free one; a
+  machine-wide server keeps its fixed port.
+- Two tokens: the admin token (administrators only) reaches everything; the user token
+  (readable by every local user on a machine-wide install) reaches transcription, translation,
+  model listing, readiness and system information. A user token on an admin route gets
+  `403 admin_required`.
+- Network modes: `local` (default, loopback only), `lan` (other devices only while every active
+  Windows network is Private or Domain), `tailscale` (other devices only from Tailscale
+  addresses). Anything beyond health from another device needs a token. Shutdown accepts only
+  local callers.
+- Browsers are refused by default (no CORS origins); origins are allowed only when explicitly
+  configured.
+- The server answers immediately at startup and loads the selected model in the background;
+  status and stop always work during a load.
+- Health reports the version and an `api_level` that increases whenever clients must change.
+- State lives in SQLite with versioned forward migrations and a backup before each migration.
+- Long-running model work is a durable operation that survives restarts.
 
-- No normal batch-transcription endpoint, realtime transcription WebSocket, audio buffer, audio transcoder, or inference adapter in the server data path.
-- No cloud provider API adapter in the server.
-- No invisible model download during inference.
-- No direct application coupling; the server API is usable independently.
+## Engineering
 
-## Provider Engine Architecture
-
-- Provider/engine lifecycle logic is trait-based and pluggable (a `ProviderEngine` implementation
-  per engine, dispatched through a registry), never a hardcoded per-engine `if`/`match` chain in
-  `RuntimeManager`. Adding an engine is a catalog entry plus one new adapter module — not a
-  parallel reimplementation of install/cache/uninstall machinery.
-- **Engine selection criteria** — a new engine is only added when it has: an actively-maintained
-  *official* upstream Git repository (not a fork, mirror, or single-maintainer experimental
-  project); genuine, broad community adoption (not just technical merit in isolation); a
-  redistribution-compatible license (MIT/Apache/BSD-style preferred), verified against the
-  project's actual current `LICENSE` file at selection time, never assumed.
-- **Minimize binaries the server itself builds and hosts.** An engine's adapter should fetch
-  release assets from *its own upstream* project's official releases by default. The server only
-  builds and hosts its own binary for an engine when no official upstream release exists at all —
-  this is the exception (faster-whisper needs it because CTranslate2/faster-whisper ships only a
-  pip package, no standalone executable), not the default expectation for every future engine.
-
-## API Completeness
-
-The HTTP API is the primary control surface and should expose as much of the server's
-functionality as reasonably possible. The CLI is a thin convenience wrapper over the same
-operations, not a separate capability surface. Consuming applications must drive the server via
-the API; they must never shell out to CLI subcommands to reach a capability the API doesn't yet
-cover — that gap is a signal to extend the API, not a reason for a client to depend on the CLI.
+- Build and test locally first. Candidate and release builds are dispatch-only, and a release
+  promotes the exact tested binary and its checksum; rebuilding is not reproducible.
+- Code adapted from Handy (MIT) keeps an attribution comment and the notice in
+  `THIRD_PARTY_NOTICES.md`.
+- Personal dictation audio and transcripts used for testing never enter the repository.

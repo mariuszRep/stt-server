@@ -1,61 +1,57 @@
-[workspace]
-members = [
-    "crates/common",
-    "crates/runtime",
-    "crates/server",
-    "crates/cli",
-]
-resolver = "2"
-
-[workspace.package]
-version = "0.2.10"
+[package]
+name = "stt-server-next"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/example/stt-server"
 
-[workspace.dependencies]
-# Async runtime
-tokio = { version = "1", features = ["full"] }
-tokio-stream = "0.1"
-async-trait = "0.1"
-futures = "0.3"
+[lib]
+name = "stt_server_next"
+path = "src/lib.rs"
 
-# Web framework
-axum = { version = "0.7", features = ["ws", "macros"] }
-tower = { version = "0.4", features = ["util"] }
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+[dependencies]
+transcribe-cpp = { version = "=0.2.3", default-features = false, features = ["vulkan"] }
+hound = "=3.5.1"
+rubato = "=0.16.2"
+axum = { version = "=0.8.9", features = ["multipart"] }
+tokio = { version = "=1.53.1", features = ["full"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+rusqlite = { version = "=0.37.0", features = ["bundled"] }
+sha2 = "=0.10.9"
+reqwest = { version = "=0.12.28", features = ["stream", "rustls-tls", "json", "multipart"], default-features = false }
+futures-util = "0.3"
+uuid = { version = "=1.26.1", features = ["v4"] }
+fs4 = "=1.1.0"
+tower-http = { version = "=0.7.1", features = ["cors"] }
 
-# Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+[target.'cfg(windows)'.dependencies]
+windows-service = "=0.8.1"
+# Already a transitive dependency (via tokio) at 0.61.2; pinned exactly and
+# taken on directly, with only the feature sets `GET /v1/local/system` needs
+# (registry reads for OS/CPU name, GlobalMemoryStatusEx for RAM,
+# GetLogicalProcessorInformation for physical core count, and
+# GetProcessMemoryInfo for this process's working-set size), so no new
+# transitive surface is added.
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_Storage_FileSystem",
+] }
 
-# Error handling
-thiserror = "1"
-anyhow = "1"
+[dev-dependencies]
+tower = { version = "=0.5.3", features = ["util"] }
 
-# Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+[[bin]]
+name = "stt-proof"
+path = "src/main.rs"
 
-# CLI
-clap = { version = "4", features = ["derive"] }
-
-# UUIDs
-uuid = { version = "1", features = ["v4"] }
-
-# Platform directories
-dirs = "5"
-
-# Testing
-proptest = "1"
-reqwest = { version = "0.12", features = ["json"] }
-
-# Shared crate
-stt-common = { path = "crates/common" }
-stt-runtime = { path = "crates/runtime" }
-stt-server = { path = "crates/server" }
+[[bin]]
+name = "stt-server-next"
+path = "src/bin/server.rs"
 
 [profile.release]
 lto = true
 codegen-units = 1
-strip = true
