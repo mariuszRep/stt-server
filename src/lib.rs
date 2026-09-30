@@ -1,0 +1,30 @@
+pub mod api;
+pub mod app;
+pub mod audio;
+pub mod auth;
+#[cfg(windows)]
+pub mod autostart;
+pub mod capabilities;
+pub mod catalog;
+pub mod cli;
+pub mod discovery;
+pub mod download;
+pub mod dropin;
+pub mod engine;
+pub mod errors;
+pub mod format;
+pub mod gguf_probe;
+pub mod import;
+pub mod import_user;
+pub mod model_cli;
+pub mod network;
+pub mod operations;
+pub mod queue;
+pub mod run_plan;
+pub mod selfupdate;
+#[cfg(windows)]
+pub mod service;
+pub mod store;
+pub mod sysinfo;
+pub mod update_transaction;
+pub mod verify;

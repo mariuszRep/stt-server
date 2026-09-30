@@ -1,47 +1,22 @@
-# Build output
 /target/
-/dist/
-*.exe
-*.dll
-*.so
-*.dylib
-
-# Rust
-Cargo.lock
-
-# Node
-node_modules/
-sdk/dist/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Environment
-.env
-.env.local
-
-# Models (large files, not committed)
-*.bin
+/t/
+/t-static/
+/s/
+static-build.log
+static-build-2.log
+static-smoke.out
+static-smoke.err
+stereo-smoke.out
+stereo-smoke.err
+/test-data*/
+/.last-candidate.json
 *.gguf
-models/
-
-# Test artifacts
-test-results/
-bench-results/
-
-# Vendored managed-runtime Python source (runtimes/*/): bytecode cache,
-# local virtualenvs, and PyInstaller build output, not the vendored source
-# itself
-runtimes/*/__pycache__/
-runtimes/*/**/__pycache__/
-runtimes/*/venv/
-runtimes/*/*.egg-info/
-runtimes/*/build/
-runtimes/*/dist/
+*.wav
+*.db
+*.db-shm
+*.db-wal
+__pycache__/
+candidate-build/
+local-candidate-promote/
+candidate-download/
+.last-candidate.json

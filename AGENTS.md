@@ -1,119 +1,114 @@
 # AGENTS.md — STT Server
 
-This repo owns the local control plane (`stt` binary): hardware/runtime detection, provider
-and model lifecycle, runtime supervision, and connection descriptors — plus the managed
-runtimes it ships (`runtimes/<engine>/`).
-
-## Which checkout am I in?
-
-This repo exists TWICE on disk, as two git worktrees sharing one object database:
-
-```
-Projects/stt-server              standalone clone      branch: main
-Projects/voice-typer/stt-server  linked worktree       branch: voice-typer-windows   ← dev happens here
-```
-
-`voice-typer-windows` is the integration branch in ALL THREE repos — same name in
-stt-sdk, stt-server and whisper-vibes. There is no per-repo variant such as
-"stt-server-windows"; if you are looking for one, it does not exist.
-
-Decide from your working path, never from which branch looks newer or has more commits:
-  path contains /voice-typer/  → use this worktree, on the branch already checked out
-  path does NOT                → use this clone's own `main`
-
-The two are normally on DIFFERENT commits. Committing to the wrong one makes the work
-invisible to the other and is expensive to reconcile — see the 2026-08-30 incident in
-this repo's history.
-
-Ignore these stale local branches, they are not part of the flow:
-`backup/python-cli-main`
-Confirm state before any cross-repo work: `../scripts/check-worktrees.sh`
+This repository owns `stt-server`: a single Windows executable that manages GGUF speech
+models and serves batch transcription through an OpenAI-compatible API.
 
 ## Read Order
 
-1. This repository's `VISION.md` and `CONVENTIONS.md`
-2. `AGENTS.md` (this file)
-3. Relevant `.projectflows/goals/<status>/<goal-slug>/GOAL.md`
-4. Relevant source files
+1. `VISION.md` — approved product intent; do not edit without explicit human instruction
+2. `CONVENTIONS.md` — architecture and behaviour rules
+3. This file
+4. The relevant goal: `.projectflows/goals/<status>/<slug>/GOAL.md` in this repository, and
+   for cross-repo context the workspace goals in
+   `D:\Users\mariu\Projects\voice-typer\.projectflows\goals\in_progress\`
+   (`build-stt-server-next`, `migrate-voice-typer-to-stt-server-next`, `promote-stt-server-next-to-stt-server`)
+5. `README.md`, `docs/client-contract.md`, then the relevant source
 
-The workspace root's `../AGENTS.md` matters only when a change spans repos (e.g. a gitlink
-bump or the cross-repo train) — everything below is self-contained for this repo.
+## Repository
+
+- `mariuszRep/stt-server`, checked out in the workspace as `voice-typer/stt-server` on the
+  integration branch `voice-typer-windows` (see the workspace `AGENTS.md` for the sibling-clone
+  rules and the cross-repo train).
+- This code was developed as `stt-server-next` and took over this repository at 0.3.0. The
+  earlier provider-based server is preserved at tag `legacy-provider-final` and branch
+  `legacy`; the previous `main` at tag `legacy-main-final`. Its releases (up to v0.2.10) are
+  untouched. Do not delete those refs.
+- Do not create other branches, force-push, rebase, or amend.
 
 ## Boundaries
 
 | Owns | Must not own |
 |---|---|
-| Hardware/driver/runtime detection, provider catalog and compatibility, provider/model install-update-removal, runtime lifecycle, recommendations, health, runtime connection descriptors, managed runtime packaging (`runtimes/`) | Transcription proxying or inference on the data path — audio never crosses the control plane (CI enforces this with a WebSocket regression guard); app UX |
+| Model catalog, download, import, drop-in refresh, verification, selection, loading, removal; batch transcription and translation; capability matrix; queue; CLI and process modes; install scope and data folder; auth with admin and user tokens; network modes (local, LAN, Tailscale); CORS; self-update; system information; SQLite state | Microphone capture, chunking, VAD, the dictation session, prompt or vocabulary construction, transcript editing (all client-side); provider processes or descriptors; hardware-based model ranking |
 
-- Managed provider runtimes live at `runtimes/<engine>/` (`faster-whisper/`,
-  `sherpa-onnx/`), each an independent build — never a member of the root cargo workspace.
-- This repo may consume the published `@open-vibe-ai/stt-sdk` as a versioned library for
-  shared provider contracts — never SDK source by repository-relative path.
+## Layout
 
-## Workspace Layout
+- `src/bin/server.rs` — thin entry point; `src/cli.rs` commands and flags
+- `src/api.rs` router and handlers; `src/app.rs` state and startup reconciliation
+- `src/catalog.rs`, `src/capabilities.rs`, `src/run_plan.rs`, `src/format.rs` — models,
+  capabilities, request planning, responses
+- `src/download.rs`, `src/import.rs`, `src/verify.rs`, `src/dropin.rs`, `src/gguf_probe.rs`
+- `src/queue.rs`, `src/engine.rs` — inference queue and model load/swap
+- `src/import_user.rs` — copy a user's models into a machine-wide install
+- `src/store.rs` migrations; `src/discovery.rs`, `src/autostart.rs`, `src/service.rs`,
+  `src/sysinfo.rs`
+- `src/auth.rs` access levels; `src/network.rs` network modes; `src/selfupdate.rs` updates;
+  `src/model_cli.rs` CLI model commands over the API
+- `tests/` — tests that run the real compiled binary
+- `catalog/` — Handy catalog copy (byte-identical, with `SOURCE.md`)
+- `scripts/build-local.ps1` (static release build), `scripts/bench_corpus.py` (corpus bench),
+  `scripts/catalog_sweep.py` (unattended every-model check, one model on disk at a time)
 
-- `crates/common` (`stt-common`), `crates/runtime` (`stt-runtime`), `crates/server`
-  (`stt-server`), `crates/cli` (the `stt` binary) — the root cargo workspace.
-- `runtimes/sherpa-onnx/` — separate cargo workspace on purpose (its native ONNX-runtime
-  link must not slow every `cargo build --workspace`); build it with
-  `cargo build --release --bin sherpad` from inside that directory.
-- `runtimes/faster-whisper/` — Python runtime packaged with PyInstaller; its `venv/` is
-  dependency output, never edit code inside it.
+## Build and Verify
 
-## Verify Commands
+PowerShell environment (as `scripts/build-local.ps1` sets it):
 
-```bash
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo build --workspace
-cargo test --workspace        # faster-whisper integration tests need runtimes/faster-whisper/venv
-./smoke-test.sh target/release/stt   # after cargo build --release --bin stt
+```powershell
+$env:PATH="C:\Program Files\CMake\bin;$env:PATH"
+$env:VULKAN_SDK='C:\VulkanSDK\1.4.357.0'; $env:LIB="$env:VULKAN_SDK\Lib;$env:LIB"
+$env:TRANSCRIBE_CMAKE_ARGS='-DGGML_NATIVE=OFF -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded'
+$env:RUSTFLAGS='-C target-feature=+crt-static'
+$env:CARGO_TARGET_DIR='D:\Users\mariu\Projects\voice-typer\stt-server\s'
 ```
 
-`scripts/verify-release-artifact.sh dist` audits staged release binaries — CI runs it on
-every built artifact.
+Required before any commit:
+
+```powershell
+cargo fmt --check
+cargo clippy --release --all-targets --offline -- -D warnings
+cargo test --release --offline
+scripts\build-local.ps1 -Offline   # prints binary size and SHA-256
+```
+
+- Everyday development can use a second target folder (`CARGO_TARGET_DIR=...	`) with plain
+  `cargo clippy --all-targets -- -D warnings` and `cargo test`, so a running release or sweep
+  exe under `s\` is never locked or overwritten. The release commands above remain the gate
+  before tagging a release.
+- Real-model checks use a temporary `--data-dir` and a spare port (54400+), never the user's
+  real data folders. Stop every server you start (`stt-server stop --data-dir <dir>`).
+- Never install the Windows Service or change system settings yourself; give the user the
+  commands to run in an admin terminal.
+- On Windows, tests must drop the app and router before deleting temp dirs (file locks).
+- Run long commands with explicit timeouts and log output to a file; read the tail.
+- Audit native imports after dependency changes with `dumpbin /DEPENDENTS` (Visual Studio
+  Build Tools): only Windows system DLLs and `vulkan-1.dll` are allowed.
 
 ## Build, test, release
 
+Nothing builds or ships on its own: every workflow is `workflow_dispatch`-only. The stages run
+from the workspace root (`voice-typer/`), never from this folder:
+
+```text
+npm run vt -- server dev                 local gate (scripts/dev-gate.ps1): fmt, clippy, tests
+npm run vt -- server uat [--local]       build the candidate; store it as a private draft release
+                                         candidate-<sha> with stt-server.exe, .sha256, manifest.json
+                                         (--local builds with scripts/build-local.ps1: zero Actions minutes)
+human acceptance                         install the candidate and test it by hand
+npm run vt -- server prod <ver> [--local]  tag the tested SHA; release.yml (or --local) promotes those exact
+                                         files, never rebuilds, then bumps the patch version
 ```
-push to voice-typer-windows ──▶ ci.yml runs on every push (fmt/clippy/build/test/sherpad);
-                                a draft PR titled "vX.Y.Z" stays open (ensure-pr.yml
-                                opens one if none exists)
-merge PR ─────────────────────▶ candidate-server.yml fires on push:main → real binaries
-                                + per-artifact SHA256SUMS (workflow_dispatch stays
-                                available to re-test any SHA)
-human acceptance ─────────────▶ download the run's artifacts, verify against SHA256SUMS,
-                                install and smoke-test on a real machine
-tag the tested SHA ───────────▶ release.yml fetches that run's artifacts, re-verifies
-                                checksums, and publishes those exact files — never rebuilds
-```
 
-The candidate produces: `stt-linux-x86_64`, `stt-windows-x86_64.exe`,
-`sherpad-linux-cpu`, `sherpad-windows-cpu`, `faster-whisper-runtime-linux-cpu`,
-`faster-whisper-runtime-windows-cpu`, and — only when its opt-in dispatch input is set —
-`faster-whisper-runtime-windows-gpu` (617MB, off by default).
+- The version in `Cargo.toml` must equal the release version when UAT runs; `prod` refuses
+  to promote a candidate whose `Cargo.toml` disagrees.
+- Release assets are `stt-server.exe`, `stt-server.exe.sha256` and `manifest.json`. The
+  self-updater (`update check` / `update install`) reads them from this repository's releases.
 
-- Version bumps are ordinary commits on the branch before the final candidate run:
-  `[workspace.package] version` in the root `Cargo.toml`. The candidate workflow's version
-  guard fails the build if the manifest version isn't ahead of the latest release tag.
-- Release (explicit instruction only): `git tag vX.Y.Z <tested-sha>` →
-  `git push origin vX.Y.Z`. The tag need not sit on `main`. `release.yml` hard-fails when
-  no successful candidate run exists for that SHA — re-dispatch `candidate-server.yml` on
-  the SHA first if the artifacts expired.
-- **Rollback is free**: re-tag an older already-tested SHA and let promote republish it —
-  seconds, no rebuild, no new test cycle.
+## Rules
 
-### CI housekeeping rules
-
-- **GitHub Releases assets do not count against the Actions artifact-storage quota** —
-  promoting is how bits get off the meter permanently, which is why candidate artifact
-  retention is deliberately short (7 days).
-- **Renaming a job or artifact orphans the old artifact's name** — nothing prunes it.
-  When an artifact name changes, purge the old name (`gh api -X DELETE
-  repos/<owner>/<repo>/actions/artifacts/<id>`); `cleanup-artifacts.yml` does this weekly.
-
-## Documentation Rule
-
-Durable product or technical direction belongs in `VISION.md` / `CONVENTIONS.md`.
-Executable work belongs in `.projectflows/goals/<status>/<goal-slug>/GOAL.md`.
-Do not maintain separate roadmap/status documents unless explicitly requested.
+- Commit messages are conventional; record evidence (tests, real checks, binary size and
+  SHA-256) in `docs/feasibility-2026-09-25.md` and `docs/parity-ledger.md`.
+- Never commit models, audio, transcripts, databases, tokens, or anything under `s/` or
+  `test-data*`.
+- Do not implement destructive data purge without explicit approval of that exact scope.
+- Architectural choices the goal does not settle are the user's to make: ask, or list them
+  as open decisions; do not settle them silently.

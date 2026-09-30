@@ -1,45 +1,40 @@
-# VISION.md — STT Server
+# STT Server Next — Vision
 
-> This repository is the local control-plane component of the Voice Typer workspace. Root product intent lives at `../VISION.md`.
+> Approved by the user on 2026-09-26; "Runs the way people need it" updated with the user's
+> decisions of 2026-09-27. Change only on explicit human instruction.
 
-## Purpose
+## What it is
 
-`stt-server` makes compatible local STT provider runtimes available on a machine. It is self-hosted, local-first, and vendor-neutral.
+One self-contained local speech-to-text server. A person installs a single program, and it
+manages speech models and turns audio into text for any application that asks, through the
+OpenAI audio API that many tools already understand. Voice Typer is its first client, not its
+only one.
 
-## Responsibilities
+## What it promises
 
-- Hardware, driver, and runtime capability detection.
-- Provider catalog, compatibility evaluation, and recommendations.
-- Provider install, update, removal, start, stop, health, and logs.
-- Model catalog, download, verification, selection, and removal.
-- Runtime connection descriptors for clients.
+- **One program, one engine.** No helper processes, no Python, no separately shipped inference
+  libraries. It runs on the CPU everywhere and uses the GPU through Vulkan when it can, and it
+  always says which one it actually used.
+- **Every model Handy supports.** The full Handy GGUF catalog is available in every published
+  quantisation. People can also drop their own GGUF files into a folder and refresh.
+- **The person decides.** Nothing downloads until someone chooses a model. Recommendations
+  follow a fixed curated order, never a guess about the user's hardware.
+- **Honest capabilities.** Each loaded model states which options it really supports (prompt,
+  language hint, translation, temperature, timestamps). Clients use that to show or hide
+  controls. The server never pretends an option worked.
+- **Transcription stays simple.** Applications send finished audio and get text back. The
+  client owns the dictation session: microphone, chunking, prompts and vocabulary, and editing
+  the result. The server passes a prompt through unchanged and never rewrites a transcript.
+- **Runs the way people need it.** By default it starts and stops with the app that uses it,
+  installed just for that person. It can also run on its own: at Windows sign-in for one person,
+  or installed for the whole machine as a shared server (a Windows Service) that other users,
+  devices on a private network, or the person's own devices over Tailscale can use. Each install
+  keeps its models in one place, and shared use is always behind a token, with ordinary users
+  able to transcribe and only an administrator able to change models or settings.
+- **Open source.** It will be published as an open-source project, with public releases the
+  server can update itself from.
 
-## Boundaries
+## Not in scope
 
-The server is a control plane. It does not own normal batch/realtime transcription APIs, audio processing, model inference, or an audio proxy. Those belong to a managed local provider runtime, which the SDK contacts directly. The server may consume the published SDK library for shared provider contracts and runtime validation, but never SDK source by repository path.
-
-## Core Workflow
-
-1. A client asks the server what local providers/models are compatible.
-2. The server installs and starts a selected provider runtime.
-3. The server returns a versioned connection descriptor.
-4. The client uses `stt-sdk` to communicate directly with the runtime.
-
-## Rules
-
-- Local runtime binding defaults to loopback.
-- Provider/model installation is explicit and observable.
-- Only curated compatible provider/runtime/model combinations are offered.
-- The server may manage, but must not carry, normal transcription data traffic.
-
-## Key Decisions
-
-- 2026-08-30 — Provider engines are added via a pluggable architecture (see `CONVENTIONS.md`'s
-  selection criteria and Provider Engine Architecture sections), not one-off hardcoded
-  integrations. Planned roster: faster-whisper (priority, already shipped), whisper.cpp, and
-  sherpa-onnx, extensible to further engines beyond those three. faster-whisper continues to be
-  the engine serving Whisper models specifically — sherpa-onnx's own ONNX-exported Whisper path
-  has a documented accuracy regression versus faster-whisper on identical audio
-  ([k2-fsa/sherpa-onnx#2900](https://github.com/k2-fsa/sherpa-onnx/issues/2900)), so it is
-  additive for model families neither other engine can run (NVIDIA Parakeet/Canary, Moonshine,
-  SenseVoice, Zipformer/Paraformer), not a replacement for faster-whisper.
+Live streaming transcripts, server-side microphone capture or voice-activity detection,
+holding a user's dictation session, and cloud or multi-tenant hosting.

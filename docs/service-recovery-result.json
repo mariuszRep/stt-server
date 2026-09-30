@@ -1,0 +1,8 @@
+{
+    "service":  "OpenVibeSttNext",
+    "old_pid":  29564,
+    "new_pid":  15668,
+    "status":  "ready",
+    "model":  "parakeet-unified-en-0.6b",
+    "backend":  "Vulkan0"
+}
