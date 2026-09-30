@@ -59,6 +59,7 @@ pub fn build_router(state: state::AppState) -> Router {
         .route("/v1/health", get(routes::health))
         .route("/v1/readiness", get(routes::readiness))
         .route("/v1/hardware", get(routes::get_hardware))
+        .route("/v1/system/memory", get(routes::get_system_memory))
         .route("/v1/providers", get(routes::list_providers))
         .route("/v1/providers/:id/install", post(routes::install_provider))
         .route(
