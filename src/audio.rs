@@ -5,8 +5,60 @@ use rubato::{FftFixedIn, Resampler};
 
 use crate::errors::{internal, ApiError, ApiResult};
 
+/// One-line description of an upload's size and RIFF header, for the log line written when
+/// the upload is rejected. The client only ever sees a generic message; this is what makes a
+/// truncated body, an empty body or an odd data length diagnosable afterwards.
+pub fn describe_wav_header(bytes: &[u8]) -> String {
+    let mut out = format!("len={}", bytes.len());
+    let tag = |range: std::ops::Range<usize>| {
+        bytes
+            .get(range)
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+    };
+    let u32_at = |at: usize| {
+        bytes
+            .get(at..at + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let u16_at = |at: usize| {
+        bytes
+            .get(at..at + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+    };
+    out.push_str(&format!(
+        " riff={:?} riff_size={:?} wave={:?} fmt={:?} format={:?} channels={:?} rate={:?} bits={:?} data_tag={:?}",
+        tag(0..4),
+        u32_at(4),
+        tag(8..12),
+        tag(12..16),
+        u16_at(20),
+        u16_at(22),
+        u32_at(24),
+        u16_at(34),
+        tag(36..40),
+    ));
+    if let Some(data_len) = u32_at(40) {
+        let block = u16_at(32).unwrap_or(0) as u64;
+        let actual = bytes.len().saturating_sub(44);
+        out.push_str(&format!(
+            " data_len={data_len} actual_data_bytes={actual} block_align={block}"
+        ));
+        if block > 0 && u64::from(data_len) % block != 0 {
+            out.push_str(" data_len_not_whole_samples");
+        }
+        if (data_len as usize) > actual {
+            out.push_str(" truncated_body");
+        }
+    }
+    out
+}
+
 pub fn decode_wav(bytes: &[u8]) -> ApiResult<Vec<f32>> {
-    let mut reader = hound::WavReader::new(Cursor::new(bytes)).map_err(|_| {
+    let mut reader = hound::WavReader::new(Cursor::new(bytes)).map_err(|error| {
+        eprintln!(
+            "rejected audio: invalid WAV ({error}); {}",
+            describe_wav_header(bytes)
+        );
         ApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_audio",
@@ -41,7 +93,11 @@ pub fn decode_wav(bytes: &[u8]) -> ApiResult<Vec<f32>> {
             ));
         }
     }
-    .map_err(|_| {
+    .map_err(|error| {
+        eprintln!(
+            "rejected audio: malformed samples ({error}); {}",
+            describe_wav_header(bytes)
+        );
         ApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_audio",
@@ -126,5 +182,61 @@ mod tests {
         let decoded = decode_wav(&cursor.into_inner()).unwrap();
         assert_eq!(decoded.len(), 16_000);
         assert!(decoded.iter().all(|sample| sample.abs() < 0.0001));
+    }
+
+    fn wav_bytes(samples: usize) -> Vec<u8> {
+        let mut cursor = Cursor::new(Vec::new());
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        {
+            let mut writer = hound::WavWriter::new(&mut cursor, spec).unwrap();
+            for _ in 0..samples {
+                writer.write_sample(0_i16).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    #[test]
+    fn header_description_reports_valid_header() {
+        let text = describe_wav_header(&wav_bytes(3200));
+        assert!(text.contains("len=6444"), "{text}");
+        assert!(text.contains("riff=Some(\"RIFF\")"), "{text}");
+        assert!(
+            text.contains("data_len=6400 actual_data_bytes=6400"),
+            "{text}"
+        );
+        assert!(!text.contains("truncated_body"), "{text}");
+        assert!(!text.contains("not_whole_samples"), "{text}");
+    }
+
+    #[test]
+    fn header_description_flags_truncated_body_and_odd_length() {
+        let mut bytes = wav_bytes(3200);
+        bytes.truncate(1000);
+        assert!(describe_wav_header(&bytes).contains("truncated_body"));
+
+        let mut odd = wav_bytes(3200);
+        odd[40..44].copy_from_slice(&6401u32.to_le_bytes());
+        assert!(describe_wav_header(&odd).contains("data_len_not_whole_samples"));
+    }
+
+    #[test]
+    fn header_description_survives_empty_and_tiny_bodies() {
+        assert_eq!(describe_wav_header(&[]).split(' ').next(), Some("len=0"));
+        assert!(describe_wav_header(&[1, 2, 3]).contains("len=3"));
+    }
+
+    #[test]
+    fn empty_and_truncated_bodies_are_rejected_not_panicked() {
+        assert!(decode_wav(&[]).is_err());
+        let mut bytes = wav_bytes(3200);
+        bytes.truncate(60);
+        assert!(decode_wav(&bytes).is_err());
     }
 }
