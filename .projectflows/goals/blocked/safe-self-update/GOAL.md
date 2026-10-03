@@ -7,8 +7,8 @@ type: feature
 scope: stt-server-next only
 attempt: 1
 max_attempts: 8
-last_result: blocked -- live 0.3.0->0.3.1 rehearsal against public releases found a real bug: `update install --yes` fails safely at recovery-task registration (schtasks rejects the UTF-8 task XML); nothing was replaced
-next_action: Fix update_transaction.rs so recovery-task.xml is written in an encoding schtasks accepts (UTF-16 LE with BOM and encoding="UTF-16", verified manually), add a test that exercises the real schtasks registration, ship a fixed release (>0.3.1), then rehearse N->N+1 and forced rollback again (forced rollback can use a local STT_SERVER_UPDATE_URL manifest advertising a higher tag over the same binary, which triggers the version-mismatch rollback).
+last_result: blocked -- 0.3.2 rehearsal: recovery-task registration (UTF-16 fix) now works, but the worker aborts at validate_journal ("Invalid update artifact paths") before any change, leaving an armed journal + registered logon task and a server that cannot be restarted; update/rollback only succeed with a throwaway diagnostic patch
+next_action: Fix update_transaction.rs::validate_journal (journal.work_dir is built from the canonicalized exe parent, i.e. with the \?\ prefix, but is compared to the parent of launch.executable, which is stored non-canonical) and make the worker failure path clean up (remove task, disarm journal) instead of leaving it armed; add a test that drives install end to end with a non-canonical launch.executable and the real schtasks; ship a fixed release, then re-run the success and forced-rollback rehearsals on that exact binary (diagnostic result: both pass once the comparison is fixed); finally the live public N->N+1 check.
 success_criteria:
   - A user can check for a newer released server and choose when to install it through the CLI.
   - The downloaded executable is checked against the release checksum before it can replace the running version.
@@ -192,3 +192,24 @@ Commands and outputs:
 Note: the update-source section above still mentions `stt-server-next` asset names; the code and
 releases now use `stt-server.exe` / `stt-server.exe.sha256` and the `mariuszRep/stt-server` repo.
 Public-source blocker is resolved; the new blocker is the registration bug.
+
+2026-10-03 (0.3.2 rehearsal, commits eaec7b3 UTF-16 task XML + d52c719 service rename): **Result: still blocked -- a second bug sits behind the first.**
+
+Isolation: scratch folder under the session scratchpad, own data dir (`STT_SERVER_DATA_DIR` set, `status --json` confirmed the scratch `data_dir` before every update), port 54400, local manifest served by `python -m http.server 54401 --bind 127.0.0.1` with `STT_SERVER_UPDATE_URL=http://127.0.0.1:54401/manifest.json` (GitHub-style JSON: `tag_name`, assets `stt-server.exe` + `stt-server.exe.sha256` with `browser_download_url`). Started with `stt-server.exe start --data-dir ... --port 54400`. No admin, no service. The real server (port 54321, pid 22380) was never touched and reported 0.3.1 before and after.
+
+Binary identity: built 0.3.2 `selease\stt-server.exe` SHA-256 `52CC87866EE955870CA3ED93A21298FB640C5E948FA9A8D244CCE03CF0962C9A` (matches the approved hash).
+
+B. Forced rollback on the unmodified 0.3.2 binary (manifest `v0.3.9`, pointing at the same 0.3.2 bytes with a matching .sha256):
+- `update check --json` -> `{"current_version":"0.3.2","latest_version":"0.3.9","update_available":true}`
+- `update install --yes --json --data-dir <scratch>\data` -> `{"error":null,"installed":false,"phase":"prepared"}`, `error: Update worker failed; see \?\C:\...\.stt-update-<id>`, exit 1. The recovery task registered now (the UTF-16 fix works), but `worker.log` contains only `Invalid update artifact paths`.
+- Cause: `validate_journal` (src/update_transaction.rs) requires `journal.work_dir == launch.executable.parent()/.stt-update-<id>`. `prepare` builds `work_dir` from `fs::canonicalize(current_exe())`, which on Windows carries the `\?\` verbatim prefix (and on-disk casing); `launch.executable` comes from the server's `server.json` and is the plain non-verbatim path. The two can never be equal, so every `update install --yes` fails at this check on a normal `start`ed server. Retrying with the exe started via its canonical-case path did not help (the prefix still differs).
+- Damage left behind by that failure: journal stays `phase: prepared`, `armed: true`; scheduled task `OpenVibeSTT-Recovery-<id>` (LogonTrigger, Command `\?\...ecovery.exe __update-worker ... --recover`) stays registered, so at next logon it would fire and fail the same check; a second `update install --yes` -> `Previous update requires recovery before another update`; after `stop`, `start` -> `error: server did not become healthy within 30s` (startup guard refuses while the armed journal exists). The executable hash was unchanged and the original server kept running until stopped, so no binary or data was lost, but the user is locked out of restarting. Recovery needed manual `schtasks /Delete` plus removing the journal. (Not fixed, per instructions.)
+
+A. Success path: not possible on the unmodified binary for the same reason.
+
+Diagnostic only (not the release candidate): to learn whether anything else is broken behind this bug, a throwaway git worktree outside the repo (detached at d52c719, never committed, removed afterwards) was patched so `validate_journal` canonicalizes `launch.executable` before comparing, and built as 0.3.3 (SHA-256 `448A5F30204B00C68BB21A9BECC5051A9B81A67669EE55F029F1EE6C91AED7ED`) and 0.3.4 (`D17C66F1AC58CD5764A8C76AF442197F0AA6FAA6EDE00F051CDB92EB277FC9A5`) with `scripts/build-local.ps1` (short CARGO_TARGET_DIR, full ggml rebuild 8m43s). With that patch:
+- Success 0.3.3 -> 0.3.4 (manifest `v0.3.4`): `update install --yes --json` -> `{"error":null,"installed":true,"phase":"committed"}`, exit 0; exe hash changed `448A5F30...` -> `D17C66F1...`; restarted server pid changed, `status --json` and `/health` report `0.3.4`; journal `phase: committed`, `task_removed: true`; `schtasks /Query` shows no OpenVibeSTT task.
+- Forced rollback 0.3.3 with manifest `v0.3.9` over the same bytes: `{"error":"Started executable reports the wrong version","installed":false,"phase":"restored"}`, exit 1; exe hash unchanged `448A5F30...`; server restarted (new pid) healthy at 0.3.3; journal `phase: restored`, `task_removed: true`; no OpenVibeSTT task left.
+So the transaction logic (download, verify, stop, replace, restart, validate, commit, rollback, task removal) works end to end; only the path comparison is wrong. These patched binaries are not release candidates; the exact fixed release binary must be rehearsed again.
+
+Cleanup: isolated servers stopped (ports 54400/54401 free), scratch folder, patched worktree (`git worktree remove` + `prune`) and the extra build directory deleted, the two leftover scratch recovery tasks deleted by name, no OpenVibeSTT tasks present, real server `/health` version 0.3.1 on 54321.
