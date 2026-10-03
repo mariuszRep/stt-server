@@ -2,13 +2,13 @@
 name: ready-for-voice-typer
 title: Make STT Server Next Release-Ready for Voice Typer
 description: Close the remaining server-side work so Voice Typer can depend on stt-server-next as its only speech server, with safe updates and proven reliability.
-status: draft
+status: cancelled
 type: feature
 scope: stt-server-next only
 attempt: 0
 max_attempts: 8
-last_result: none
-next_action: Run in_progress/hands-on-acceptance-tests (sections A-F); finish in_progress/openai-model-per-request's /models/manage rename; after the first public release, run blocked/safe-self-update's live N-to-N+1 rehearsal; then move this goal to ready/done. See the "Remaining acceptance checklist" below for every outstanding check and its owner goal.
+last_result: cancelled
+next_action: null
 success_criteria:
   - A user can keep the server up to date from public releases without losing models or settings, and a failed update rolls back automatically.
   - The server installs and runs correctly on a clean Windows machine, on a machine without a GPU or Vulkan, and when upgrading from an earlier version.
@@ -126,7 +126,7 @@ Client changes (SDK and app have their own goals), streaming, multiple resident 
 
 ## Attempts
 
-None yet. (2026-10-03: evidence recorded below and in `in_progress/hands-on-acceptance-tests`; this goal stays `draft`, no attempt started.)
+None. No attempt was started; closed as cancelled on 2026-10-03.
 
 ## Verification Log
 
@@ -159,4 +159,17 @@ deferred to the Hyper-V VM session.
 
 ## Final Outcome
 
-Not started.
+Cancelled 2026-10-03: superseded by shipped releases; remaining checks tracked in
+hands-on-acceptance-tests / safe-self-update. Voice Typer (Stanzo) has shipped on stt-server since
+0.3.0 (whisper-vibes tags v0.3.0, v0.3.2, v0.3.3, v0.3.4). Success criteria were not all met, so this
+is `cancelled`, not `done`. Open items (owner goal in `in_progress/` or `blocked/`):
+
+- Clean machine, no GPU/CPU-only startup -> in_progress/hands-on-acceptance-tests section A.
+- Second device on the LAN (genuine second-device transcription) -> hands-on-acceptance-tests section B.
+- Tailscale peer-side authenticated transcription and plain-LAN 403 on a transcription route -> section C.
+- Real multi-user (machine-wide install, standard user, cross-account import) -> sections D-E and in_progress/install-scope-and-shared-access.
+- Model-per-request end-to-end on a real device -> sections A/B.
+- Full-disk behaviour -> section G; power loss / interrupted download -> section H (unit-tested only).
+- Clean-VM Windows Service install/uninstall recheck -> section F.
+- Live N -> N+1 update with forced rollback -> blocked/safe-self-update.
+- Public release + exact-binary promotion rehearsal -> blocked/safe-self-update.

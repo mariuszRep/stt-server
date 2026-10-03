@@ -47,7 +47,7 @@ Self-update, CLI model-command implementation, new speech models, client migrati
 
 ## Related goals
 
-- draft/ready-for-voice-typer: server acceptance umbrella.
+- cancelled/ready-for-voice-typer: server acceptance umbrella.
 - done/safe-stop-startup-model-recovery: resolved high-priority stop/startup/refresh findings.
 
 ## Attempts

@@ -91,7 +91,7 @@ version warnings in the app), macOS and Linux, multiple servers behind one addre
 
 ## Related goals
 
-- `draft/ready-for-voice-typer` (service, LAN and clean-machine acceptance).
+- `cancelled/ready-for-voice-typer` (service, LAN and clean-machine acceptance).
 - `whisper-vibes`: `draft/switch-to-stt-server-next`; `stt-sdk`: `draft/stt-server-next-adapter`.
 
 ## Attempts

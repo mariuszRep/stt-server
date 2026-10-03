@@ -46,7 +46,7 @@ Releasing a public build, tagging production, model-management CLI commands and 
 
 ## Related goals
 
-- draft/ready-for-voice-typer: server acceptance umbrella.
+- cancelled/ready-for-voice-typer: server acceptance umbrella.
 - voice-typer/in_progress/migrate-voice-typer-to-stt-server-next: cross-repo phase 2.
 
 ## Attempts
