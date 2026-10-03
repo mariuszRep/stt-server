@@ -462,7 +462,24 @@ pub async fn validation(data_dir: &Path) -> Result<Value> {
 /// All ordinary service stop/start operations go through SCM, preserving its
 /// account, configuration and recovery policy rather than launching `run`.
 fn service_command(action: &str) -> Result<()> {
-    run_command(hidden_command("sc.exe").args([action, "OpenVibeSttNext"]))
+    struct Sc;
+    impl crate::service_names::ServiceControl for Sc {
+        fn exists(&self, name: &str) -> std::result::Result<bool, Box<dyn std::error::Error>> {
+            Ok(
+                bounded_output(hidden_command("sc.exe").args(["query", name]))?
+                    .status
+                    .success(),
+            )
+        }
+        fn stop_and_delete(&self, _: &str) -> std::result::Result<(), Box<dyn std::error::Error>> {
+            Err("the updater never deletes services".into())
+        }
+    }
+    // Legacy migration: an install from before the rename is still registered
+    // under the old name until `service install` is next run, and must still be
+    // stopped and started by its registered name.
+    let name = crate::service_names::active_name(&Sc);
+    run_command(hidden_command("sc.exe").args([action, name]))
 }
 
 pub async fn stop(journal: &Journal) -> Result<()> {

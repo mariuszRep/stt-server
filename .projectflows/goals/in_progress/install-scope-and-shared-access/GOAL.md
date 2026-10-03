@@ -305,3 +305,5 @@ clean-VM rehearsals called for in the goal (a genuine second Windows account exe
 machine-wide install's `user.token`, a real `models import-user` run between a per-user account's
 real models and a machine-wide service install, and the clean-VM service install/uninstall
 recheck noted above) have not been done.
+
+2026-10-03: The Windows service was renamed from `OpenVibeSttNext` to `OpenVibeSttServer` (display name `STT Server`) in 0.3.2. `service install` stops and deletes a legacy `OpenVibeSttNext` service first; `service uninstall` removes either name; the self-updater stops/starts whichever is registered. The real-service rehearsal and clean-VM recheck above must use the new name, and should also cover upgrading a machine that still has the legacy service.

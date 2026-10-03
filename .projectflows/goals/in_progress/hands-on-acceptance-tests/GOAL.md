@@ -169,7 +169,7 @@ deletes the file:
 ```powershell
 & $svc service uninstall
 Start-Sleep 15
-Get-Service OpenVibeSttNext -ErrorAction SilentlyContinue      # expect: nothing
+Get-Service OpenVibeSttServer -ErrorAction SilentlyContinue      # expect: nothing
 Test-Path 'C:\Program Files\OpenVibeAI\STT Server'             # expect: False
 Get-ChildItem "$data\models" | Select Name                     # expect: model file kept
 ```

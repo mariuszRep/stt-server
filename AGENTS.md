@@ -25,8 +25,7 @@ models and serves batch transcription through an OpenAI-compatible API.
   `legacy`; the previous `main` at tag `legacy-main-final`. Its releases (up to v0.2.10) are
   untouched. Do not delete those refs.
 - Do not create other branches, force-push, rebase, or amend.
-- Current names: executable `stt-server.exe`; Windows service `OpenVibeSttNext` (the service
-  name was not changed by the 0.3.0 rename, so installed services keep working); autostart
+- Current names: executable `stt-server.exe`; Windows service `OpenVibeSttServer` (display name `STT Server`; renamed from `OpenVibeSttNext` in 0.3.2: `service install` migrates and `service uninstall` removes a legacy one); autostart
   value `OpenVibeSttServer`; per-user data `%LOCALAPPDATA%\OpenVibeAI\STT Server`; machine-wide
   program `%ProgramFiles%\OpenVibeAI\STT Server`, data `%ProgramData%\OpenVibeAI\STT Server`.
   The `STT Server Next` folders in `src/app.rs` are legacy-migration only.
