@@ -32,7 +32,8 @@ use crate::app::{
     token_file, user_token_file,
 };
 
-const NAME: &str = "OpenVibeSttNext";
+use crate::service_names::{self, DISPLAY_NAME, LEGACY_SERVICE_NAME, SERVICE_NAME as NAME};
+
 define_windows_service!(ffi_service_main, service_main);
 
 pub fn dispatch() -> Result<(), Box<dyn Error>> {
@@ -232,13 +233,18 @@ pub fn install() -> Result<(), Box<dyn Error>> {
     // built-in Users group, used instead of the localized "Users" name so
     // this works on non-English Windows too.
     icacls(&user_token_path, &user_token_acl_args())?;
+    // Legacy migration: replace a pre-rename service (LEGACY_SERVICE_NAME)
+    // before registering the current one.
+    if service_names::migrate_legacy(&Scm)? {
+        println!("Removed legacy service {LEGACY_SERVICE_NAME}");
+    }
     let manager = ServiceManager::local_computer(
         None::<&str>,
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
     )?;
     let info = ServiceInfo {
         name: OsString::from(NAME),
-        display_name: OsString::from("OpenVibe STT Server"),
+        display_name: OsString::from(DISPLAY_NAME),
         service_type: ServiceType::OWN_PROCESS,
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
@@ -299,23 +305,52 @@ fn delayed_remove_dir(dir: &Path) -> Command {
     command
 }
 
-pub fn uninstall() -> Result<(), Box<dyn Error>> {
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    let service = manager.open_service(
-        NAME,
-        ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
-    )?;
-    if service.query_status()?.current_state != ServiceState::Stopped {
-        service.stop()?;
-        for _ in 0..20 {
-            if service.query_status()?.current_state == ServiceState::Stopped {
-                break;
+/// SCM-backed [`service_names::ServiceControl`].
+struct Scm;
+
+const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
+
+impl service_names::ServiceControl for Scm {
+    fn exists(&self, name: &str) -> Result<bool, Box<dyn Error>> {
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+        match manager.open_service(name, ServiceAccess::QUERY_STATUS) {
+            Ok(_) => Ok(true),
+            Err(windows_service::Error::Winapi(error))
+                if error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST) =>
+            {
+                Ok(false)
             }
-            thread::sleep(Duration::from_secs(1));
+            Err(error) => Err(error.into()),
         }
     }
-    service.delete()?;
-    drop(service);
+
+    fn stop_and_delete(&self, name: &str) -> Result<(), Box<dyn Error>> {
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+        let service = manager.open_service(
+            name,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
+        )?;
+        if service.query_status()?.current_state != ServiceState::Stopped {
+            service.stop()?;
+            for _ in 0..20 {
+                if service.query_status()?.current_state == ServiceState::Stopped {
+                    break;
+                }
+                thread::sleep(Duration::from_secs(1));
+            }
+        }
+        service.delete()?;
+        Ok(())
+    }
+}
+
+/// Removes the current service and, as legacy migration, a pre-rename
+/// `OpenVibeSttNext` one if present.
+pub fn uninstall() -> Result<(), Box<dyn Error>> {
+    let removed = service_names::remove_all(&Scm)?;
+    if removed.is_empty() {
+        return Err(format!("Service {NAME} is not installed").into());
+    }
     let dir = install_dir();
     let running_from_install = std::env::current_exe()
         .map(|exe| exe.parent() == Some(dir.as_path()))
@@ -326,7 +361,10 @@ pub fn uninstall() -> Result<(), Box<dyn Error>> {
     } else if dir.exists() {
         fs::remove_dir_all(&dir)?;
     }
-    println!("Removed {NAME}; model and state data preserved");
+    println!(
+        "Removed {}; model and state data preserved",
+        removed.join(", ")
+    );
     Ok(())
 }
 
