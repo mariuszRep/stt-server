@@ -282,6 +282,22 @@ reporting and model import.
 - Gates: `cargo fmt --check` clean, `cargo clippy --all-targets -- -D warnings` clean, `cargo test`
   271 lib + 11 bin passed (282 total, 0 failed). Not committed per instruction.
 
+2026-10-03: Network modes checked live (no code change) (real laptop, Windows 11 "rhs-surface", Tailscale
+100.125.201.68, home LAN 10.0.0.18; stt-server 0.3.1 run by Stanzo 0.3.4 -- Stanzo's LAN-mode bug of
+connecting to 0.0.0.0 was fixed in whisper-vibes 36fa22a and released as Stanzo v0.3.4).
+- LAN mode (health: mode lan, effective lan, bound 0.0.0.0:54321): `GET /v1/models` via
+  10.0.0.18 with user.token -> 200; without token -> 401. Caveat: sent from the laptop itself to its
+  own LAN address, NOT from a second device, so this does not close the genuine second-device LAN
+  check.
+- Tailscale mode (health: mode tailscale, effective tailscale, addresses [100.125.201.68]): from
+  the laptop, `/v1/models` via the Tailscale IP with token -> 200; without token -> 401; via the LAN
+  IP 10.0.0.18 with token -> 403 `network_not_private`.
+- Real tailnet peer: Android phone (Pixel 7) on Tailscale, `GET http://100.125.201.68:54321/health`
+  in Chrome -> status ok, effective tailscale. Proves an off-machine tailnet peer reaches the server.
+- Switching Local/LAN/Tailscale from the Stanzo Settings UI works on Stanzo 0.3.4.
+  Still outstanding for this goal: second Windows account, cross-account `import-user`, clean-VM
+  service reinstall, and a genuine second-device LAN check (all in `in_progress/hands-on-acceptance-tests`).
+
 Every success criterion in this goal's slices (install scope/one data folder, several users on one
 PC, access levels, network modes including Tailscale, versions and moving models between scopes)
 now has an implementation and passing tests. Status stays `in_progress`: the real multi-user and

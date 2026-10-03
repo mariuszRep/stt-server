@@ -2,17 +2,17 @@
 name: hands-on-acceptance-tests
 title: Hands-On Acceptance Tests (VM, Phone, Tailscale, Shared Machine)
 description: The manual tests only a person with a second device can run, against the final release build, with copy-paste commands and expected results.
-status: ready
+status: in_progress
 type: validation
 scope: stt-server-next only
-attempt: 0
+attempt: 1
 max_attempts: 3
-last_result: none
-next_action: Set up a Windows 11 Hyper-V VM on an External switch, copy the release exe into it, then run sections A to F in order and paste results back; sections G and H are recorded as unit-tested-only unless a real rehearsal is also done.
+last_result: partial
+next_action: Hyper-V VM session (VM on an External switch, joined to the tailnet, using curl.exe): run sections A, B (genuine second-device LAN transcription), C (authenticated Tailscale 200/401 with a real audio file from the VM peer, plus plain-LAN 403 on a transcription route), D, E, F; G and H stay unit-tested-only unless a real rehearsal is done. Phone testing is finished and is not needed again.
 success_criteria:
   - The single exe runs on a clean Windows machine with no GPU and falls back to CPU.
   - Another device reaches the laptop's server on a private network with the token and is refused without it, and an authenticated Tailscale transcription (not just /health) succeeds from a real tailnet peer while the same route from a plain-LAN address is refused.
-  - Tailscale mode works from the phone on mobile data and is invisible on Wi-Fi/Ethernet addresses.
+  - Tailscale mode is reachable by a real tailnet peer (phone /health: done 2026-10-03) and invisible on Wi-Fi/Ethernet addresses (403 network_not_private: done 2026-10-03 from the laptop).
   - On a machine-wide install, a standard Windows user can transcribe but cannot change models or settings.
   - A user's already-downloaded models move into a machine-wide install without a new download.
   - Uninstall leaves no service and no program folder behind, and keeps models.
@@ -96,9 +96,11 @@ On the laptop: `& $exe start --network tailscale`, then `& $exe health`
 (expect: effective tailscale, with the 100.x address); note the port from `status --json` and read
 `user.token` as in section B. Find the laptop's Tailscale machine name with `tailscale status`.
 
-From another tailnet device -- the VM (if it also runs Tailscale) or a phone with an HTTP client
-app (e.g. an app that can send a `multipart/form-data` POST with a header, not just a browser tab,
-since a browser alone cannot attach `Authorization` or upload a file to an arbitrary URL):
+The phone part of this section is DONE (2026-10-03; see the Verification Log) -- no further phone
+testing. The peer for the remaining authenticated-transcription checks is the Hyper-V VM: join it to
+the tailnet and use `curl.exe` there (it can attach `Authorization` and upload a file).
+
+From the VM (on the tailnet):
 
 ```
 GET  http://<TS-NAME>:<PORT>/health                                                    -> expect status: ok, no token needed
@@ -108,7 +110,7 @@ POST http://<TS-NAME>:<PORT>/v1/audio/transcriptions  (no Authorization header, 
                                                                                          -> expect 401 unauthorized
 ```
 
-Then, from the VM or another device reachable only over plain Wi-Fi/Ethernet (not Tailscale),
+Then, from the VM using a plain Wi-Fi/Ethernet path (not Tailscale; e.g. with Tailscale disabled in the VM),
 using the laptop's LAN address while it is still in `--network tailscale` mode:
 
 ```
@@ -204,7 +206,10 @@ recovery with the model reloaded, uninstall keeping models, old-folder migration
 
 ## Attempts
 
-None yet.
+1. 2026-10-03: Partial. Live checks run on the real laptop (LAN/Tailscale mode behaviour from the
+   laptop itself, plus an Android phone as a real tailnet peer for `/health`). Sections A-H are not
+   yet run; the VM session carries the remaining checks (see the status table in the Verification
+   Log).
 
 ## Verification Log
 
@@ -222,6 +227,34 @@ a real tailnet peer, a no-token request expecting 401, and a plain-LAN-address r
 tailscale mode expecting 403. Added sections G (full disk) and H (power loss / interrupted
 download), recorded as unit-tested-only pending a real rehearsal, so every acceptance check from
 the umbrella goal's checklist has an explicit home in this file.
+
+2026-10-03: Live acceptance evidence recorded (real laptop, Windows 11 "rhs-surface", Tailscale
+100.125.201.68, home LAN 10.0.0.18; stt-server 0.3.1 run by Stanzo 0.3.4 -- Stanzo's LAN-mode bug of
+connecting to 0.0.0.0 was fixed in whisper-vibes 36fa22a and released as Stanzo v0.3.4).
+- LAN mode (health: mode lan, effective lan, bound 0.0.0.0:54321): `GET /v1/models` via
+  10.0.0.18 with user.token -> 200; without token -> 401. Caveat: sent from the laptop itself to its
+  own LAN address, NOT from a second device, so this does not close the genuine second-device LAN
+  check.
+- Tailscale mode (health: mode tailscale, effective tailscale, addresses [100.125.201.68]): from
+  the laptop, `/v1/models` via the Tailscale IP with token -> 200; without token -> 401; via the LAN
+  IP 10.0.0.18 with token -> 403 `network_not_private`.
+- Real tailnet peer: Android phone (Pixel 7) on Tailscale, `GET http://100.125.201.68:54321/health`
+  in Chrome -> status ok, effective tailscale. Proves an off-machine tailnet peer reaches the server.
+- Switching Local/LAN/Tailscale from the Stanzo Settings UI works on Stanzo 0.3.4.
+
+Status of the section B/C checks after this entry:
+
+| Check | State |
+|---|---|
+| B: LAN `/v1/models` 200 with token / 401 without (laptop to its own LAN IP) | done, but self-addressed, not a second device |
+| B: genuine second-device LAN `/health`, 401, authenticated transcription of a real WAV, model-per-request, `/models/manage/refresh` 403 | still needed in VM |
+| C: Tailscale `/v1/models` 200 with token / 401 without (from laptop) | done |
+| C: LAN IP in tailscale mode with token -> 403 `network_not_private` (from laptop, `/v1/models`) | done |
+| C: real tailnet peer reaches `/health` (Pixel 7 phone) | done; phone testing finished |
+| C: authenticated transcription 200 / no-token 401 with a real audio file from a tailnet peer | still needed in VM |
+| C: 403 `network_not_private` on `/v1/audio/transcriptions` from a plain-LAN device in tailscale mode | still needed in VM |
+| Switching Local/LAN/Tailscale in Stanzo Settings (0.3.4) | done |
+| A, D, E, F, G, H | not started |
 
 ## Final Outcome
 
