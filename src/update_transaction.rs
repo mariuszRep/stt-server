@@ -102,6 +102,10 @@ impl Journal {
     }
     fn advance(&mut self, phase: Phase) -> Result<()> {
         self.phase = phase;
+        if phase.terminal() {
+            // A finished transaction no longer needs (or blocks on) recovery.
+            self.armed = false;
+        }
         self.save()
     }
 }
@@ -983,6 +987,23 @@ fn saved_network_mode(data_dir: &Path, flags: &RunFlags) -> Result<String> {
         .unwrap_or_else(|| "local".into()))
 }
 
+#[cfg(windows)]
+fn stop_inheriting_stdio() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+    for handle in [
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ] {
+        if !handle.is_null() {
+            // SAFETY: a standard handle owned by this process; failure is harmless.
+            unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+        }
+    }
+}
+#[cfg(not(windows))]
+fn stop_inheriting_stdio() {}
+
 pub async fn install(data_dir: PathBuf, yes: bool, json_output: bool, timeout: u64) -> Result<()> {
     let check = selfupdate::check_latest(
         &reqwest::Client::new(),
@@ -1006,6 +1027,10 @@ pub async fn install(data_dir: PathBuf, yes: bool, json_output: bool, timeout: u
     let guard = lock(&data_dir)?;
     let journal = prepare(&data_dir, &check.release, timeout, &WindowsTasks).await?;
     let log = File::create(journal.work_dir.join("worker.log")).map_err(err)?;
+    // The worker (and the server it restarts) must not keep this CLI's own
+    // stdout/stderr open: a caller reading them through a pipe or file would
+    // otherwise wait until the restarted server exits.
+    stop_inheriting_stdio();
     let mut command = hidden_command(journal.worker());
     command
         .arg("__update-worker")
@@ -1499,6 +1524,20 @@ mod tests {
         // A later update is not refused for a pending recovery.
         drop(startup_guard(&journal.data_dir).unwrap());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reaching_a_terminal_phase_disarms_the_journal() {
+        for phase in [Phase::Committed, Phase::Restored] {
+            let (root, mut journal) = armed_fixture("terminal-disarm");
+            assert!(journal.armed);
+            journal.advance(Phase::Replacing).unwrap();
+            assert!(journal.armed);
+            journal.advance(phase).unwrap();
+            assert!(!journal.armed);
+            assert!(!read_journal(&journal.data_dir).unwrap().unwrap().armed);
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[tokio::test]
