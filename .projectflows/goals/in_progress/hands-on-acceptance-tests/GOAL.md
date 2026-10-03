@@ -4,7 +4,7 @@ title: Hands-On Acceptance Tests (VM, Phone, Tailscale, Shared Machine)
 description: The manual tests only a person with a second device can run, against the final release build, with copy-paste commands and expected results.
 status: in_progress
 type: validation
-scope: stt-server-next only
+scope: stt-server only
 attempt: 1
 max_attempts: 3
 last_result: partial
@@ -26,7 +26,7 @@ source: user
 All development for these areas is done. Only testing remains. Paste each section's output back
 to Claude; results go into the Verification Log below.
 
-**Build under test:** `D:\Users\mariu\Projects\stt-server-next\s\release\stt-server-next.exe`
+**Build under test:** `D:\Users\mariu\Projects\voice-typer\stt-server\s\release\stt-server.exe`
 (record its SHA-256 from the build output before starting).
 
 Replace `<LAPTOP-IP>` with the laptop's Wi-Fi/Ethernet IPv4 (`ipconfig`), and `<TS-NAME>` with its
@@ -41,17 +41,17 @@ user's own server); a machine-wide install never falls back. See `docs/client-co
 
 ## A. Clean machine, no GPU (inside the VM)
 
-Copy `stt-server-next.exe` to `C:\stt\` in the VM. Install nothing else. In a normal PowerShell:
+Copy `stt-server.exe` to `C:\stt\` in the VM. Install nothing else. In a normal PowerShell:
 
 ```powershell
 cd C:\stt
-.\stt-server-next.exe start
-.\stt-server-next.exe status --json          # expect: running: true, version and api_level shown; note the "port" field
-.\stt-server-next.exe models download whisper-tiny --wait
-.\stt-server-next.exe models default whisper-tiny   # sets whisper-tiny as the default AND loads it
-.\stt-server-next.exe health                 # expect: ready; backend CPU with a fallback reason; default_model and loaded_model both whisper-tiny
-.\stt-server-next.exe models download moonshine-tiny --wait   # a second downloaded model (whisper-tiny stays the default)
-.\stt-server-next.exe stop
+.\stt-server.exe start
+.\stt-server.exe status --json          # expect: running: true, version and api_level shown; note the "port" field
+.\stt-server.exe models download whisper-tiny --wait
+.\stt-server.exe models default whisper-tiny   # sets whisper-tiny as the default AND loads it
+.\stt-server.exe health                 # expect: ready; backend CPU with a fallback reason; default_model and loaded_model both whisper-tiny
+.\stt-server.exe models download moonshine-tiny --wait   # a second downloaded model (whisper-tiny stays the default)
+.\stt-server.exe stop
 ```
 
 Pass: every command succeeds; the backend is CPU with a clear reason, not an error; `health`
@@ -63,7 +63,7 @@ loaded default, not just an installed one.
 On the laptop (normal PowerShell):
 
 ```powershell
-$exe = 'D:\Users\mariu\Projects\stt-server-next\s\release\stt-server-next.exe'
+$exe = 'D:\Users\mariu\Projects\voice-typer\stt-server\s\release\stt-server.exe'
 & $exe start --network lan
 & $exe status --json                         # note the actual "port" -- do not assume 54321
 & $exe health                                # expect: network mode lan, effective lan
@@ -129,8 +129,8 @@ Afterwards: `& $exe stop`.
 Admin PowerShell in the VM:
 
 ```powershell
-C:\stt\stt-server-next.exe service install
-$svc = 'C:\Program Files\OpenVibeAI\STT Server\stt-server-next.exe'
+C:\stt\stt-server.exe service install
+$svc = 'C:\Program Files\OpenVibeAI\STT Server\stt-server.exe'
 $data = 'C:\ProgramData\OpenVibeAI\STT Server'
 & $svc models download whisper-tiny --wait --data-dir $data
 & $svc models default whisper-tiny --data-dir $data
@@ -140,7 +140,7 @@ net user tester Test1234! /add               # a standard (non-admin) user
 Sign in as `tester` (or "Run as different user" for PowerShell):
 
 ```powershell
-$svc = 'C:\Program Files\OpenVibeAI\STT Server\stt-server-next.exe'
+$svc = 'C:\Program Files\OpenVibeAI\STT Server\stt-server.exe'
 $data = 'C:\ProgramData\OpenVibeAI\STT Server'
 & $svc health --data-dir $data               # expect: ready
 & $svc models list --data-dir $data          # expect: list shown

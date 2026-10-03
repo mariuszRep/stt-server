@@ -10,8 +10,9 @@ models and serves batch transcription through an OpenAI-compatible API.
 3. This file
 4. The relevant goal: `.projectflows/goals/<status>/<slug>/GOAL.md` in this repository, and
    for cross-repo context the workspace goals in
-   `D:\Users\mariu\Projects\voice-typer\.projectflows\goals\in_progress\`
-   (`build-stt-server-next`, `migrate-voice-typer-to-stt-server-next`, `promote-stt-server-next-to-stt-server`)
+   `D:\Users\mariu\Projects\voice-typer\.projectflows\goals\done\`
+   (`build-stt-server-next`, `migrate-voice-typer-to-stt-server-next`,
+   `promote-stt-server-next-to-stt-server`: historical slugs, all completed)
 5. `README.md`, `docs/client-contract.md`, then the relevant source
 
 ## Repository
@@ -19,11 +20,16 @@ models and serves batch transcription through an OpenAI-compatible API.
 - `mariuszRep/stt-server`, checked out in the workspace as `voice-typer/stt-server` on the
   integration branch `voice-typer-windows` (see the workspace `AGENTS.md` for the sibling-clone
   rules and the cross-repo train).
-- This code was developed as `stt-server-next` and took over this repository at 0.3.0. The
+- This code was first developed under the working name `stt-server-next` and took over this repository at 0.3.0. The
   earlier provider-based server is preserved at tag `legacy-provider-final` and branch
   `legacy`; the previous `main` at tag `legacy-main-final`. Its releases (up to v0.2.10) are
   untouched. Do not delete those refs.
 - Do not create other branches, force-push, rebase, or amend.
+- Current names: executable `stt-server.exe`; Windows service `OpenVibeSttNext` (the service
+  name was not changed by the 0.3.0 rename, so installed services keep working); autostart
+  value `OpenVibeSttServer`; per-user data `%LOCALAPPDATA%\OpenVibeAI\STT Server`; machine-wide
+  program `%ProgramFiles%\OpenVibeAI\STT Server`, data `%ProgramData%\OpenVibeAI\STT Server`.
+  The `STT Server Next` folders in `src/app.rs` are legacy-migration only.
 
 ## Boundaries
 

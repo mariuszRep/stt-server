@@ -4,7 +4,7 @@ title: Install Scope, One Data Folder, and Safe Shared Access
 description: Make every way of running the server use one data folder per install, support per-user and machine-wide installs side by side, and let shared servers be used safely by other users, the local network, and Tailscale.
 status: in_progress
 type: feature
-scope: stt-server-next only
+scope: stt-server only
 attempt: 1
 max_attempts: 8
 last_result: all six slices implemented and gated; real-machine rehearsal (second Windows account, cross-account import-user, clean-VM service reinstall) still outstanding, tracked in hands-on-acceptance-tests
@@ -246,12 +246,12 @@ reporting and model import.
   (unauthenticated) now reports `version` (`CARGO_PKG_VERSION`) and `api_level` alongside the
   existing `status`/`service`/`network` fields; `GET /v1/local/system`'s `server` section reports
   the same two. `server.json` (`discovery::ServerInfo`) gained an `api_level` field (`#[serde(default)]`
-  so an old file without it still parses, reading back as `0`); `stt-server-next status` and
-  `stt-server-next health` both print version/api_level (JSON and human output). `status --json`'s
+  so an old file without it still parses, reading back as `0`); `stt-server status` and
+  `stt-server health` both print version/api_level (JSON and human output). `status --json`'s
   `api_level` is therefore this build's constant if the running server wrote it, or `0` for a
   `server.json` from before this change.
 - **`models import-user`** (admin-only, `src/import_user.rs`, new module): CLI
-  `stt-server-next models import-user [--from <dir>] [--wait] [--json] [--data-dir <path>]` and
+  `stt-server models import-user [--from <dir>] [--wait] [--json] [--data-dir <path>]` and
   `POST /v1/local/models/import-user` `{"from": path}` (from defaults server-side to
   `app::per_user_data_dir()`, the invoking OS user's own per-user data folder). Deliberately does
   *not* open the source's `state.db`: since the managed store and the drop-in folder already share
