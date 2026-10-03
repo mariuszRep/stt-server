@@ -254,7 +254,47 @@ Status of the section B/C checks after this entry:
 | C: authenticated transcription 200 / no-token 401 with a real audio file from a tailnet peer | still needed in VM |
 | C: 403 `network_not_private` on `/v1/audio/transcriptions` from a plain-LAN device in tailscale mode | still needed in VM |
 | Switching Local/LAN/Tailscale in Stanzo Settings (0.3.4) | done |
-| A, D, E, F, G, H | not started |
+| H: interrupted download / power-loss rehearsal (laptop, v0.3.2) | done 2026-10-03; see entry below (self-update kill-mid-install part not run) |
+| A, D, E, F, G | not started |
+
+2026-10-03: Section H run live on the laptop with the public v0.3.2 release exe (downloaded with
+`gh release download v0.3.2 --repo mariuszRep/stt-server`; SHA-256 643a07a9...d9159 matches the
+published `.sha256`). Isolation: scratch dir under the session scratchpad, `--data-dir` and
+`STT_SERVER_DATA_DIR` both set to it, port 54400, foreground `run` started by me (PID tracked,
+killed only by that PID); `status --json` confirmed `data_dir` = the scratch dir before any action.
+The user's real server (Stanzo, port 54321) was never touched; `/health` stayed 200 throughout.
+Model: `whisper-medium` default quant Q8_0, 831,538,144 bytes.
+1. Hard kill mid-download: `models download whisper-medium --json` -> operation `queued`; at
+   `progress_bytes` ~410,773,184 (49%) `Stop-Process -Id <my pid> -Force`. Left behind:
+   `staging\<sha256>.part` = 411,707,072 bytes, `models\` empty, stale `server.json`/`server.lock`.
+   (While the server runs, `dir` reports the open `.part` as 0 bytes -- NTFS metadata lag, the
+   real size appears after the process dies.) `status --json` -> `{"running":false}`.
+2. Restart (`run --port 54400 --data-dir <scratch>`): `status` running, `/health` ok,
+   `default_model:null`; no model flagged `downloaded`; the interrupted operation is reported
+   `state: failed, error: "Interrupted by service restart"` (not silently resumed); `.part` kept.
+   Fresh `models download whisper-medium`: first poll `progress_bytes=411,757,916` (resumed from the
+   partial, not 0); total 47 s for the remaining ~420 MB; `completed`; staging empty, one
+   `models\<sha256>.gguf` of 831,538,144 bytes; `models verify whisper-medium --wait` -> `completed`;
+   `models list` shows whisper-medium Q8_0 downloaded.
+3. Kill in the final verify/move phase: a 3rd download (after `models remove`) polled the operation
+   with a single HttpClient (281k polls) and killed the server the instant `progress_bytes` reached
+   831,538,144 while `state` was still `running` (the verify/rename window is under ~1 s, so this is
+   the closest achievable; the first two attempts finished before the kill landed, and the
+   Invoke-RestMethod polling loop exhausted ephemeral ports for ~5 min -- test-harness artifact).
+   Result: full-size `.part` (831,538,144) in staging, no `.gguf` in `models\`. After restart no
+   model was installed/`downloaded`; re-running `models download whisper-medium --wait` finished in
+   ~0.8 s by reusing the complete `.part` (hash verified, moved), staging emptied, `models verify`
+   `completed`. No corrupt model was ever marked installed.
+4. `models cancel`: download restarted, at ~66 MB `models cancel <operation_id>` -> `state:
+   cancelled, error_code: cancelled`, exit 0; operation stays `cancelled`; model not installed.
+   Observation: the partial `staging\<sha256>.part` (70,557,306 bytes) is retained after cancel
+   (consistent with the resume design, but not "no junk"; it is reused by the next download of
+   that file). Not treated as a defect; a user wanting the space back has no CLI command to clear
+   staging (note for a possible follow-up decision).
+Not run: the `update install --yes` kill/Scheduled-Task-rollback half of section H (needs the VM
+and a real newer release). Cleanup: server stopped by `stop --data-dir`, scratch dir deleted
+(the server ACL-locks its token files, so deleting needed a permission reset), real server
+(PID 8516, Stanzo) still `status: ok` on :54321.
 
 ## Final Outcome
 
