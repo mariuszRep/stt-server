@@ -368,17 +368,28 @@ pub fn task_xml(journal: &Journal, sid: &str) -> String {
         quote_windows_arg(&journal.data_dir.display().to_string())
     );
     format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Triggers>{trigger}</Triggers><Principals><Principal id="Owner"><UserId>{principal}</UserId><LogonType>{logon}</LogonType><RunLevel>{level}</RunLevel></Principal></Principals><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings><Actions Context="Owner"><Exec><Command>{}</Command><Arguments>{}</Arguments></Exec></Actions></Task>"#,
+        r#"<?xml version="1.0" encoding="UTF-16"?><Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Triggers>{trigger}</Triggers><Principals><Principal id="Owner"><UserId>{principal}</UserId><LogonType>{logon}</LogonType><RunLevel>{level}</RunLevel></Principal></Principals><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings><Actions Context="Owner"><Exec><Command>{}</Command><Arguments>{}</Arguments></Exec></Actions></Task>"#,
         xml(&journal.worker().display().to_string()),
         xml(&arguments)
     )
+}
+
+/// The bytes `schtasks /Create /XML` accepts: UTF-16LE with a BOM, matching the
+/// `encoding="UTF-16"` declaration. A UTF-8 file is rejected ("unable to switch
+/// the encoding").
+pub fn task_xml_bytes(journal: &Journal, sid: &str) -> Vec<u8> {
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in task_xml(journal, sid).encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
 }
 impl TaskRunner for WindowsTasks {
     fn register(&self, journal: &Journal) -> Result<()> {
         #[cfg(windows)]
         {
             let task_file = journal.work_dir.join("recovery-task.xml");
-            fs::write(&task_file, task_xml(journal, &owner_sid()?)).map_err(err)?;
+            fs::write(&task_file, task_xml_bytes(journal, &owner_sid()?)).map_err(err)?;
             run_command(
                 hidden_command("schtasks.exe")
                     .args(["/Create", "/TN", &journal.task_name, "/XML"])
@@ -978,6 +989,48 @@ mod tests {
             armed: true,
             error: None,
         }
+    }
+
+    #[test]
+    fn task_xml_bytes_are_utf16le_with_bom_and_matching_declaration() {
+        let journal = sample_journal(PathBuf::from("w"), PathBuf::from("d"));
+        let bytes = task_xml_bytes(&journal, "S-1-5-21-1-2-3-1001");
+        assert_eq!(&bytes[..2], &[0xFF, 0xFE]);
+        assert_eq!((bytes.len() - 2) % 2, 0);
+        let units: Vec<u16> = bytes[2..]
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let text = String::from_utf16(&units).unwrap();
+        assert!(text.starts_with(r#"<?xml version="1.0" encoding="UTF-16"?>"#));
+        assert_eq!(text, task_xml(&journal, "S-1-5-21-1-2-3-1001"));
+    }
+
+    /// Registers and deletes a uniquely named per-user task with the real
+    /// `schtasks.exe` (no admin needed). The guard deletes it even on failure.
+    #[cfg(windows)]
+    #[test]
+    fn real_schtasks_accepts_generated_recovery_task_xml() {
+        struct Cleanup(String, PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = hidden_command("schtasks.exe")
+                    .args(["/Delete", "/TN", &self.0, "/F"])
+                    .output();
+                let _ = fs::remove_dir_all(&self.1);
+            }
+        }
+        let work = temp_dir("schtasks");
+        fs::create_dir_all(&work).unwrap();
+        let journal = sample_journal(work.clone(), work.join("data"));
+        let _cleanup = Cleanup(journal.task_name.clone(), work);
+        WindowsTasks.register(&journal).unwrap();
+        let query = hidden_command("schtasks.exe")
+            .args(["/Query", "/TN", &journal.task_name])
+            .output()
+            .unwrap();
+        assert!(query.status.success(), "task was not registered");
+        WindowsTasks.remove(&journal).unwrap();
     }
 
     // --- validate_response: the decision function behind "expected-version
