@@ -2,13 +2,13 @@
 name: safe-self-update
 title: Safely update and roll back STT Server Next
 description: Let a standalone server install a verified public release and recover automatically if the new program cannot start.
-status: blocked
+status: ready
 type: feature
 scope: stt-server-next only
-attempt: 1
+attempt: 2
 max_attempts: 8
-last_result: blocked -- 0.3.2 rehearsal: recovery-task registration (UTF-16 fix) now works, but the worker aborts at validate_journal ("Invalid update artifact paths") before any change, leaving an armed journal + registered logon task and a server that cannot be restarted; update/rollback only succeed with a throwaway diagnostic patch
-next_action: Fix update_transaction.rs::validate_journal (journal.work_dir is built from the canonicalized exe parent, i.e. with the \?\ prefix, but is compared to the parent of launch.executable, which is stored non-canonical) and make the worker failure path clean up (remove task, disarm journal) instead of leaving it armed; add a test that drives install end to end with a non-canonical launch.executable and the real schtasks; ship a fixed release, then re-run the success and forced-rollback rehearsals on that exact binary (diagnostic result: both pass once the comparison is fixed); finally the live public N->N+1 check.
+last_result: partial -- self-update rehearsed end to end on the fixed 0.3.2 build (success 0.3.2->0.3.3, forced rollback, pre-arm and post-arm failure cleanup with retry); only the live public N->N+1 check remains
+next_action: After 0.3.2 ships as a public GitHub release, run the live check against a real public N->N+1 release pair (for example 0.3.2 and the next release): update check, update install --yes, then confirm the version, a committed journal and no leftover task, in an isolated data dir and port as in the 2026-10-03 entries; then move this goal to done.
 success_criteria:
   - A user can check for a newer released server and choose when to install it through the CLI.
   - The downloaded executable is checked against the release checksum before it can replace the running version.
@@ -213,3 +213,32 @@ Diagnostic only (not the release candidate): to learn whether anything else is b
 So the transaction logic (download, verify, stop, replace, restart, validate, commit, rollback, task removal) works end to end; only the path comparison is wrong. These patched binaries are not release candidates; the exact fixed release binary must be rehearsed again.
 
 Cleanup: isolated servers stopped (ports 54400/54401 free), scratch folder, patched worktree (`git worktree remove` + `prune`) and the extra build directory deleted, the two leftover scratch recovery tasks deleted by name, no OpenVibeSTT tasks present, real server `/health` version 0.3.1 on 54321.
+
+2026-10-03 (fix + rehearsal on the fixed 0.3.2 build; commits 8580cf7 and 1a92ace): **Result: A, B and C pass. Only the live public N->N+1 check remains.**
+
+Fixes (src/update_transaction.rs, with tests): `simplify_path`/`same_path` helpers (strip the `\\?\` / `\\?\UNC\` prefix when a plain form exists; ignore separator style, trailing slash and, on Windows, case) used by `validate_journal`, by `prepare` (executable, data dir, work dir, launch.executable) and for the recovery task command and arguments. A worker whose validation fails while the journal is still `Prepared` now removes the task and disarms. A failed `prepare` removes its work folder. A terminal phase clears `armed`. `update install` marks its own stdout/stderr non-inheritable before spawning the worker (found during this rehearsal: the restarted server kept the caller's redirect file open, so a caller waiting on pipe EOF would block until the server exited). New tests: path helper (verbatim, UNC, no-plain-form, long path, case), canonical work_dir with a plain launch.executable passes validation, task XML has no `\\?\`, post-arm failure removes the task and disarms (startup works again), a failure after the executable was touched stays armed, terminal phases disarm. The real-schtasks test from eaec7b3 still passes.
+Gates on 1a92ace: `cargo fmt --check` clean; `cargo clippy --release --all-targets --offline -- -D warnings` clean; `cargo test --release --offline` 330 lib + 11 + 1 + 5 integration tests passed, 0 failed; `scripts\build-local.ps1 -Offline` OK.
+
+Binary identity: 0.3.2 (unmodified, committed 1a92ace) `s\release\stt-server.exe`, 67231744 bytes, SHA-256 `87E86057C64F5DC0407EE61C719F82D3F5FFE462922D0CB7118B3694BD9CD47A`. The "N+1" binary was built from a throwaway detached worktree at 1a92ace with only the `Cargo.toml` version changed 0.3.2 -> 0.3.3 (`CARGO_TARGET_DIR=C:\vtb`, build-local.ps1 -Offline): SHA-256 `A60A092B895379B8CB516F7F14DED17AABF072BD56A6F376017AF8211F4D8DE5`. Neither is published; the 0.3.3 one is a rehearsal artifact only.
+
+Isolation: scratch folder under the session scratchpad (`rh\bin\stt-server.exe` copy, `rh\data`, `rh\srv`), `STT_SERVER_DATA_DIR` and `--data-dir` set to the scratch data dir, port 54400, manifest served by `python -m http.server 54401 --bind 127.0.0.1` with `STT_SERVER_UPDATE_URL=http://127.0.0.1:54401/manifest.json` (GitHub-style JSON, assets `stt-server.exe` + `stt-server.exe.sha256`), server started with `stt-server.exe start --data-dir <rh\data> --port 54400`. No admin, no service. The user's real server (pid 22380, `C:\Users\mariu\AppData\Local\Stanzo\stt-server.exe`, port 54321) was never touched: `/health` reported 0.3.1 before every scenario and after the last. Each scenario started from a fresh scratch folder and ended with `stop`, `start` (healthy) and `stop`.
+
+A. Success 0.3.2 -> 0.3.3 (manifest `v0.3.3` -> the patched binary):
+- before: exe SHA `87E86057...`, `/health` 0.3.2, no journal, no task. `update check --json` -> `{"current_version":"0.3.2","latest_version":"0.3.3","update_available":true}`.
+- `update install --yes --json --data-dir <rh\data>` -> `{"error":null,"installed":true,"phase":"committed"}`, exit 0.
+- after: exe SHA `A60A092B...`, `/health` and `status --json` 0.3.3 (new pid), journal `phase=committed armed=False task_removed=True`, `schtasks /Query` shows no OpenVibeSTT task. The CLI's captured-output file was writable straight after (handle not leaked). `stop`, then `start` -> healthy 0.3.3.
+
+B. Forced rollback (manifest `v0.3.9` advertising the same 0.3.2 bytes):
+- `update install --yes --json` -> `{"error":"Started executable reports the wrong version","installed":false,"phase":"restored"}`, exit 1.
+- after: exe SHA unchanged `87E86057...`, `/health` 0.3.2 (server restarted and healthy), journal `phase=restored armed=False task_removed=True`, no task. `stop`, then `start` -> healthy 0.3.2.
+
+C1. Failure before arming (manifest with a wrong `.sha256`): `error: downloaded executable's SHA-256 (a60a092b...) does not match the release's checksum (000...0)`, exit 1; exe unchanged, 0.3.2 still running, no journal, no task, no leftover `.stt-update-*` folder. Retry with a good manifest -> `installed:true, phase:committed`, 0.3.3, no task.
+
+C2. Failure after arming (candidate with a matching SHA-256 that is not an executable, manifest `v0.3.3`): `update install --yes --json` -> `{"error":"This version of %1 is not compatible with the version of Windows you're running. ... (os error 216)","installed":false,"phase":"restored"}`, exit 1; exe unchanged `87E86057...`, 0.3.2 restarted and healthy, journal `phase=restored armed=False task_removed=True`, no task. Retry with a good manifest on the same scratch install -> `installed:true, phase:committed`, 0.3.3; `stop`/`start` healthy. So after a post-arm failure a later `update install` is not refused and `start` works.
+- Not rehearsed with the real binaries: a worker validation failure while `Prepared` (cannot be injected between prepare and worker spawn); covered by the unit test `a_worker_failure_after_arming_removes_the_task_and_disarms` with a recording task runner.
+
+Observation (not changed): finished transactions keep their `.stt-update-<id>` work folder (previous.exe, candidate.exe, recovery.exe, journal copy; about 200 MB) beside the executable, and each update adds one; nothing prunes them. Open decision for the user: prune old terminal work folders on the next successful update?
+
+Cleanup: scratch folder (the token files needed an ACL grant before they could be deleted), throwaway worktree (`git worktree remove` + `prune`), `C:\vtb` build dir; http server and all scratch servers stopped (ports 54400/54401 idle), no OpenVibeSTT tasks, real server `/health` 0.3.1 on 54321.
+
+2026-10-03: Goal moved from `blocked` to `ready`: the registration and path bugs are fixed and rehearsed. The only remaining item is the live check of a real public N->N+1 GitHub release after 0.3.2 ships.
