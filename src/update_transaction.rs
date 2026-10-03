@@ -737,6 +737,19 @@ fn cleanup(journal: &mut Journal, tasks: &impl TaskRunner) -> Result<()> {
 /// A run worker applies only a freshly prepared transaction. A recovery worker
 /// always rolls back any uncommitted transaction, never guesses it succeeded.
 pub async fn worker(data_dir: &Path, recover: bool, tasks: &impl TaskRunner) -> Result<()> {
+    let result = run_worker(data_dir, recover, tasks).await;
+    // Best effort and never changes the outcome: the finished transaction's own
+    // folder is kept (this process runs from it and the journal still points
+    // at it); it is pruned by the next update.
+    if let Ok(Some(journal)) = read_journal(data_dir) {
+        if journal.phase.terminal() {
+            prune_finished_work_dirs(data_dir, Some(&journal.work_dir));
+        }
+    }
+    result
+}
+
+async fn run_worker(data_dir: &Path, recover: bool, tasks: &impl TaskRunner) -> Result<()> {
     let _lock = lock(data_dir)?;
     let mut journal = read_journal(data_dir)?.ok_or("No update journal")?;
     if let Err(cause) = validate_journal(&journal, data_dir) {
@@ -776,6 +789,69 @@ pub async fn worker(data_dir: &Path, recover: bool, tasks: &impl TaskRunner) -> 
         return Err(format!("{cause}; previous version restored"));
     }
     cleanup(&mut journal, tasks)
+}
+
+const WORK_DIR_PREFIX: &str = ".stt-update-";
+
+/// Deletes finished `.stt-update-<uuid>` folders next to the journal's
+/// executable. Never touches `keep`, the folder of a journal that is not
+/// terminal or is still armed, or anything that is not named like a work
+/// folder. Failures are logged and ignored.
+fn prune_finished_work_dirs(data_dir: &Path, keep: Option<&Path>) {
+    let journal = match read_journal(data_dir) {
+        Ok(journal) => journal,
+        Err(e) => {
+            eprintln!("update cleanup skipped, journal unreadable: {e}");
+            return;
+        }
+    };
+    let Some(journal) = journal else { return };
+    let Some(exe_dir) = journal.launch.executable.parent() else {
+        return;
+    };
+    let protected = (!journal.phase.terminal() || journal.armed).then_some(journal.work_dir);
+    prune_work_dirs(exe_dir, keep, protected.as_deref(), |dir| {
+        fs::remove_dir_all(dir)
+    });
+}
+
+fn prune_work_dirs(
+    exe_dir: &Path,
+    keep: Option<&Path>,
+    protected: Option<&Path>,
+    remove: impl Fn(&Path) -> std::io::Result<()>,
+) {
+    let entries = match fs::read_dir(exe_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!(
+                "update cleanup skipped, cannot list {}: {e}",
+                exe_dir.display()
+            );
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_work_dir = entry.file_name().to_str().is_some_and(|name| {
+            name.strip_prefix(WORK_DIR_PREFIX)
+                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+        });
+        // file_type does not follow symlinks, so a link is never traversed.
+        if !is_work_dir || !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        if [keep, protected]
+            .into_iter()
+            .flatten()
+            .any(|p| same_path(p, &path))
+        {
+            continue;
+        }
+        if let Err(e) = remove(&path) {
+            eprintln!("could not remove old update folder {}: {e}", path.display());
+        }
+    }
 }
 
 fn validate_journal(journal: &Journal, data_dir: &Path) -> Result<()> {
@@ -841,6 +917,9 @@ async fn prepare_with_id(
             return Err("Previous update requires recovery before another update".into());
         }
         cleanup(&mut old, tasks)?;
+        // The previous transaction is over: its folder (previous.exe, recovery
+        // copy) is no longer needed once a new update replaces its journal.
+        prune_finished_work_dirs(data_dir, None);
     }
     let executable =
         simplify_path(&fs::canonicalize(std::env::current_exe().map_err(err)?).map_err(err)?);
@@ -1550,6 +1629,83 @@ mod tests {
         worker(&journal.data_dir, true, &tasks).await.unwrap_err();
         assert_eq!(tasks.removed.get(), 0);
         assert!(read_journal(&journal.data_dir).unwrap().unwrap().armed);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn work_name() -> String {
+        format!("{WORK_DIR_PREFIX}{}", uuid::Uuid::new_v4())
+    }
+
+    #[test]
+    fn pruning_removes_finished_folders_and_keeps_armed_keep_and_unrelated() {
+        let root = temp_dir("prune");
+        fs::create_dir_all(&root).unwrap();
+        let mk = |name: &str| {
+            let dir = root.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("previous.exe"), b"x").unwrap();
+            dir
+        };
+        let old_a = mk(&work_name());
+        let old_b = mk(&work_name());
+        let armed = mk(&work_name());
+        let keep = mk(&work_name());
+        let unrelated = mk("other-folder");
+        let lookalike = mk(".stt-update-notes");
+        let file = root.join(work_name());
+        fs::write(&file, b"not a folder").unwrap();
+        prune_work_dirs(&root, Some(&keep), Some(&armed), |d| fs::remove_dir_all(d));
+        assert!(!old_a.exists() && !old_b.exists());
+        assert!(armed.exists() && keep.exists());
+        assert!(unrelated.exists() && lookalike.exists() && file.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pruning_tolerates_deletion_errors() {
+        let root = temp_dir("prune-errors");
+        fs::create_dir_all(&root).unwrap();
+        let dirs: Vec<_> = (0..3)
+            .map(|_| {
+                let d = root.join(work_name());
+                fs::create_dir_all(&d).unwrap();
+                d
+            })
+            .collect();
+        let attempts = std::cell::Cell::new(0);
+        prune_work_dirs(&root, None, None, |_| {
+            attempts.set(attempts.get() + 1);
+            Err(std::io::Error::other("in use"))
+        });
+        assert_eq!(attempts.get(), 3);
+        assert!(dirs.iter().all(|d| d.exists()));
+        prune_work_dirs(&root.join("missing"), None, None, |_| Ok(()));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn worker_prunes_other_folders_after_commit_but_not_while_armed() {
+        let (root, mut journal) = armed_fixture("prune-worker");
+        let exe_dir = journal.launch.executable.parent().unwrap().to_path_buf();
+        let stale = exe_dir.join(work_name());
+        fs::create_dir_all(&stale).unwrap();
+        // Armed, non-terminal journal: a failing recovery must not prune.
+        journal.phase = Phase::Replacing;
+        fs::write(journal.worker(), b"tampered").unwrap();
+        journal.save().unwrap();
+        worker(&journal.data_dir, true, &RecordingTasks::default())
+            .await
+            .unwrap_err();
+        assert!(stale.exists());
+        // Terminal journal: stale folder goes, own folder stays.
+        journal.phase = Phase::Committed;
+        journal.armed = false;
+        journal.save().unwrap();
+        worker(&journal.data_dir, false, &RecordingTasks::default())
+            .await
+            .ok();
+        assert!(!stale.exists());
+        assert!(journal.work_dir.exists());
         let _ = fs::remove_dir_all(root);
     }
 }
