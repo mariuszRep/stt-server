@@ -7,8 +7,8 @@ type: feature
 scope: stt-server-next only
 attempt: 1
 max_attempts: 8
-last_result: reimplemented as a journalled transaction (src/update_transaction.rs); covered by unit tests and real-binary integration tests (tests/update_transaction.rs); real GitHub Releases source and live release-to-release rehearsal still untested (repo private)
-next_action: Rehearse a live N to N+1 update and forced rollback with two real tagged binaries once a release source exists.
+last_result: blocked -- live 0.3.0->0.3.1 rehearsal against public releases found a real bug: `update install --yes` fails safely at recovery-task registration (schtasks rejects the UTF-8 task XML); nothing was replaced
+next_action: Fix update_transaction.rs so recovery-task.xml is written in an encoding schtasks accepts (UTF-16 LE with BOM and encoding="UTF-16", verified manually), add a test that exercises the real schtasks registration, ship a fixed release (>0.3.1), then rehearse N->N+1 and forced rollback again (forced rollback can use a local STT_SERVER_UPDATE_URL manifest advertising a higher tag over the same binary, which triggers the version-mismatch rollback).
 success_criteria:
   - A user can check for a newer released server and choose when to install it through the CLI.
   - The downloaded executable is checked against the release checksum before it can replace the running version.
@@ -148,3 +148,47 @@ fresh pass/fail count; confirm the run's result separately before relying on thi
 This does not change what remains blocked: the only outstanding check is a live update from one
 real tagged GitHub release to the next (and a forced rollback of it), which needs the repository
 to be public with a first published release -- unchanged from the 2026-09-28 entry above.
+
+2026-10-03: Live rehearsal attempted against the now-public releases (mariuszRep/stt-server v0.3.0
+and v0.3.1, each with `stt-server.exe`, `stt-server.exe.sha256`, `manifest.json`). **Result: blocked
+by a real bug; the update itself could not be rehearsed.** Evidence follows.
+
+Isolation: everything ran in a throwaway scratch folder with its own `--data-dir`, port 54400 and
+`STT_SERVER_DATA_DIR` set as an override, so scope resolution could not fall back to
+`%LOCALAPPDATA%\OpenVibeAI\STT Server`. The user's real server (Stanzo, port 54321) was never
+touched; its `/health` reported version 0.3.1 before and after. No service, autostart or admin.
+
+Commands and outputs:
+
+- `gh release view v0.3.0|v0.3.1 --repo mariuszRep/stt-server`: assets manifest.json, stt-server.exe
+  (67218432 / 67219968 bytes), stt-server.exe.sha256. Downloaded SHA-256: v0.3.0
+  `7fe436d857c2d25fb40e300c1e25fc9620d7158a23298454f15abac23f09dffb`, v0.3.1
+  `71c6a15f7b08389adf87827e86ef0355782c9bd7b0d2637295eb74eece3a33d6`; both match their .sha256 files.
+- `stt-server.exe run --data-dir <scratch>\data --port 54400` (0.3.0), then `status --json`:
+  `{"data_dir":"<scratch>\data","port":54400,"running":true,"version":"0.3.0",...}`; `/health` version 0.3.0.
+- `update check --json` -> `{"current_version":"0.3.0","latest_version":"0.3.1","update_available":true}` (passes).
+- `update install --json` (no `--yes`) -> `{"installed":false,"reason":"confirmation_required",...}` (passes; nothing downloaded or changed).
+- `update install --yes --json` -> exit 1:
+  `error: Recovery task registration failed: ERROR: The task XML is malformed. (1,40)::ERROR: unable to switch the encoding`
+  Journal ended `phase: restored`, `armed: false`, error as above. The failure was safe: the installed
+  exe hash stayed `7FE436D8...` (0.3.0), the 0.3.0 server stayed up and healthy on 54400, the real
+  server was untouched, and no recovery scheduled task was left behind.
+- Diagnosis: `WindowsTasks::register` (src/update_transaction.rs) writes `recovery-task.xml` with
+  `fs::write` as UTF-8 while the XML declares `encoding="UTF-8"`; `schtasks /Create /XML` rejects
+  that. Re-encoding the identical file as UTF-16 with `encoding="UTF-16"` registered and deleted
+  cleanly (`SUCCESS` both ways, throwaway task name, nothing left). So every `update install --yes`
+  on Windows, including from the released 0.3.0 and 0.3.1 binaries, fails at this step. Unit and
+  integration tests did not catch it because they use a stand-in task runner, not real schtasks.
+  Per instructions the code was not changed.
+- Forced rollback: not rehearsed; it is only reachable after registration succeeds. The code has no
+  test-only env seam for failing readiness (only `STT_SERVER_TEST_SLOW_LOAD_MS`, which affects model
+  load). The existing `STT_SERVER_UPDATE_URL` override could force it without code change (a local
+  manifest tagged higher than the real version over the same binary causes the version-mismatch
+  rollback), but only once the registration bug is fixed. No workaround shim for schtasks was used,
+  to avoid faking the mechanism.
+- Cleanup: isolated server stopped (`stopped via shutdown endpoint`, port 54400 down), scratch folder
+  deleted, no OpenVibeSTT recovery tasks present, real server `/health` version 0.3.1.
+
+Note: the update-source section above still mentions `stt-server-next` asset names; the code and
+releases now use `stt-server.exe` / `stt-server.exe.sha256` and the `mariuszRep/stt-server` repo.
+Public-source blocker is resolved; the new blocker is the registration bug.
