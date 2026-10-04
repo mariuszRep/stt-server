@@ -44,7 +44,7 @@ Handy's desktop UI, microphone capture, ONNX and legacy bin models, public relea
 
 ## Related goals
 
-- draft/ready-for-voice-typer: overall acceptance.
+- cancelled/ready-for-voice-typer: overall acceptance.
 - voice-typer/in_progress/build-stt-server-next: original model-coverage commitment and current evidence log.
 
 ## Attempts

@@ -43,7 +43,7 @@ Self-update, new model families, a desktop UI and an alternate model database.
 
 ## Related goals
 
-- draft/ready-for-voice-typer: server acceptance umbrella.
+- cancelled/ready-for-voice-typer: server acceptance umbrella.
 - voice-typer/in_progress/build-stt-server-next: standalone replacement criteria.
 
 ## Attempts

@@ -4,7 +4,7 @@ title: Install Scope, One Data Folder, and Safe Shared Access
 description: Make every way of running the server use one data folder per install, support per-user and machine-wide installs side by side, and let shared servers be used safely by other users, the local network, and Tailscale.
 status: in_progress
 type: feature
-scope: stt-server-next only
+scope: stt-server only
 attempt: 1
 max_attempts: 8
 last_result: all six slices implemented and gated; real-machine rehearsal (second Windows account, cross-account import-user, clean-VM service reinstall) still outstanding, tracked in hands-on-acceptance-tests
@@ -91,7 +91,7 @@ version warnings in the app), macOS and Linux, multiple servers behind one addre
 
 ## Related goals
 
-- `draft/ready-for-voice-typer` (service, LAN and clean-machine acceptance).
+- `cancelled/ready-for-voice-typer` (service, LAN and clean-machine acceptance).
 - `whisper-vibes`: `draft/switch-to-stt-server-next`; `stt-sdk`: `draft/stt-server-next-adapter`.
 
 ## Attempts
@@ -246,12 +246,12 @@ reporting and model import.
   (unauthenticated) now reports `version` (`CARGO_PKG_VERSION`) and `api_level` alongside the
   existing `status`/`service`/`network` fields; `GET /v1/local/system`'s `server` section reports
   the same two. `server.json` (`discovery::ServerInfo`) gained an `api_level` field (`#[serde(default)]`
-  so an old file without it still parses, reading back as `0`); `stt-server-next status` and
-  `stt-server-next health` both print version/api_level (JSON and human output). `status --json`'s
+  so an old file without it still parses, reading back as `0`); `stt-server status` and
+  `stt-server health` both print version/api_level (JSON and human output). `status --json`'s
   `api_level` is therefore this build's constant if the running server wrote it, or `0` for a
   `server.json` from before this change.
 - **`models import-user`** (admin-only, `src/import_user.rs`, new module): CLI
-  `stt-server-next models import-user [--from <dir>] [--wait] [--json] [--data-dir <path>]` and
+  `stt-server models import-user [--from <dir>] [--wait] [--json] [--data-dir <path>]` and
   `POST /v1/local/models/import-user` `{"from": path}` (from defaults server-side to
   `app::per_user_data_dir()`, the invoking OS user's own per-user data folder). Deliberately does
   *not* open the source's `state.db`: since the managed store and the drop-in folder already share
@@ -282,6 +282,22 @@ reporting and model import.
 - Gates: `cargo fmt --check` clean, `cargo clippy --all-targets -- -D warnings` clean, `cargo test`
   271 lib + 11 bin passed (282 total, 0 failed). Not committed per instruction.
 
+2026-10-03: Network modes checked live (no code change) (real laptop, Windows 11 "rhs-surface", Tailscale
+100.125.201.68, home LAN 10.0.0.18; stt-server 0.3.1 run by Stanzo 0.3.4 -- Stanzo's LAN-mode bug of
+connecting to 0.0.0.0 was fixed in whisper-vibes 36fa22a and released as Stanzo v0.3.4).
+- LAN mode (health: mode lan, effective lan, bound 0.0.0.0:54321): `GET /v1/models` via
+  10.0.0.18 with user.token -> 200; without token -> 401. Caveat: sent from the laptop itself to its
+  own LAN address, NOT from a second device, so this does not close the genuine second-device LAN
+  check.
+- Tailscale mode (health: mode tailscale, effective tailscale, addresses [100.125.201.68]): from
+  the laptop, `/v1/models` via the Tailscale IP with token -> 200; without token -> 401; via the LAN
+  IP 10.0.0.18 with token -> 403 `network_not_private`.
+- Real tailnet peer: Android phone (Pixel 7) on Tailscale, `GET http://100.125.201.68:54321/health`
+  in Chrome -> status ok, effective tailscale. Proves an off-machine tailnet peer reaches the server.
+- Switching Local/LAN/Tailscale from the Stanzo Settings UI works on Stanzo 0.3.4.
+  Still outstanding for this goal: second Windows account, cross-account `import-user`, clean-VM
+  service reinstall, and a genuine second-device LAN check (all in `in_progress/hands-on-acceptance-tests`).
+
 Every success criterion in this goal's slices (install scope/one data folder, several users on one
 PC, access levels, network modes including Tailscale, versions and moving models between scopes)
 now has an implementation and passing tests. Status stays `in_progress`: the real multi-user and
@@ -289,3 +305,5 @@ clean-VM rehearsals called for in the goal (a genuine second Windows account exe
 machine-wide install's `user.token`, a real `models import-user` run between a per-user account's
 real models and a machine-wide service install, and the clean-VM service install/uninstall
 recheck noted above) have not been done.
+
+2026-10-03: The Windows service was renamed from `OpenVibeSttNext` to `OpenVibeSttServer` (display name `STT Server`) in 0.3.2. `service install` stops and deletes a legacy `OpenVibeSttNext` service first; `service uninstall` removes either name; the self-updater stops/starts whichever is registered. The real-service rehearsal and clean-VM recheck above must use the new name, and should also cover upgrading a machine that still has the legacy service.

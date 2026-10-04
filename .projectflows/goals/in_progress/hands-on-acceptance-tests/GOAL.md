@@ -2,17 +2,17 @@
 name: hands-on-acceptance-tests
 title: Hands-On Acceptance Tests (VM, Phone, Tailscale, Shared Machine)
 description: The manual tests only a person with a second device can run, against the final release build, with copy-paste commands and expected results.
-status: ready
+status: in_progress
 type: validation
-scope: stt-server-next only
-attempt: 0
+scope: stt-server only
+attempt: 1
 max_attempts: 3
-last_result: none
-next_action: Set up a Windows 11 Hyper-V VM on an External switch, copy the release exe into it, then run sections A to F in order and paste results back; sections G and H are recorded as unit-tested-only unless a real rehearsal is also done.
+last_result: partial
+next_action: Hyper-V VM session (VM on an External switch, joined to the tailnet, using curl.exe): run sections A, B (genuine second-device LAN transcription), C (authenticated Tailscale 200/401 with a real audio file from the VM peer, plus plain-LAN 403 on a transcription route), D, E, F; G and H stay unit-tested-only unless a real rehearsal is done. Phone testing is finished and is not needed again.
 success_criteria:
   - The single exe runs on a clean Windows machine with no GPU and falls back to CPU.
   - Another device reaches the laptop's server on a private network with the token and is refused without it, and an authenticated Tailscale transcription (not just /health) succeeds from a real tailnet peer while the same route from a plain-LAN address is refused.
-  - Tailscale mode works from the phone on mobile data and is invisible on Wi-Fi/Ethernet addresses.
+  - Tailscale mode is reachable by a real tailnet peer (phone /health: done 2026-10-03) and invisible on Wi-Fi/Ethernet addresses (403 network_not_private: done 2026-10-03 from the laptop).
   - On a machine-wide install, a standard Windows user can transcribe but cannot change models or settings.
   - A user's already-downloaded models move into a machine-wide install without a new download.
   - Uninstall leaves no service and no program folder behind, and keeps models.
@@ -26,7 +26,7 @@ source: user
 All development for these areas is done. Only testing remains. Paste each section's output back
 to Claude; results go into the Verification Log below.
 
-**Build under test:** `D:\Users\mariu\Projects\stt-server-next\s\release\stt-server-next.exe`
+**Build under test:** `D:\Users\mariu\Projects\voice-typer\stt-server\s\release\stt-server.exe`
 (record its SHA-256 from the build output before starting).
 
 Replace `<LAPTOP-IP>` with the laptop's Wi-Fi/Ethernet IPv4 (`ipconfig`), and `<TS-NAME>` with its
@@ -41,17 +41,17 @@ user's own server); a machine-wide install never falls back. See `docs/client-co
 
 ## A. Clean machine, no GPU (inside the VM)
 
-Copy `stt-server-next.exe` to `C:\stt\` in the VM. Install nothing else. In a normal PowerShell:
+Copy `stt-server.exe` to `C:\stt\` in the VM. Install nothing else. In a normal PowerShell:
 
 ```powershell
 cd C:\stt
-.\stt-server-next.exe start
-.\stt-server-next.exe status --json          # expect: running: true, version and api_level shown; note the "port" field
-.\stt-server-next.exe models download whisper-tiny --wait
-.\stt-server-next.exe models default whisper-tiny   # sets whisper-tiny as the default AND loads it
-.\stt-server-next.exe health                 # expect: ready; backend CPU with a fallback reason; default_model and loaded_model both whisper-tiny
-.\stt-server-next.exe models download moonshine-tiny --wait   # a second downloaded model (whisper-tiny stays the default)
-.\stt-server-next.exe stop
+.\stt-server.exe start
+.\stt-server.exe status --json          # expect: running: true, version and api_level shown; note the "port" field
+.\stt-server.exe models download whisper-tiny --wait
+.\stt-server.exe models default whisper-tiny   # sets whisper-tiny as the default AND loads it
+.\stt-server.exe health                 # expect: ready; backend CPU with a fallback reason; default_model and loaded_model both whisper-tiny
+.\stt-server.exe models download moonshine-tiny --wait   # a second downloaded model (whisper-tiny stays the default)
+.\stt-server.exe stop
 ```
 
 Pass: every command succeeds; the backend is CPU with a clear reason, not an error; `health`
@@ -63,7 +63,7 @@ loaded default, not just an installed one.
 On the laptop (normal PowerShell):
 
 ```powershell
-$exe = 'D:\Users\mariu\Projects\stt-server-next\s\release\stt-server-next.exe'
+$exe = 'D:\Users\mariu\Projects\voice-typer\stt-server\s\release\stt-server.exe'
 & $exe start --network lan
 & $exe status --json                         # note the actual "port" -- do not assume 54321
 & $exe health                                # expect: network mode lan, effective lan
@@ -96,9 +96,11 @@ On the laptop: `& $exe start --network tailscale`, then `& $exe health`
 (expect: effective tailscale, with the 100.x address); note the port from `status --json` and read
 `user.token` as in section B. Find the laptop's Tailscale machine name with `tailscale status`.
 
-From another tailnet device -- the VM (if it also runs Tailscale) or a phone with an HTTP client
-app (e.g. an app that can send a `multipart/form-data` POST with a header, not just a browser tab,
-since a browser alone cannot attach `Authorization` or upload a file to an arbitrary URL):
+The phone part of this section is DONE (2026-10-03; see the Verification Log) -- no further phone
+testing. The peer for the remaining authenticated-transcription checks is the Hyper-V VM: join it to
+the tailnet and use `curl.exe` there (it can attach `Authorization` and upload a file).
+
+From the VM (on the tailnet):
 
 ```
 GET  http://<TS-NAME>:<PORT>/health                                                    -> expect status: ok, no token needed
@@ -108,7 +110,7 @@ POST http://<TS-NAME>:<PORT>/v1/audio/transcriptions  (no Authorization header, 
                                                                                          -> expect 401 unauthorized
 ```
 
-Then, from the VM or another device reachable only over plain Wi-Fi/Ethernet (not Tailscale),
+Then, from the VM using a plain Wi-Fi/Ethernet path (not Tailscale; e.g. with Tailscale disabled in the VM),
 using the laptop's LAN address while it is still in `--network tailscale` mode:
 
 ```
@@ -127,8 +129,8 @@ Afterwards: `& $exe stop`.
 Admin PowerShell in the VM:
 
 ```powershell
-C:\stt\stt-server-next.exe service install
-$svc = 'C:\Program Files\OpenVibeAI\STT Server\stt-server-next.exe'
+C:\stt\stt-server.exe service install
+$svc = 'C:\Program Files\OpenVibeAI\STT Server\stt-server.exe'
 $data = 'C:\ProgramData\OpenVibeAI\STT Server'
 & $svc models download whisper-tiny --wait --data-dir $data
 & $svc models default whisper-tiny --data-dir $data
@@ -138,7 +140,7 @@ net user tester Test1234! /add               # a standard (non-admin) user
 Sign in as `tester` (or "Run as different user" for PowerShell):
 
 ```powershell
-$svc = 'C:\Program Files\OpenVibeAI\STT Server\stt-server-next.exe'
+$svc = 'C:\Program Files\OpenVibeAI\STT Server\stt-server.exe'
 $data = 'C:\ProgramData\OpenVibeAI\STT Server'
 & $svc health --data-dir $data               # expect: ready
 & $svc models list --data-dir $data          # expect: list shown
@@ -167,7 +169,7 @@ deletes the file:
 ```powershell
 & $svc service uninstall
 Start-Sleep 15
-Get-Service OpenVibeSttNext -ErrorAction SilentlyContinue      # expect: nothing
+Get-Service OpenVibeSttServer -ErrorAction SilentlyContinue      # expect: nothing
 Test-Path 'C:\Program Files\OpenVibeAI\STT Server'             # expect: False
 Get-ChildItem "$data\models" | Select Name                     # expect: model file kept
 ```
@@ -204,7 +206,10 @@ recovery with the model reloaded, uninstall keeping models, old-folder migration
 
 ## Attempts
 
-None yet.
+1. 2026-10-03: Partial. Live checks run on the real laptop (LAN/Tailscale mode behaviour from the
+   laptop itself, plus an Android phone as a real tailnet peer for `/health`). Sections A-H are not
+   yet run; the VM session carries the remaining checks (see the status table in the Verification
+   Log).
 
 ## Verification Log
 
@@ -222,6 +227,77 @@ a real tailnet peer, a no-token request expecting 401, and a plain-LAN-address r
 tailscale mode expecting 403. Added sections G (full disk) and H (power loss / interrupted
 download), recorded as unit-tested-only pending a real rehearsal, so every acceptance check from
 the umbrella goal's checklist has an explicit home in this file.
+
+2026-10-03: Live acceptance evidence recorded (real laptop, Windows 11 "rhs-surface", Tailscale
+100.125.201.68, home LAN 10.0.0.18; stt-server 0.3.1 run by Stanzo 0.3.4 -- Stanzo's LAN-mode bug of
+connecting to 0.0.0.0 was fixed in whisper-vibes 36fa22a and released as Stanzo v0.3.4).
+- LAN mode (health: mode lan, effective lan, bound 0.0.0.0:54321): `GET /v1/models` via
+  10.0.0.18 with user.token -> 200; without token -> 401. Caveat: sent from the laptop itself to its
+  own LAN address, NOT from a second device, so this does not close the genuine second-device LAN
+  check.
+- Tailscale mode (health: mode tailscale, effective tailscale, addresses [100.125.201.68]): from
+  the laptop, `/v1/models` via the Tailscale IP with token -> 200; without token -> 401; via the LAN
+  IP 10.0.0.18 with token -> 403 `network_not_private`.
+- Real tailnet peer: Android phone (Pixel 7) on Tailscale, `GET http://100.125.201.68:54321/health`
+  in Chrome -> status ok, effective tailscale. Proves an off-machine tailnet peer reaches the server.
+- Switching Local/LAN/Tailscale from the Stanzo Settings UI works on Stanzo 0.3.4.
+
+Status of the section B/C checks after this entry:
+
+| Check | State |
+|---|---|
+| B: LAN `/v1/models` 200 with token / 401 without (laptop to its own LAN IP) | done, but self-addressed, not a second device |
+| B: genuine second-device LAN `/health`, 401, authenticated transcription of a real WAV, model-per-request, `/models/manage/refresh` 403 | still needed in VM |
+| C: Tailscale `/v1/models` 200 with token / 401 without (from laptop) | done |
+| C: LAN IP in tailscale mode with token -> 403 `network_not_private` (from laptop, `/v1/models`) | done |
+| C: real tailnet peer reaches `/health` (Pixel 7 phone) | done; phone testing finished |
+| C: authenticated transcription 200 / no-token 401 with a real audio file from a tailnet peer | still needed in VM |
+| C: 403 `network_not_private` on `/v1/audio/transcriptions` from a plain-LAN device in tailscale mode | still needed in VM |
+| Switching Local/LAN/Tailscale in Stanzo Settings (0.3.4) | done |
+| H: interrupted download / power-loss rehearsal (laptop, v0.3.2) | done 2026-10-03; see entry below (self-update kill-mid-install part not run) |
+| A, D, E, F, G | not started |
+
+2026-10-03: Section H run live on the laptop with the public v0.3.2 release exe (downloaded with
+`gh release download v0.3.2 --repo mariuszRep/stt-server`; SHA-256 643a07a9...d9159 matches the
+published `.sha256`). Isolation: scratch dir under the session scratchpad, `--data-dir` and
+`STT_SERVER_DATA_DIR` both set to it, port 54400, foreground `run` started by me (PID tracked,
+killed only by that PID); `status --json` confirmed `data_dir` = the scratch dir before any action.
+The user's real server (Stanzo, port 54321) was never touched; `/health` stayed 200 throughout.
+Model: `whisper-medium` default quant Q8_0, 831,538,144 bytes.
+1. Hard kill mid-download: `models download whisper-medium --json` -> operation `queued`; at
+   `progress_bytes` ~410,773,184 (49%) `Stop-Process -Id <my pid> -Force`. Left behind:
+   `staging\<sha256>.part` = 411,707,072 bytes, `models\` empty, stale `server.json`/`server.lock`.
+   (While the server runs, `dir` reports the open `.part` as 0 bytes -- NTFS metadata lag, the
+   real size appears after the process dies.) `status --json` -> `{"running":false}`.
+2. Restart (`run --port 54400 --data-dir <scratch>`): `status` running, `/health` ok,
+   `default_model:null`; no model flagged `downloaded`; the interrupted operation is reported
+   `state: failed, error: "Interrupted by service restart"` (not silently resumed); `.part` kept.
+   Fresh `models download whisper-medium`: first poll `progress_bytes=411,757,916` (resumed from the
+   partial, not 0); total 47 s for the remaining ~420 MB; `completed`; staging empty, one
+   `models\<sha256>.gguf` of 831,538,144 bytes; `models verify whisper-medium --wait` -> `completed`;
+   `models list` shows whisper-medium Q8_0 downloaded.
+3. Kill in the final verify/move phase: a 3rd download (after `models remove`) polled the operation
+   with a single HttpClient (281k polls) and killed the server the instant `progress_bytes` reached
+   831,538,144 while `state` was still `running` (the verify/rename window is under ~1 s, so this is
+   the closest achievable; the first two attempts finished before the kill landed, and the
+   Invoke-RestMethod polling loop exhausted ephemeral ports for ~5 min -- test-harness artifact).
+   Result: full-size `.part` (831,538,144) in staging, no `.gguf` in `models\`. After restart no
+   model was installed/`downloaded`; re-running `models download whisper-medium --wait` finished in
+   ~0.8 s by reusing the complete `.part` (hash verified, moved), staging emptied, `models verify`
+   `completed`. No corrupt model was ever marked installed.
+4. `models cancel`: download restarted, at ~66 MB `models cancel <operation_id>` -> `state:
+   cancelled, error_code: cancelled`, exit 0; operation stays `cancelled`; model not installed.
+   Observation: the partial `staging\<sha256>.part` (70,557,306 bytes) is retained after cancel
+   (consistent with the resume design, but not "no junk"; it is reused by the next download of
+   that file). Not treated as a defect; a user wanting the space back has no CLI command to clear
+   staging (note for a possible follow-up decision).
+   Follow-up implemented (commit c25c006): server start now prunes `staging\*.part` files not owned by a
+   queued/running operation that are older than 7 days (mtime) or whose model is already installed and
+   verified; `models cancel` still keeps the part for resume; cleanup errors are logged, never fatal.
+Not run: the `update install --yes` kill/Scheduled-Task-rollback half of section H (needs the VM
+and a real newer release). Cleanup: server stopped by `stop --data-dir`, scratch dir deleted
+(the server ACL-locks its token files, so deleting needed a permission reset), real server
+(PID 8516, Stanzo) still `status: ok` on :54321.
 
 ## Final Outcome
 
