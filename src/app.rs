@@ -527,6 +527,97 @@ fn reconcile_interrupted_imports(db: &Connection, data_dir: &Path) -> Result<(),
     Ok(())
 }
 
+/// Age after which an unowned `staging/*.part` file is considered abandoned.
+pub const STAGING_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Removes abandoned download/import staging files. A cancelled or never
+/// retried download keeps its `.part` file so a retry can resume; this only
+/// removes parts that no queued/running operation owns and that either are
+/// older than `max_age` (by mtime) or belong to a model whose verified final
+/// file is already installed. Never errors: problems are logged and skipped.
+/// Returns the number of files removed.
+pub fn prune_staging(
+    db: &Connection,
+    catalog: &[CatalogModel],
+    data_dir: &Path,
+    max_age: Duration,
+) -> usize {
+    let staging = data_dir.join("staging");
+    let Ok(entries) = fs::read_dir(&staging) else {
+        return 0;
+    };
+    let mut active_ops: Vec<String> = Vec::new();
+    let mut active_hashes: Vec<String> = Vec::new();
+    match db.prepare("SELECT id,model_id FROM operations WHERE state IN ('queued','running')") {
+        Ok(mut query) => match query.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) {
+            Ok(rows) => {
+                for (op, model_id) in rows.flatten() {
+                    active_ops.push(op.to_ascii_lowercase());
+                    for model in catalog.iter().filter(|m| m.slug == model_id) {
+                        active_hashes
+                            .extend(model.files.iter().map(|f| f.sha256.to_ascii_lowercase()));
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("staging cleanup skipped: {error}");
+                return 0;
+            }
+        },
+        Err(error) => {
+            eprintln!("staging cleanup skipped: {error}");
+            return 0;
+        }
+    }
+    let now = std::time::SystemTime::now();
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        let Some(stem) = name.strip_suffix(".part") else {
+            continue;
+        };
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        if active_hashes.iter().any(|h| h == stem) || active_ops.iter().any(|op| stem.contains(op))
+        {
+            continue;
+        }
+        let installed = db
+            .query_row(
+                "SELECT path FROM installed WHERE lower(sha256)=?1 AND needs_verification=0",
+                params![stem],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .is_some_and(|final_path| Path::new(&final_path).is_file());
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .is_some_and(|age| age > max_age);
+        if !(installed || old) {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                removed += 1;
+                eprintln!("removed stale staging file {}", path.display());
+            }
+            Err(error) => eprintln!("could not remove staging file {}: {error}", path.display()),
+        }
+    }
+    removed
+}
+
 pub fn open_app() -> Result<Arc<App>, Box<dyn Error>> {
     open_app_at(data_dir())
 }
@@ -577,6 +668,9 @@ pub fn open_app_at_full(
         reconcile_interrupted_imports(&db, &data_dir)?;
     }
     reconcile_installed(&db, &catalog.models, &data_dir)?;
+    if !crate::update_transaction::maintenance(&data_dir) {
+        prune_staging(&db, &catalog.models, &data_dir, STAGING_MAX_AGE);
+    }
     let mut selected: Option<(String, String)> = db
         .query_row(
             "SELECT i.id,i.path FROM installed i JOIN settings s ON s.key='selected_model' AND s.value=i.id WHERE i.needs_verification=0",
@@ -894,6 +988,114 @@ mod tests {
         let resolved = path.canonicalize().unwrap();
         assert!(resolved.starts_with(&parent));
         fs::remove_dir_all(resolved).unwrap();
+    }
+
+    fn prune_fixture() -> (PathBuf, Connection, Vec<CatalogModel>) {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(path.join("staging")).unwrap();
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE operations(id TEXT PRIMARY KEY, model_id TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL);
+             CREATE TABLE installed(id TEXT PRIMARY KEY, path TEXT NOT NULL, sha256 TEXT NOT NULL, needs_verification INTEGER NOT NULL DEFAULT 0);",
+        )
+        .unwrap();
+        let catalog: Catalog =
+            serde_json::from_str(include_str!("../catalog/handy-2026-08-17.json")).unwrap();
+        (path, db, catalog.models)
+    }
+
+    fn put_part(dir: &Path, name: &str, age_days: u64) -> PathBuf {
+        let file = dir.join("staging").join(name);
+        fs::write(&file, b"partial").unwrap();
+        let mtime = std::time::SystemTime::now() - Duration::from_secs(age_days * 86_400);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        file
+    }
+
+    #[test]
+    fn prune_staging_removes_old_orphans_and_keeps_the_rest() {
+        let (dir, db, models) = prune_fixture();
+        let old = put_part(&dir, &format!("{}.part", "a".repeat(64)), 10);
+        let recent = put_part(&dir, &format!("{}.part", "b".repeat(64)), 1);
+        let unrelated = put_part(&dir, "notes.txt", 30);
+        let file = &models[0].files[0];
+        let active = put_part(&dir, &format!("{}.part", file.sha256), 30);
+        db.execute(
+            "INSERT INTO operations(id,model_id,kind,state) VALUES('op1',?1,'install','running')",
+            params![models[0].slug],
+        )
+        .unwrap();
+        let removed = prune_staging(&db, &models, &dir, STAGING_MAX_AGE);
+        assert_eq!(removed, 1);
+        assert!(!old.exists());
+        assert!(recent.exists());
+        assert!(unrelated.exists());
+        assert!(active.exists());
+        // Once the operation is no longer active the old part is abandoned.
+        db.execute("UPDATE operations SET state='cancelled'", [])
+            .unwrap();
+        assert_eq!(prune_staging(&db, &models, &dir, STAGING_MAX_AGE), 1);
+        assert!(!active.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn prune_staging_removes_leftover_of_installed_model_regardless_of_age() {
+        let (dir, db, models) = prune_fixture();
+        let hash = "c".repeat(64);
+        let model_file = dir.join("model.gguf");
+        fs::write(&model_file, b"x").unwrap();
+        db.execute(
+            "INSERT INTO installed(id,path,sha256,needs_verification) VALUES('m',?1,?2,0)",
+            params![model_file.to_string_lossy().as_ref(), hash],
+        )
+        .unwrap();
+        let leftover = put_part(&dir, &format!("{hash}.part"), 0);
+        // Registered but not verified, or final file missing: keep (recent).
+        let unverified = "d".repeat(64);
+        db.execute(
+            "INSERT INTO installed(id,path,sha256,needs_verification) VALUES('n',?1,?2,1)",
+            params![model_file.to_string_lossy().as_ref(), unverified],
+        )
+        .unwrap();
+        let kept_unverified = put_part(&dir, &format!("{unverified}.part"), 0);
+        let missing = "e".repeat(64);
+        db.execute(
+            "INSERT INTO installed(id,path,sha256,needs_verification) VALUES('o','nope.gguf',?1,0)",
+            params![missing],
+        )
+        .unwrap();
+        let kept_missing = put_part(&dir, &format!("{missing}.part"), 0);
+        assert_eq!(prune_staging(&db, &models, &dir, STAGING_MAX_AGE), 1);
+        assert!(!leftover.exists());
+        assert!(kept_unverified.exists());
+        assert!(kept_missing.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn prune_staging_tolerates_errors() {
+        let (dir, db, models) = prune_fixture();
+        // A directory named like a part file is skipped, not removed.
+        fs::create_dir(dir.join("staging").join(format!("{}.part", "f".repeat(64)))).unwrap();
+        let old = put_part(&dir, &format!("{}.part", "a".repeat(64)), 10);
+        assert_eq!(prune_staging(&db, &models, &dir, STAGING_MAX_AGE), 1);
+        assert!(!old.exists());
+        // Missing staging folder and broken database never panic.
+        assert_eq!(
+            prune_staging(&db, &models, &dir.join("missing"), STAGING_MAX_AGE),
+            0
+        );
+        let broken = Connection::open_in_memory().unwrap();
+        let _ = put_part(&dir, &format!("{}.part", "9".repeat(64)), 10);
+        assert_eq!(prune_staging(&broken, &models, &dir, STAGING_MAX_AGE), 0);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
