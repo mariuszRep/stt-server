@@ -2,13 +2,13 @@
 name: safe-self-update
 title: Safely update and roll back STT Server Next
 description: Let a standalone server install a verified public release and recover automatically if the new program cannot start.
-status: ready
+status: done
 type: feature
 scope: stt-server-next only
-attempt: 2
+attempt: 3
 max_attempts: 8
-last_result: partial -- self-update rehearsed end to end on the fixed 0.3.2 build; real public check of 0.3.1->0.3.2 fails safely in the old 0.3.1 updater (expected); the true public N->N+1 check is 0.3.2 -> the next release
-next_action: After the first public release newer than 0.3.2 ships, run the live check from a downloaded public 0.3.2 binary against the real GitHub Releases source (no STT_SERVER_UPDATE_URL): update check, update install --yes, then confirm the version, a committed journal and no leftover task, in an isolated data dir and port 54400 as in the 2026-10-03 entries; then move this goal to done.
+last_result: passed
+next_action: null
 success_criteria:
   - A user can check for a newer released server and choose when to install it through the CLI.
   - The downloaded executable is checked against the release checksum before it can replace the running version.
@@ -104,6 +104,8 @@ test). Full logs under `C:\Users\mariu\AppData\Local\Temp\claude\scratch-ssu\`
 Update behaviour and local-fixture rehearsal are specified. Public release verification remains a later external gate.
 
 ## Final Outcome
+
+2026-10-04: Done. All success criteria are evidenced: CLI check and choose-to-install, SHA-256 verification, journalled recovery with automatic rollback and database restore, forced rollback and N->N+1 rehearsed on the fixed build, and a real public 0.3.2 -> 0.3.3 self-update from GitHub Releases that committed with the hash matching the public checksum. Releases up to 0.3.1 cannot self-update (old updater bugs; they fail safely).
 
 Implemented and unit/mock-server tested (attempt 1); not yet verified against a real running
 server pair or the real GitHub Releases source. Left in `in_progress` pending review.
@@ -251,3 +253,19 @@ Evidence (isolated: scratch under the session scratchpad `selfupdate3\`, `STT_SE
 Also confirmed with the public v0.3.2 binary (SHA-256 `643a07a9...9159`, matches its .sha256): `update check --json` -> `current_version 0.3.2, latest_version 0.3.2, update_available false`; `update install --json` -> `reason: already_up_to_date`. There is no public release newer than 0.3.2 yet, so 0.3.2 -> N+1 cannot be run.
 Remaining item: the live check of public 0.3.2 -> next release (see next_action). Mechanism evidence otherwise stands from the 0.3.2-build rehearsal above.
 Cleanup: isolated server stopped via the shutdown endpoint (54400 down), scratch folder deleted, no OpenVibeSTT tasks, real server `/health` 0.3.1 on 54321.
+
+2026-10-04 (live public N->N+1 check, real GitHub Releases source, no `STT_SERVER_UPDATE_URL`): **Result: PASS. Public v0.3.2 self-updated to public v0.3.3.**
+
+Isolation: scratch `selfupdate4\` under the session scratchpad, `STT_SERVER_DATA_DIR` and `--data-dir` set, port 54400, no admin/service. `status --json` confirmed `data_dir` was the scratch `...\selfupdate4\data` before the update. The user's real server (`C:\Users\mariu\AppData\Local\Stanzo\stt-server.exe`, port 54321, now 0.3.2) was never touched; `/health` ok before and after.
+
+Commands and outputs:
+- `gh release download v0.3.2|v0.3.3 --repo mariuszRep/stt-server`: v0.3.2 exe SHA-256 `643A07A9...D9159` (67239424 bytes) matches its .sha256; v0.3.3 exe SHA-256 `AB3C1872802EBFD90B2CD5822038A98EFA6A40BB81C7629D3AD2C25395993406` (67251712 bytes) matches its .sha256.
+- v0.3.2 copy started with `start --data-dir <scratch>\data --port 54400` -> `started: pid 28536`; `/health` 0.3.2.
+- `update check --json` -> `{"current_version":"0.3.2","latest_version":"0.3.3","update_available":true}`.
+- `update install --json` (no `--yes`) -> `{"current_version":"0.3.2","installed":false,"latest_version":"0.3.3","reason":"confirmation_required"}`; exe hash unchanged.
+- `update install --yes --json --data-dir <scratch>\data` -> exit 0, `{"error":null,"installed":true,"phase":"committed"}`.
+- After: exe SHA `AB3C1872...3406` equals the public v0.3.3 .sha256; `status --json` and `/health` report 0.3.3 (pid changed 28536 -> 30660); journal `phase=committed armed=False task_removed=True`; zero `OpenVibeSTT` scheduled tasks.
+- `stop` (`stopped via shutdown endpoint`), `status` -> `{"running":false}`, `start` -> healthy 0.3.3.
+- Second `update check --json` -> `{"current_version":"0.3.3","latest_version":"0.3.3","update_available":false}`; `update install --json` -> `reason: already_up_to_date`.
+- Work-folder behaviour: exactly one `.stt-update-<id>` folder (previous.exe, recovery.exe, retired.exe, state.snapshot, logs) was kept beside the exe after the commit, as designed (the code comment says it is pruned by the next update; `prune_finished_work_dirs` and its tests cover that). Prune-on-next-update was not run live because no release after 0.3.3 exists.
+- Cleanup: isolated server stopped (54400 down), scratch deleted, no OpenVibeSTT tasks, real server `/health` 0.3.2 on 54321.
