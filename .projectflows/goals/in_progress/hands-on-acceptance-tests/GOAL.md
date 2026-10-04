@@ -291,6 +291,9 @@ Model: `whisper-medium` default quant Q8_0, 831,538,144 bytes.
    (consistent with the resume design, but not "no junk"; it is reused by the next download of
    that file). Not treated as a defect; a user wanting the space back has no CLI command to clear
    staging (note for a possible follow-up decision).
+   Follow-up implemented (commit c25c006): server start now prunes `staging\*.part` files not owned by a
+   queued/running operation that are older than 7 days (mtime) or whose model is already installed and
+   verified; `models cancel` still keeps the part for resume; cleanup errors are logged, never fatal.
 Not run: the `update install --yes` kill/Scheduled-Task-rollback half of section H (needs the VM
 and a real newer release). Cleanup: server stopped by `stop --data-dir`, scratch dir deleted
 (the server ACL-locks its token files, so deleting needed a permission reset), real server
