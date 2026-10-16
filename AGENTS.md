@@ -44,6 +44,7 @@ models and serves batch transcription through an OpenAI-compatible API.
   capabilities, request planning, responses
 - `src/download.rs`, `src/import.rs`, `src/verify.rs`, `src/dropin.rs`, `src/gguf_probe.rs`
 - `src/queue.rs`, `src/engine.rs` — inference queue and model load/swap
+- `src/realtime.rs` — live streaming transcription over WebSocket (`GET /v1/realtime`)
 - `src/import_user.rs` — copy a user's models into a machine-wide install
 - `src/store.rs` migrations; `src/discovery.rs`, `src/autostart.rs`, `src/service.rs`,
   `src/sysinfo.rs`

@@ -176,7 +176,7 @@ where to drop files should read `GET /v1/local/config`'s
   | Level | Routes |
   |---|---|
   | Unauthenticated | `GET /health` |
-  | User (admin token also works) | `GET /readiness`, `GET /v1/models`, `GET /models/manage`, `GET /models/manage/default`, `GET /v1/local/system`, `GET /models/manage/recommendations`, `GET /models/manage/operations/{id}`, `POST /v1/audio/transcriptions`, `POST /v1/audio/translations` |
+  | User (admin token also works) | `GET /readiness`, `GET /v1/models`, `GET /models/manage`, `GET /models/manage/default`, `GET /v1/local/system`, `GET /models/manage/recommendations`, `GET /models/manage/operations/{id}`, `POST /v1/audio/transcriptions`, `POST /v1/audio/translations`, `GET /v1/realtime` (WebSocket, section 5a) |
   | Admin only | `GET`/`PATCH /v1/local/config`, `POST /models/manage/{id}/download`, `POST /models/manage/{id}/verify`, `POST /models/manage/{id}/default` (set default and load), `DELETE /models/manage/default` (unload), `DELETE /models/manage/{id}` (remove), `POST /models/manage/refresh` (drop-in refresh), `POST /models/manage/import`, `POST /models/manage/import-user` (copy another install's models in; see section 1.4), `POST /models/manage/operations/{id}/cancel`, `POST /v1/local/shutdown` |
 
   The CLI (`stt-server models ...`, `status`, `stop`, `update`, ...)
@@ -633,8 +633,7 @@ model-aware planning happens; a field sent twice is `400 duplicate_field`.
   Oversize bodies get `413 audio_too_long`.
 - Reviewed against the intended local/LAN clients (Whisper Vibes desktop app,
   `stt-sdk`): both send short dictation-length WAV clips well under 40 MiB,
-  so the limit is kept as-is. Streaming upload/transcription is out of the
-  approved product scope (`CONVENTIONS.md`), so raising the cap to support
+  so the limit is kept as-is. Streaming *upload* is not planned (live transcription has its own endpoint, section 5a), so raising the cap to support
   arbitrarily long single uploads is not planned; a client with a longer
   recording should chunk it into multiple requests rather than expect a
   larger limit here. Any future change to the WAV-only/40 MiB bounds (e.g. to
@@ -690,6 +689,81 @@ timestamps allow) always populated.
   `resolve_language`/`plan`).
 - `"unknown"` -- none of the above applied.
 
+## 5a. Live transcription (WebSocket)
+
+`GET /v1/realtime?intent=transcription` upgrades to a WebSocket that transcribes audio while it is
+being spoken. It follows OpenAI's Realtime API in transcription mode, so an OpenAI Realtime client
+works with a base-URL change, and adds Handy's committed/tentative text as one extension event.
+Source: `src/realtime.rs`.
+
+- **Auth**: the same bearer token as every other route (user or admin token), sent as the
+  `Authorization: Bearer ...` header on the upgrade request. A missing or wrong token is a plain
+  `401 unauthorized` before any upgrade. Browsers cannot set that header on a WebSocket; the target
+  clients (the SDK, Stanzo) are native. A request that is not a WebSocket upgrade is
+  `400 websocket_required`; an `intent` other than `transcription` is `400 unsupported_intent`.
+- **Query**: `intent=transcription` (optional, the only intent), `model=<id>` (optional initial model,
+  like OpenAI's `model` query parameter; default `default`).
+- **Models**: only models that report `streaming` (parakeet-unified, nemotron streaming, ...; see
+  `capabilities.streaming` in `GET /v1/models` and `/models/manage`). Others get the error code
+  `streaming_unsupported` and the socket is closed: the client falls back to
+  `POST /v1/audio/transcriptions`.
+- **Turns**: client-driven only. Audio between the first `append` and the `commit` is one *item*. After
+  `completed` the next `append` starts a new item on the same socket. One item is transcribed at a time.
+
+### Client events (JSON text frames)
+
+| Event | Fields | Effect |
+|---|---|---|
+| `transcription_session.update` (also `session.update`) | `session.input_audio_format` (`"pcm16"`), `session.input_audio_sample_rate` (8000-48000, default 24000; extension), `session.input_audio_transcription.{model, language, prompt}`, `session.turn_detection` (must be null) | Changes the session for the *next* item. Reply: `transcription_session.updated` (or `session.updated` when the client used `session.update`). The GA shape (`session.audio.input.{format{type:"audio/pcm", rate}, transcription{model, language or languages[0], prompt}, turn_detection}`) is read too. |
+| `input_audio_buffer.append` | `audio`: base64 PCM16 little-endian mono | Feeds the engine immediately. The first one of an item starts the stream (model bind or swap happens here). |
+| `input_audio_buffer.commit` | none | Ends the item: the server replies `input_audio_buffer.committed {item_id, previous_item_id}`, then a last `delta` and `partial`, then `completed`. Error `input_audio_buffer_commit_empty` when no audio was appended. |
+| `input_audio_buffer.clear` | none | Discards the item without a transcript. Reply `input_audio_buffer.cleared`. |
+
+An item with no client event for 60 s is discarded with error `idle_timeout`.
+
+### Server events
+
+| Event | Fields |
+|---|---|
+| `transcription_session.created` | `session` (sent on connect): `{id, object:"realtime.transcription_session", input_audio_format, input_audio_sample_rate, input_audio_transcription{model, language, prompt}, turn_detection:null}` |
+| `transcription_session.updated` / `session.updated` | `session` |
+| `input_audio_buffer.committed` / `input_audio_buffer.cleared` | as above |
+| `conversation.item.input_audio_transcription.delta` | `item_id`, `content_index:0`, `delta`: the text *newly committed* since the last delta. Committed text is append-only and never changes, so concatenating deltas gives the committed transcript. |
+| `conversation.item.input_audio_transcription.partial` | **Extension.** `item_id`, `content_index`, `committed` (everything committed so far), `tentative` (the volatile suffix the engine may still rewrite), `revision` (monotonic). Sent on every change of either; render `committed + tentative`. |
+| `conversation.item.input_audio_transcription.completed` | `item_id`, `content_index:0`, `transcript` (the final text, trimmed) |
+| `error` | `{type: "invalid_request_error" or "server_error", code, message, param:null, event_id:null}` |
+
+Every event also carries `event_id`. Error codes on the socket: `invalid_json`, `invalid_event`,
+`invalid_audio`, `unsupported_audio_format`, `turn_detection_unsupported`,
+`input_audio_buffer_commit_empty`, `idle_timeout`, `streaming_unsupported`, `stream_busy`, plus the
+batch codes of section 6 for model resolution and the queue (`server_not_ready`, `model_not_installed`,
+`needs_verification`, `model_load_failed`, `queue_full`, `queue_timeout`, `engine_busy`, ...).
+Only `streaming_unsupported` closes the socket; other errors leave it usable.
+
+### Concurrency
+
+At most **one live stream** runs at a time (an `append` that would start a second one gets
+`stream_busy`). A stream takes the single batch permit only while it begins, in FIFO order with batch
+requests, then releases it: batch requests are not queued behind it. The transcribe-cpp library refuses
+overlapping runs on the *same* model while it streams, so a batch request for the streaming model gets
+`503 engine_busy` until the item ends (items are short dictation utterances); a request for another model
+proceeds normally.
+
+### Deviations from OpenAI
+
+- Models are local GGUF ids (or `default`), not `gpt-*` names; unknown ids are `model_not_installed`.
+- `input_audio_format` is only `pcm16`. The sample rate is 24 kHz by default as in OpenAI; 8-48 kHz can be
+  set with the extension `input_audio_sample_rate` (or the GA `rate`), and audio is resampled to 16 kHz.
+  Sending 16000 avoids the resampling.
+- `turn_detection` must be null (no server VAD); the client commits. No `noise_reduction`, `include` or
+  `logprobs`, and no conversation items beyond the transcription ones.
+- `delta` events are *committed* text, which trails the audio by the model's chunk latency; the
+  lower-latency volatile text is only in the `partial` extension.
+- `prompt` is accepted but only used by whisper-family models, which do not stream, so it has no effect
+  today. `language` is a hint, resolved like the batch endpoint.
+- The `previous_item_id` chain only covers items of the current socket.
+- Translation is not available live (see the `live-translation` goal).
+
 ## 6. Error envelope and codes
 
 Every non-2xx JSON error:
@@ -711,8 +785,8 @@ source (`src/api.rs`, `src/audio.rs`, `src/auth.rs`, `src/catalog.rs`,
 | 404 | `model_not_found`, `operation_not_found`, `model_not_installed` (verify and remove of a never-installed id; **a transcription/translation naming a model that isn't downloaded or isn't a known id at all -- see 4.3**; `GET /v1/models/{id}` for a non-callable id) |
 | 409 | `already_installed`, `operation_conflict`, `operation_finished` (cancelling a terminal operation), `model_in_use` (removing the selected model), `model_not_installed` (select, before install), **`needs_verification`** (select, or a transcription/translation naming a downloaded-but-unverified model -- see 4), `model_load_failed` (select, or a per-request swap whose load failed -- see 4.3; the previously resident model is left untouched), `unowned_model_path` (refusing to remove a file outside the managed store), `model_loading` (select/load of a different model while a background load is already in progress -- see 4.2) |
 | 413 | `audio_too_long` (payload too large) |
-| 422 | `unsupported_capability`, `engine_unsupported`, `engine_rejected_option`, `prompt_too_long`, `size_mismatch` (import exceeds catalog size), `hash_mismatch` (import/verify SHA-256 or size mismatch) |
-| 429 | `queue_full` |
+| 422 | `streaming_unsupported` (socket event only, section 5a), `unsupported_capability`, `engine_unsupported`, `engine_rejected_option`, `prompt_too_long`, `size_mismatch` (import exceeds catalog size), `hash_mismatch` (import/verify SHA-256 or size mismatch) |
+| 429 | `queue_full`, `stream_busy` (socket event only, section 5a) |
 | 500 | `internal_error`, `inference_failed` (message only; not meant to be pattern-matched) |
 | 503 | `server_not_ready` (no default model configured and nothing loading; includes an `operation_id` in `details` when an install/verify that would fix this is already running), `not_ready`, `model_loading` (a `model=default` request while the startup reload is still in progress and nothing is default yet, *or* a request whose named model is being loaded in the background for longer than `queue_wait_timeout_ms` -- `details` carries `model`/`elapsed_ms` -- see 4.2/4.3), `engine_busy`, `queue_timeout` |
 | 504 | `inference_timeout` |

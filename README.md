@@ -22,7 +22,9 @@ to `0` for a `server.json` written before this field existed, meaning "older tha
 client requires"). `GET /v1/local/system`'s `server` section reports the same two fields.
 Other routes require a bearer token. The server implements
 `GET /readiness`, `GET /v1/models`, and OpenAI-style `POST /v1/audio/transcriptions` and
-`POST /v1/audio/translations` for mono/stereo WAV from 8–192 kHz (16/24-bit PCM or 32-bit float),
+`POST /v1/audio/translations` (plus the live WebSocket `GET /v1/realtime?intent=transcription`, an
+OpenAI Realtime-style transcription stream with committed/tentative text, documented in
+`docs/client-contract.md` section 5a) for mono/stereo WAV from 8–192 kHz (16/24-bit PCM or 32-bit float),
 both sharing one pipeline (parse → decode → plan → queue → run → format) and a 40 MiB body limit.
 Audio is converted to 16 kHz mono before inference. Accepted multipart fields are `file`, `model`,
 `language`, `prompt`, `temperature`, `response_format` (`json`/`text`/`verbose_json`), and repeatable
