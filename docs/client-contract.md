@@ -413,6 +413,36 @@ response calls out any control where the catalog's claim and the live
 answer disagree (excluding catalog `"unknown"`, which never counts as a
 mismatch).
 
+**Controls in the matrix.** Every entry is `{status, evidence, reason?, ...}`
+with `status` `supported` | `unsupported` | `unknown`, `evidence`
+`loaded_model` (read from the loaded model: capabilities struct and feature
+probes) or `catalog_claim` (catalog view, unverified), and `reason`
+`model_lacks` | `unverified` | `not_implemented` | `not_reported`.
+
+| Control | Source when loaded | Extra fields |
+|---|---|---|
+| `prompt`, `temperature` | whisper architecture | `max_tokens` (prompt) |
+| `language_hint` | language list | `languages` |
+| `language_detect` | `supports_language_detect` | |
+| `translation` | `supports_translate` and an `en` target | `target_languages` (the model's own list; `[]` when unsupported) |
+| `timestamp_granularity` | `max_timestamp_kind` | `max` (`none`/`segment`/`word`/`token`) |
+| `streaming` | `supports_streaming` | `model_claim` |
+| `punctuation` | PNC feature probe | |
+| `itn` | ITN feature probe | |
+| `cancellation` | cancellation feature probe | |
+| `long_form` | long-form feature probe | |
+| `spec_decode` | `supports_spec_decode` | |
+| `native_sample_rate` | `native_sample_rate` | `hz` (`unknown`/`not_reported` when 0) |
+
+Translation is per model: a multilingual Whisper reports `supported` with
+`target_languages: ["en"]`; Parakeet and Unified report `unsupported`. In the
+catalog view `translation` follows the catalog's `translate` claim (`unknown`
+with `target_languages: ["en"]` when claimed, `unsupported` with `[]`
+otherwise). `punctuation`, `itn`, `cancellation`, `long_form`, `spec_decode`
+and `native_sample_rate` have no catalog claim, so before a model has been
+loaded they are `unknown` (`reason: "unverified"`, `evidence:
+"catalog_claim"`); loading the model resolves them.
+
 Each entry in either view is a `ControlCapability` object
 per optional control (`prompt`, `temperature`, `language_hint`,
 `word_timestamps`, `translation`, ...):

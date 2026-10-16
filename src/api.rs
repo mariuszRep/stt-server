@@ -574,6 +574,17 @@ fn custom_model_view(installed: &crate::store::InstalledFile) -> Value {
     let claims = installed.custom_claims.clone().unwrap_or(Value::Null);
     let languages = installed.custom_languages.clone().unwrap_or_default();
     let multi_language = languages.len() > 1;
+    let mut effective_capabilities = json!({
+        "prompt": {"status": "unknown"},
+        "temperature": {"status": "unknown"},
+        "language_hint": {"status": if multi_language { "unknown" } else { "unsupported" }},
+        "language_detect": {"status": "unknown"},
+        "translation": {"status": "unknown"},
+        "timestamp_granularity": {"status": "unknown"},
+        "streaming": {"status": if claims["streaming"] == true { "unknown" } else { "unsupported" }},
+        "response_formats": {"json": "supported", "text": "unsupported", "verbose_json": "unsupported"},
+    });
+    crate::capabilities::add_unverified_engine_controls(&mut effective_capabilities);
     json!({
         "id": installed.id,
         "name": custom_model_name(installed),
@@ -583,16 +594,7 @@ fn custom_model_view(installed: &crate::store::InstalledFile) -> Value {
         "custom": true,
         "evidence": "gguf_header",
         "model_capabilities": claims,
-        "effective_capabilities": {
-            "prompt": {"status": "unknown"},
-            "temperature": {"status": "unknown"},
-            "language_hint": {"status": if multi_language { "unknown" } else { "unsupported" }},
-            "language_detect": {"status": "unknown"},
-            "translation": {"status": "unknown"},
-            "timestamp_granularity": {"status": "unknown"},
-            "streaming": {"status": if claims["streaming"] == true { "unknown" } else { "unsupported" }},
-            "response_formats": {"json": "supported", "text": "unsupported", "verbose_json": "unsupported"},
-        },
+        "effective_capabilities": effective_capabilities,
         "downloaded": true,
         "installed_quant": installed.quant,
         "installable": false,
@@ -661,7 +663,7 @@ fn callable_capabilities(app: &App, id: &str, catalog_fallback: Option<Value>) -
         return Ok(cached.to_json());
     }
     Ok(catalog_fallback.unwrap_or_else(|| {
-        json!({
+        let mut unknown = json!({
             "prompt": {"status": "unknown"},
             "temperature": {"status": "unknown"},
             "language_hint": {"status": "unknown"},
@@ -670,7 +672,9 @@ fn callable_capabilities(app: &App, id: &str, catalog_fallback: Option<Value>) -
             "timestamp_granularity": {"status": "unknown"},
             "streaming": {"status": "unsupported"},
             "response_formats": {"json": "supported", "text": "unsupported", "verbose_json": "unsupported"},
-        })
+        });
+        crate::capabilities::add_unverified_engine_controls(&mut unknown);
+        unknown
     }))
 }
 
@@ -2767,6 +2771,7 @@ mod router_tests {
             prompt_max_tokens: None,
             timestamp_granularity_rejected: false,
             supports_streaming: false,
+            ..Default::default()
         });
         app.live_caps
             .lock()

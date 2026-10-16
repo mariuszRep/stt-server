@@ -15,9 +15,10 @@ use crate::catalog::{self, CatalogModel};
 /// Requested (or default) timestamp granularity, independent of the
 /// transcribe-cpp crate's own `TimestampKind` so this module has no compile
 /// dependency on the engine for its pure, unit-tested half.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TimestampGranularity {
+    #[default]
     None,
     Segment,
     Word,
@@ -37,7 +38,7 @@ impl TimestampGranularity {
 
 /// Everything `run_plan` needs about a *loaded* model's capabilities, decoupled
 /// from `transcribe_cpp::Model` so it stays plain-data and unit-testable.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct LoadedCaps {
     pub arch: String,
     pub languages: Vec<String>,
@@ -75,6 +76,37 @@ pub struct LoadedCaps {
     /// `Capabilities::supports_streaming`: the model can run through the
     /// live `GET /v1/realtime` endpoint (`Session::stream`).
     pub supports_streaming: bool,
+    /// `Capabilities::supports_spec_decode`: n-gram speculative decoding.
+    pub supports_spec_decode: bool,
+    /// `Feature::Pnc`: the model exposes a runtime punctuation/casing toggle.
+    pub supports_pnc: bool,
+    /// `Feature::Itn`: the model exposes a runtime inverse-text-normalisation toggle.
+    pub supports_itn: bool,
+    /// `Feature::Cancellation`: the model honours the abort callback mid-run.
+    pub supports_cancellation: bool,
+    /// `Feature::LongForm`: audio longer than the native window in one run.
+    pub supports_long_form: bool,
+    /// `Capabilities::native_sample_rate` in Hz (0 when not reported).
+    pub native_sample_rate: i32,
+}
+
+/// Controls the catalog has no claim for: they are `unknown` until a model is
+/// loaded and the engine answers.
+const ENGINE_ONLY_CONTROLS: [&str; 6] = [
+    "punctuation",
+    "itn",
+    "cancellation",
+    "long_form",
+    "spec_decode",
+    "native_sample_rate",
+];
+
+/// Add the engine-only controls to a pre-load matrix as `unknown`.
+pub fn add_unverified_engine_controls(matrix: &mut Value) {
+    for control in ENGINE_ONLY_CONTROLS {
+        matrix[control] =
+            json!({"status": "unknown", "reason": "unverified", "evidence": "catalog_claim"});
+    }
 }
 
 impl LoadedCaps {
@@ -108,6 +140,12 @@ impl LoadedCaps {
             prompt_max_tokens: None,
             timestamp_granularity_rejected: false,
             supports_streaming: caps.supports_streaming,
+            supports_spec_decode: caps.supports_spec_decode,
+            supports_pnc: model.supports(Feature::Pnc),
+            supports_itn: model.supports(Feature::Itn),
+            supports_cancellation: model.supports(Feature::Cancellation),
+            supports_long_form: model.supports(Feature::LongForm),
+            native_sample_rate: caps.native_sample_rate,
         }
     }
 }
@@ -383,7 +421,7 @@ impl EffectiveCaps {
             evidence: "loaded_model",
             mechanism: Some("task_translate"),
             scope: None,
-            extra: json!({ "target_languages": ["en"] }),
+            extra: json!({ "target_languages": self.loaded.translate_target_languages }),
         };
         // Trust `self.loaded.max_timestamp_kind` directly: it is the
         // engine's own accurate, per-architecture (and, for granite,
@@ -431,6 +469,38 @@ impl EffectiveCaps {
             extra: json!({ "model_claim": self.loaded.supports_streaming }),
         };
 
+        let feature = |supported: bool| ControlCapability {
+            status: if supported {
+                Status::Supported
+            } else {
+                Status::Unsupported
+            },
+            reason: (!supported).then_some("model_lacks"),
+            evidence: "loaded_model",
+            mechanism: None,
+            scope: None,
+            extra: Value::Null,
+        };
+        let native_sample_rate = if self.loaded.native_sample_rate > 0 {
+            ControlCapability {
+                status: Status::Supported,
+                reason: None,
+                evidence: "loaded_model",
+                mechanism: None,
+                scope: None,
+                extra: json!({ "hz": self.loaded.native_sample_rate }),
+            }
+        } else {
+            ControlCapability {
+                status: Status::Unknown,
+                reason: Some("not_reported"),
+                evidence: "loaded_model",
+                mechanism: None,
+                scope: None,
+                extra: Value::Null,
+            }
+        };
+
         json!({
             "prompt": prompt_vocab.to_json(),
             "temperature": temperature.to_json(),
@@ -439,6 +509,12 @@ impl EffectiveCaps {
             "translation": translation.to_json(),
             "timestamp_granularity": timestamp_granularity.to_json(),
             "streaming": streaming.to_json(),
+            "punctuation": feature(self.loaded.supports_pnc).to_json(),
+            "itn": feature(self.loaded.supports_itn).to_json(),
+            "cancellation": feature(self.loaded.supports_cancellation).to_json(),
+            "long_form": feature(self.loaded.supports_long_form).to_json(),
+            "spec_decode": feature(self.loaded.supports_spec_decode).to_json(),
+            "native_sample_rate": native_sample_rate.to_json(),
             "response_formats": {"json": "supported", "text": "supported", "verbose_json": "supported", "srt": "unsupported", "vtt": "unsupported"},
             "feature_initial_prompt_flag": self.loaded.feature_initial_prompt_flag,
             "whisper_ext_accepted": self.loaded.whisper_ext_accepted,
@@ -505,6 +581,7 @@ mod tests {
             prompt_max_tokens: None,
             timestamp_granularity_rejected: false,
             supports_streaming: false,
+            ..Default::default()
         }
     }
 
@@ -521,6 +598,7 @@ mod tests {
             prompt_max_tokens: None,
             timestamp_granularity_rejected: false,
             supports_streaming: false,
+            ..Default::default()
         }
     }
 
@@ -585,6 +663,74 @@ mod tests {
     fn single_language_model_still_supports_language_hint() {
         let caps = EffectiveCaps::new(loaded_non_whisper());
         assert!(caps.supports_language_hint());
+    }
+
+    #[test]
+    fn loaded_translation_reports_the_models_own_targets() {
+        let whisper = EffectiveCaps::new(loaded_whisper()).to_json();
+        assert_eq!(whisper["translation"]["status"], "supported");
+        assert_eq!(whisper["translation"]["evidence"], "loaded_model");
+        assert_eq!(whisper["translation"]["target_languages"], json!(["en"]));
+        let parakeet = EffectiveCaps::new(loaded_non_whisper()).to_json();
+        assert_eq!(parakeet["translation"]["status"], "unsupported");
+        assert_eq!(parakeet["translation"]["reason"], "model_lacks");
+        assert_eq!(parakeet["translation"]["target_languages"], json!([]));
+    }
+
+    #[test]
+    fn loaded_engine_features_follow_the_model() {
+        let controls = [
+            "punctuation",
+            "itn",
+            "cancellation",
+            "long_form",
+            "spec_decode",
+        ];
+        let none = EffectiveCaps::new(loaded_non_whisper()).to_json();
+        for control in controls {
+            assert_eq!(none[control]["status"], "unsupported", "{control}");
+            assert_eq!(none[control]["reason"], "model_lacks", "{control}");
+            assert_eq!(none[control]["evidence"], "loaded_model", "{control}");
+        }
+        let all = EffectiveCaps::new(LoadedCaps {
+            supports_pnc: true,
+            supports_itn: true,
+            supports_cancellation: true,
+            supports_long_form: true,
+            supports_spec_decode: true,
+            ..loaded_non_whisper()
+        })
+        .to_json();
+        for control in controls {
+            assert_eq!(all[control]["status"], "supported", "{control}");
+            assert!(all[control].get("reason").is_none(), "{control}");
+        }
+    }
+
+    #[test]
+    fn loaded_each_feature_is_reported_independently() {
+        let json = EffectiveCaps::new(LoadedCaps {
+            supports_itn: true,
+            ..loaded_non_whisper()
+        })
+        .to_json();
+        assert_eq!(json["itn"]["status"], "supported");
+        assert_eq!(json["punctuation"]["status"], "unsupported");
+        assert_eq!(json["spec_decode"]["status"], "unsupported");
+    }
+
+    #[test]
+    fn native_sample_rate_is_reported_in_hz_or_unknown() {
+        let known = EffectiveCaps::new(LoadedCaps {
+            native_sample_rate: 16000,
+            ..loaded_non_whisper()
+        })
+        .to_json();
+        assert_eq!(known["native_sample_rate"]["status"], "supported");
+        assert_eq!(known["native_sample_rate"]["hz"], 16000);
+        let unreported = EffectiveCaps::new(loaded_non_whisper()).to_json();
+        assert_eq!(unreported["native_sample_rate"]["status"], "unknown");
+        assert_eq!(unreported["native_sample_rate"]["reason"], "not_reported");
     }
 
     #[test]

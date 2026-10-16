@@ -768,6 +768,7 @@ mod tests {
                 prompt_max_tokens: None,
                 timestamp_granularity_rejected: false,
                 supports_streaming,
+                ..Default::default()
             })
         };
         assert!(check_streaming(&caps(true)).is_ok());

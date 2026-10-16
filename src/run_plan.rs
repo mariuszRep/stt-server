@@ -492,6 +492,7 @@ mod tests {
             prompt_max_tokens: None,
             timestamp_granularity_rejected: false,
             supports_streaming: false,
+            ..Default::default()
         })
     }
 
@@ -508,6 +509,7 @@ mod tests {
             prompt_max_tokens: None,
             timestamp_granularity_rejected: false,
             supports_streaming: false,
+            ..Default::default()
         })
     }
 
@@ -524,6 +526,7 @@ mod tests {
             prompt_max_tokens: None,
             timestamp_granularity_rejected: false,
             supports_streaming: false,
+            ..Default::default()
         })
     }
 

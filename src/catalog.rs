@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::app::App;
+use crate::capabilities;
 use crate::errors::{ApiError, ApiResult};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -144,6 +145,7 @@ pub fn capability_matrix(model: &CatalogModel) -> Value {
             json!({
                 "status": "unsupported",
                 "reason": if !claimed { "model_lacks" } else { "not_implemented" },
+                "evidence": "catalog_claim",
                 "model_claim": model_claim,
             })
         } else {
@@ -152,11 +154,24 @@ pub fn capability_matrix(model: &CatalogModel) -> Value {
             json!({
                 "status": "unknown",
                 "reason": "unverified",
+                "evidence": "catalog_claim",
                 "model_claim": model_claim,
             })
         }
     };
-    json!({
+    // The catalog says whether a model translates, not into what; every
+    // translating model in it is whisper-style (English target only).
+    let mut translation = claim(
+        model.capabilities.translate,
+        json!(model.capabilities.translate),
+        false,
+    );
+    translation["target_languages"] = if model.capabilities.translate {
+        json!(["en"])
+    } else {
+        json!([])
+    };
+    let mut matrix = json!({
         "prompt": claim(is_whisper_arch, Value::Null, !is_whisper_arch),
         "temperature": claim(is_whisper_arch, Value::Null, !is_whisper_arch),
         "language_hint": claim(
@@ -165,11 +180,13 @@ pub fn capability_matrix(model: &CatalogModel) -> Value {
             false,
         ),
         "language_detect": claim(model.capabilities.lang_detect, json!(model.capabilities.lang_detect), false),
-        "translation": claim(model.capabilities.translate, json!(model.capabilities.translate), false),
+        "translation": translation,
         "timestamp_granularity": claim(has_timestamps, json!(model.capabilities.timestamps), false),
         "streaming": claim(model.capabilities.streaming, json!(model.capabilities.streaming), false),
         "response_formats": {"json": "supported", "text": "supported", "verbose_json": "unknown"},
-    })
+    });
+    capabilities::add_unverified_engine_controls(&mut matrix);
+    matrix
 }
 
 pub fn model_view(model: &CatalogModel, installed_quant: Option<&str>) -> Value {
@@ -366,6 +383,46 @@ mod tests {
         }
         if !single_language.capabilities.lang_detect {
             assert_eq!(matrix["language_detect"]["reason"], "model_lacks");
+        }
+    }
+
+    #[test]
+    fn catalog_translation_is_visible_per_model() {
+        let catalog: Catalog =
+            serde_json::from_str(include_str!("../catalog/handy-2026-08-17.json")).unwrap();
+        let by_slug = |slug: &str| catalog.models.iter().find(|m| m.slug == slug).unwrap();
+        let whisper = capability_matrix(by_slug("whisper-small"));
+        assert_eq!(whisper["translation"]["status"], "unknown");
+        assert_eq!(whisper["translation"]["evidence"], "catalog_claim");
+        assert_eq!(whisper["translation"]["target_languages"], json!(["en"]));
+        for slug in ["parakeet-unified-en-0.6b", "parakeet-tdt-0.6b-v3"] {
+            let parakeet = capability_matrix(by_slug(slug));
+            assert_eq!(parakeet["translation"]["status"], "unsupported", "{slug}");
+            assert_eq!(parakeet["translation"]["reason"], "model_lacks", "{slug}");
+            assert_eq!(
+                parakeet["translation"]["target_languages"],
+                json!([]),
+                "{slug}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_view_marks_engine_only_controls_unverified() {
+        let catalog: Catalog =
+            serde_json::from_str(include_str!("../catalog/handy-2026-08-17.json")).unwrap();
+        let matrix = capability_matrix(&catalog.models[0]);
+        for control in [
+            "punctuation",
+            "itn",
+            "cancellation",
+            "long_form",
+            "spec_decode",
+            "native_sample_rate",
+        ] {
+            assert_eq!(matrix[control]["status"], "unknown", "{control}");
+            assert_eq!(matrix[control]["reason"], "unverified", "{control}");
+            assert_eq!(matrix[control]["evidence"], "catalog_claim", "{control}");
         }
     }
 
