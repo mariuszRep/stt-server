@@ -52,7 +52,7 @@ pub async fn get_config(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiR
         "network_mode": stored_network_mode.map(|mode| mode.as_str()),
         "preferred_backend":backend_preference(&app)?,
         "max_audio_bytes":40 * 1024 * 1024,
-        "streaming":false,
+        "streaming":true,
         "cors_allowed_origins":app.cors_origins,
         "queue_max_waiting": limits.queue_max_waiting,
         "queue_wait_timeout_ms": limits.queue_wait_timeout_ms,
@@ -590,7 +590,7 @@ fn custom_model_view(installed: &crate::store::InstalledFile) -> Value {
             "language_detect": {"status": "unknown"},
             "translation": {"status": "unknown"},
             "timestamp_granularity": {"status": "unknown"},
-            "streaming": {"status": "unsupported"},
+            "streaming": {"status": if claims["streaming"] == true { "unknown" } else { "unsupported" }},
             "response_formats": {"json": "supported", "text": "unsupported", "verbose_json": "unsupported"},
         },
         "downloaded": true,
@@ -1171,7 +1171,10 @@ fn formatted_into_response(formatted: Formatted) -> Response {
 /// goal): 404 `model_not_installed` for an unknown or not-downloaded id, 409
 /// `needs_verification` for one that is downloaded but not yet verified.
 /// Never triggers a download or any other side effect.
-fn require_installed_verified(app: &App, id: &str) -> ApiResult<crate::store::InstalledFile> {
+pub(crate) fn require_installed_verified(
+    app: &App,
+    id: &str,
+) -> ApiResult<crate::store::InstalledFile> {
     match installed_file(app, id)? {
         Some(file) if !file.needs_verification => Ok(file),
         Some(_) => Err(ApiError::new(
@@ -1196,7 +1199,7 @@ fn require_installed_verified(app: &App, id: &str) -> ApiResult<crate::store::In
 /// (503 `server_not_ready`) -- this is about the *startup* reload, not a
 /// per-request swap, so it is checked once, up front, without touching the
 /// queue.
-fn resolve_requested_model(app: &App, requested: &str) -> ApiResult<String> {
+pub(crate) fn resolve_requested_model(app: &App, requested: &str) -> ApiResult<String> {
     if requested != "default" {
         return Ok(requested.to_owned());
     }
@@ -1243,7 +1246,7 @@ const MODEL_SWAP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// honours) -- only once that is exceeded does this give up with 503
 /// `model_loading`. A load this function starts itself is a plain blocking
 /// call with no such wait: it either finishes or fails outright.
-async fn bind_or_swap_model(
+pub(crate) async fn bind_or_swap_model(
     app: &App,
     target: &str,
     wait_timeout: Option<Duration>,
@@ -1575,6 +1578,7 @@ pub fn router(app: Arc<App>) -> Router {
             "/v1/audio/translations",
             post(translations).layer(DefaultBodyLimit::max(40 * 1024 * 1024)),
         )
+        .route("/v1/realtime", get(crate::realtime::realtime))
         .route("/v1/local/system", get(system_info))
         .route("/v1/local/config", get(get_config).patch(patch_config))
         .route("/v1/local/shutdown", post(shutdown_endpoint))
@@ -2762,6 +2766,7 @@ mod router_tests {
             whisper_ext_accepted: None,
             prompt_max_tokens: None,
             timestamp_granularity_rejected: false,
+            supports_streaming: false,
         });
         app.live_caps
             .lock()

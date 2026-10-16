@@ -491,6 +491,7 @@ mod tests {
             whisper_ext_accepted: Some(true),
             prompt_max_tokens: None,
             timestamp_granularity_rejected: false,
+            supports_streaming: false,
         })
     }
 
@@ -506,6 +507,7 @@ mod tests {
             whisper_ext_accepted: None,
             prompt_max_tokens: None,
             timestamp_granularity_rejected: false,
+            supports_streaming: false,
         })
     }
 
@@ -521,6 +523,7 @@ mod tests {
             whisper_ext_accepted: None,
             prompt_max_tokens: None,
             timestamp_granularity_rejected: false,
+            supports_streaming: false,
         })
     }
 

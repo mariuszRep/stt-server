@@ -2,7 +2,8 @@
 //!
 //! Exactly one transcription runs at a time (`tokio::sync::Semaphore` with a
 //! single permit; the tokio semaphore is FIFO-fair, so waiters are served in
-//! arrival order). By default the waiting list is unbounded and a waiter
+//! arrival order). A second, independent single-permit slot admits at most
+//! one live stream at a time. By default the waiting list is unbounded and a waiter
 //! never times out, matching the current shipping server (user decision).
 //! Callers may optionally pass a `max_waiting` bound (rejecting any waiter
 //! beyond it immediately with [`QueueError::Full`]) and/or a `wait_timeout`
@@ -42,6 +43,7 @@ impl Drop for WaitingGuard {
 /// list and an optional per-wait deadline.
 pub struct InferenceQueue {
     permit: Arc<Semaphore>,
+    stream_slot: Arc<Semaphore>,
     waiting: Arc<AtomicUsize>,
 }
 
@@ -55,6 +57,7 @@ impl InferenceQueue {
     pub fn new() -> Self {
         Self {
             permit: Arc::new(Semaphore::new(1)),
+            stream_slot: Arc::new(Semaphore::new(1)),
             waiting: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -64,6 +67,15 @@ impl InferenceQueue {
     /// going through the bounded/queued transcription path.
     pub fn semaphore(&self) -> Arc<Semaphore> {
         self.permit.clone()
+    }
+
+    /// Claim the single live-stream slot (`GET /v1/realtime`), or `None`
+    /// when a stream is already running. Independent of the batch permit: a
+    /// stream takes the batch permit only while it begins (model bind and
+    /// `Session::stream`), then runs holding just this slot, so batch requests
+    /// for other models are never queued behind it (see `crate::realtime`).
+    pub fn try_acquire_stream(&self) -> Option<OwnedSemaphorePermit> {
+        self.stream_slot.clone().try_acquire_owned().ok()
     }
 
     pub fn waiting_count(&self) -> usize {

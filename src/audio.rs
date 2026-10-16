@@ -158,9 +158,155 @@ pub fn decode_wav(bytes: &[u8]) -> ApiResult<Vec<f32>> {
     Ok(output[delay..delay + output_len].to_vec())
 }
 
+/// Incremental decoder for live audio: little-endian signed 16-bit mono PCM
+/// bytes in arbitrary chunk sizes (a sample may straddle two chunks), out as
+/// 16 kHz `f32`. Used by the live endpoint (`crate::realtime`); the batch path
+/// decodes whole WAV files with [`decode_wav`].
+pub struct PcmStream {
+    odd_byte: Option<u8>,
+    resampler: Option<LiveResampler>,
+}
+
+struct LiveResampler {
+    resampler: FftFixedIn<f32>,
+    pending: Vec<f32>,
+    /// Leading output samples still to discard (the resampler's filter delay).
+    skip: usize,
+}
+
+impl LiveResampler {
+    fn emit(&mut self, converted: &[f32], out: &mut Vec<f32>) {
+        let drop = self.skip.min(converted.len());
+        self.skip -= drop;
+        out.extend_from_slice(&converted[drop..]);
+    }
+}
+
+/// 20 ms of input per resampler chunk.
+fn live_chunk_frames(sample_rate: u32) -> usize {
+    sample_rate as usize / 50
+}
+
+impl PcmStream {
+    /// `sample_rate` is the rate of the incoming PCM; anything but 16 kHz is
+    /// resampled to 16 kHz.
+    pub fn new(sample_rate: u32) -> ApiResult<Self> {
+        let resampler = if sample_rate == 16_000 {
+            None
+        } else {
+            let resampler = FftFixedIn::<f32>::new(
+                sample_rate as usize,
+                16_000,
+                live_chunk_frames(sample_rate),
+                1,
+                1,
+            )
+            .map_err(internal)?;
+            let skip = resampler.output_delay();
+            Some(LiveResampler {
+                resampler,
+                pending: Vec::new(),
+                skip,
+            })
+        };
+        Ok(Self {
+            odd_byte: None,
+            resampler,
+        })
+    }
+
+    /// Decode the next chunk of PCM bytes. A trailing odd byte is held back
+    /// until the next call.
+    pub fn push(&mut self, bytes: &[u8]) -> ApiResult<Vec<f32>> {
+        let mut samples = Vec::with_capacity(bytes.len() / 2 + 1);
+        let mut rest = bytes;
+        if let (Some(low), Some(&high)) = (self.odd_byte, rest.first()) {
+            samples.push(f32::from(i16::from_le_bytes([low, high])) / 32768.0);
+            self.odd_byte = None;
+            rest = &rest[1..];
+        }
+        let (pairs, remainder) = rest.as_chunks::<2>();
+        if let [byte] = remainder {
+            self.odd_byte = Some(*byte);
+        }
+        samples.extend(
+            pairs
+                .iter()
+                .map(|pair| f32::from(i16::from_le_bytes(*pair)) / 32768.0),
+        );
+
+        let Some(live) = self.resampler.as_mut() else {
+            return Ok(samples);
+        };
+        live.pending.extend_from_slice(&samples);
+        let mut out = Vec::new();
+        loop {
+            let needed = live.resampler.input_frames_next();
+            if live.pending.len() < needed {
+                break;
+            }
+            let chunk: Vec<f32> = live.pending.drain(..needed).collect();
+            let converted = live.resampler.process(&[chunk], None).map_err(internal)?;
+            live.emit(&converted[0], &mut out);
+        }
+        Ok(out)
+    }
+
+    /// Flush what the resampler still holds at the end of an utterance.
+    pub fn finish(&mut self) -> ApiResult<Vec<f32>> {
+        let Some(live) = self.resampler.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        let tail = std::mem::take(&mut live.pending);
+        if !tail.is_empty() {
+            let converted = live
+                .resampler
+                .process_partial(Some(&[tail]), None)
+                .map_err(internal)?;
+            live.emit(&converted[0], &mut out);
+        }
+        let converted = live
+            .resampler
+            .process_partial::<&[f32]>(None, None)
+            .map_err(internal)?;
+        live.emit(&converted[0], &mut out);
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pcm16_bytes(samples: usize, value: i16) -> Vec<u8> {
+        (0..samples).flat_map(|_| value.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn pcm_stream_passes_16k_through_and_holds_an_odd_byte() {
+        let mut decoder = PcmStream::new(16_000).unwrap();
+        let bytes = pcm16_bytes(4, 16384);
+        let first = decoder.push(&bytes[..3]).unwrap();
+        assert_eq!(first, vec![0.5]);
+        let second = decoder.push(&bytes[3..]).unwrap();
+        assert_eq!(second, vec![0.5, 0.5, 0.5]);
+        assert!(decoder.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pcm_stream_resamples_24k_to_16k_in_arbitrary_chunks() {
+        let mut decoder = PcmStream::new(24_000).unwrap();
+        let bytes = pcm16_bytes(24_000, 8000);
+        let mut total = 0;
+        for chunk in bytes.chunks(1001) {
+            total += decoder.push(chunk).unwrap().len();
+        }
+        total += decoder.finish().unwrap().len();
+        // One second in, one second out, plus the flush's trailing silence
+        // (at most one 20 ms resampler chunk).
+        assert!((15_900..=16_400).contains(&total), "got {total}");
+    }
 
     #[test]
     fn audio_downmixes_and_resamples_before_inference() {

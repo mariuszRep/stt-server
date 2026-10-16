@@ -72,6 +72,9 @@ pub struct LoadedCaps {
     /// claim has been observed to be wrong, even though the model itself
     /// reported it at load time.
     pub timestamp_granularity_rejected: bool,
+    /// `Capabilities::supports_streaming`: the model can run through the
+    /// live `GET /v1/realtime` endpoint (`Session::stream`).
+    pub supports_streaming: bool,
 }
 
 impl LoadedCaps {
@@ -104,6 +107,7 @@ impl LoadedCaps {
             // See the field doc: no engine API in 0.2.3 publishes this.
             prompt_max_tokens: None,
             timestamp_granularity_rejected: false,
+            supports_streaming: caps.supports_streaming,
         }
     }
 }
@@ -415,12 +419,16 @@ impl EffectiveCaps {
             }
         };
         let streaming = ControlCapability {
-            status: Status::Unsupported,
-            reason: Some("not_implemented"),
+            status: if self.loaded.supports_streaming {
+                Status::Supported
+            } else {
+                Status::Unsupported
+            },
+            reason: (!self.loaded.supports_streaming).then_some("model_lacks"),
             evidence: "loaded_model",
             mechanism: None,
             scope: None,
-            extra: json!({ "model_claim": false }),
+            extra: json!({ "model_claim": self.loaded.supports_streaming }),
         };
 
         json!({
@@ -496,6 +504,7 @@ mod tests {
             whisper_ext_accepted: Some(true),
             prompt_max_tokens: None,
             timestamp_granularity_rejected: false,
+            supports_streaming: false,
         }
     }
 
@@ -511,6 +520,7 @@ mod tests {
             whisper_ext_accepted: None,
             prompt_max_tokens: None,
             timestamp_granularity_rejected: false,
+            supports_streaming: false,
         }
     }
 

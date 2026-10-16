@@ -167,7 +167,7 @@ pub fn capability_matrix(model: &CatalogModel) -> Value {
         "language_detect": claim(model.capabilities.lang_detect, json!(model.capabilities.lang_detect), false),
         "translation": claim(model.capabilities.translate, json!(model.capabilities.translate), false),
         "timestamp_granularity": claim(has_timestamps, json!(model.capabilities.timestamps), false),
-        "streaming": {"status": "unsupported", "reason": "not_implemented", "model_claim": model.capabilities.streaming},
+        "streaming": claim(model.capabilities.streaming, json!(model.capabilities.streaming), false),
         "response_formats": {"json": "supported", "text": "supported", "verbose_json": "unknown"},
     })
 }
@@ -230,7 +230,7 @@ mod tests {
         let matrix = capability_matrix(parakeet);
         assert_eq!(matrix["prompt"]["status"], "unsupported");
         assert!(matrix.get("vocabulary").is_none());
-        assert_eq!(matrix["streaming"]["status"], "unsupported");
+        assert_eq!(matrix["streaming"]["status"], "unknown");
         let nemotron = catalog
             .models
             .iter()
@@ -238,7 +238,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             capability_matrix(nemotron)["streaming"]["status"],
-            "unsupported"
+            "unknown"
         );
         // Nemotron's catalog entry claims `lang_detect: true`; the catalog
         // view cannot verify that (no engine has looked at the file yet),
@@ -269,6 +269,7 @@ mod tests {
         assert_eq!(matrix["language_hint"]["status"], "unknown");
         assert_eq!(matrix["language_hint"]["reason"], "unverified");
         assert_eq!(matrix["streaming"]["status"], "unsupported");
+        assert_eq!(matrix["streaming"]["reason"], "model_lacks");
         assert_eq!(
             matrix["streaming"]["model_claim"],
             whisper.capabilities.streaming
