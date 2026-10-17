@@ -8,7 +8,7 @@ scope: stt-server, stt-sdk, whisper-vibes (Stanzo)
 attempt: 1
 max_attempts: 4
 last_result: partial
-next_action: stt-server batch and live are done and gated (S1, S2). Remaining here - stt-sdk exposure (S3) is gated separately; Stanzo workflow option (whisper-vibes) is not started; the srt/vtt output formats are a separate draft goal (owner decision D2). Real-model check of a multi-target model (Canary) is still outstanding.
+next_action: owner test with a translating model - batch and live, and the Stanzo translation workflow option. Built: batch and live in stt-server (S1, S2), stt-sdk exposure (S3), Stanzo workflow option (S4, edba781 in whisper-vibes). Still open - a real multi-target model (Canary) check; the srt/vtt output formats are the separate draft goal subtitle-response-formats (owner decision D2).
 success_criteria:
   - Batch translation (/v1/audio/translations, already present in stt-server) is checked against OpenAI's contract and Handy's behaviour, gaps listed and fixed.
   - The live streaming endpoint can translate as well as transcribe (OpenAI-style session option), for models that support it; others give a clear OpenAI-style error.
@@ -48,6 +48,8 @@ the OpenAI API while keeping Handy's committed/tentative streaming semantics; la
     (audio collected, one batch translate on commit holding the batch permit only for that run, one full-turn delta
     then `completed`). Errors are `error` events on the first append.
   - Docs: `docs/client-contract.md` sections 4.1, 5, 5a and 6.
+- Built later on 2026-10-17: S3 (stt-sdk exposure of batch and streaming translation) and S4 (Stanzo translation as a
+  workflow option, batch and live, `edba781` in whisper-vibes).
 
 ## Do Not Repeat
 - Do not require an advertised `en` target to call a model translating; engines that translate to English only
@@ -59,5 +61,7 @@ the OpenAI API while keeping Handy's committed/tentative streaming semantics; la
 - Real model, turn path: the ignored test `realtime_translation_turn_runs_one_batch_translate_on_commit` ran against a
   local Whisper medium (read-only, CPU, `STT_TEST_TRANSLATE_MODEL`/`STT_TEST_TRANSLATE_WAV`): events
   `committed, delta, partial, completed`, delta equal to the full transcript.
+- 2026-10-17: S3 and S4 built and tested by automation, as reported at delivery; owner test with a translating model
+  is the next step.
 - Not verified: a real multi-target translating model (Canary) and the `verbose_json` `language` of an
   auto-detected source on a translate run; documented as the source language from the plan/engine report.

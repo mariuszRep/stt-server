@@ -7,8 +7,8 @@ type: feature
 scope: stt-server (client of this work - Stanzo's capacity coordinator, tracked in the workspace)
 attempt: 1
 max_attempts: 3
-last_result: partial
-next_action: S1 and S2 and the unload-only endpoint are built and gated. Remaining - a Stanzo release that sends priority=interactive for its own dictation turns and calls POST /models/manage/unload (workspace plan S3-S5); a stt-server release carrying these additions.
+last_result: partial - built (d16aece) and the Stanzo side built 2026-10-17; owner test pending
+next_action: owner test with the Stanzo build that sends priority=interactive for dictation turns and calls POST /models/manage/unload (Stanzo 78fadab and 9040d4d in whisper-vibes); then a stt-server release carrying these additions.
 success_criteria:
   - A batch request for the model a live stream holds waits for the stream's item to end instead of failing with engine_busy; when the wait outlasts queue_wait_timeout_ms it gets 503 engine_busy with details.reason "stream_active". A batch for another model is not delayed.
   - Transcription and translation requests accept an optional priority (interactive or normal, default normal); interactive requests are served before waiting normal ones, FIFO within a class; with no priority the behaviour is exactly the previous FIFO. The live stream's begin step queues as interactive.
@@ -43,7 +43,9 @@ generic and optional.
 ## Attempts
 - Attempt 1 (2026-10-17), stt-server: S1 (batch waits for a stream, `engine_busy` + `stream_active` on timeout),
   S2 (interactive class, `priority` field, `start_item` interactive), `POST /models/manage/unload`.
-  Docs: `docs/client-contract.md` sections 3, 4, 4.3, 5, 5a, 6; `README.md` queue section.
+  Docs: `docs/client-contract.md` sections 3, 4, 4.3, 5, 5a, 6; `README.md` queue section (`d16aece`).
+- Stanzo side, 2026-10-17 (whisper-vibes): voice bursts send `priority: interactive` (`78fadab`); the capacity coordinator
+  unloads idle speech models through `POST /models/manage/unload` (`9040d4d`).
 
 ## Verification Log
 - 2026-10-17: new unit tests in `src/queue.rs` (interactive beats an earlier normal waiter; FIFO within each class;
@@ -51,5 +53,7 @@ generic and optional.
   permit; timeout gives StreamActive; another model is not delayed) and in `src/api.rs` (priority accepted / invalid /
   duplicate; unload keeps the default while deselect clears it; StreamActive maps to engine_busy + stream_active).
   The five pre-existing queue tests pass unchanged apart from the added `Priority::Normal` argument.
+- 2026-10-17: Stanzo side built and tested by automation, as reported at delivery; not yet exercised by the owner under
+  real memory pressure.
 - Not verified: a real streaming model holding the lease while an HTTP batch waits (needs a local streaming model; the
   ignored `realtime_worker_streams_a_wav_through_a_streaming_model` test exercises the worker only).
