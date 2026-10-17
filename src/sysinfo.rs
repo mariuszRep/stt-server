@@ -149,6 +149,7 @@ pub fn to_json(snapshot: &SystemSnapshot, server: &ServerSection) -> Value {
         "memory": memory,
         "gpu": gpu,
         "process": process,
+        "vad": {"engine": "silero-v5", "sample_rate": crate::vad::SAMPLE_RATE},
         "server": {
             "version": server.version,
             "api_level": server.api_level,

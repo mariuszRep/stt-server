@@ -1602,6 +1602,83 @@ pub async fn translations(
     transcribe_or_translate(app, headers, multipart, Endpoint::Translations).await
 }
 
+fn invalid_vad_request(message: impl Into<String>) -> ApiError {
+    ApiError::new(
+        StatusCode::BAD_REQUEST,
+        "invalid_request_error",
+        message.into(),
+    )
+}
+
+/// One optional numeric `/v1/audio/vad` field, `None` when it was not sent.
+fn vad_option<T: std::str::FromStr>(
+    options: &std::collections::HashMap<String, String>,
+    name: &str,
+) -> ApiResult<Option<T>> {
+    options
+        .get(name)
+        .map(|raw| {
+            raw.trim()
+                .parse()
+                .map_err(|_| invalid_vad_request(format!("{name} must be a number")))
+        })
+        .transpose()
+}
+
+/// `POST /v1/audio/vad`: speech segments of a finished recording. A local extension (OpenAI has
+/// no equivalent) that needs no loaded model, so it neither uses the inference queue nor waits
+/// for it; its own two-slot semaphore keeps a burst of requests from taking every core.
+pub async fn audio_vad(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> ApiResult<Json<Value>> {
+    authorize(&headers, &app, AccessLevel::User)?;
+    let mut file: Option<Vec<u8>> = None;
+    let mut options = std::collections::HashMap::new();
+    while let Some(field) = multipart.next_field().await.map_err(invalid_multipart)? {
+        let name = field.name().unwrap_or("").to_owned();
+        match name.as_str() {
+            "file" => {
+                if file.is_some() {
+                    return Err(duplicate_field("file"));
+                }
+                file = Some(field.bytes().await.map_err(invalid_multipart)?.to_vec());
+            }
+            "threshold" | "min_speech_ms" | "min_silence_ms" | "speech_pad_ms" => {
+                let text = field.text().await.map_err(invalid_multipart)?;
+                if options.insert(name.clone(), text).is_some() {
+                    return Err(duplicate_field(&name));
+                }
+            }
+            other => {
+                return Err(invalid_vad_request(format!(
+                    "Field {other} is not supported"
+                )))
+            }
+        }
+    }
+    let file = file.ok_or_else(|| {
+        ApiError::new(StatusCode::BAD_REQUEST, "missing_file", "file is required")
+    })?;
+    let defaults = crate::vad::Params::default();
+    let params = crate::vad::Params {
+        threshold: vad_option(&options, "threshold")?.unwrap_or(defaults.threshold),
+        min_speech_ms: vad_option(&options, "min_speech_ms")?.unwrap_or(defaults.min_speech_ms),
+        min_silence_ms: vad_option(&options, "min_silence_ms")?.unwrap_or(defaults.min_silence_ms),
+        speech_pad_ms: vad_option(&options, "speech_pad_ms")?.unwrap_or(defaults.speech_pad_ms),
+    };
+    params.validate().map_err(invalid_vad_request)?;
+
+    let _slot = app.vad_slots.acquire().await.map_err(internal)?;
+    let report = tokio::task::spawn_blocking(move || {
+        decode_wav(&file).map(|samples| crate::vad::report(&samples, &params))
+    })
+    .await
+    .map_err(internal)??;
+    Ok(Json(report))
+}
+
 /// `POST /models/manage/refresh`: a durable operation (kind `refresh`)
 /// that scans the drop-in `user_models_dir` for new/changed/removed `.gguf`
 /// files. See `crate::dropin` for the scan/registration rules.
@@ -1651,6 +1728,10 @@ pub fn router(app: Arc<App>) -> Router {
         .route(
             "/v1/audio/translations",
             post(translations).layer(DefaultBodyLimit::max(40 * 1024 * 1024)),
+        )
+        .route(
+            "/v1/audio/vad",
+            post(audio_vad).layer(DefaultBodyLimit::max(40 * 1024 * 1024)),
         )
         .route("/v1/realtime", get(crate::realtime::realtime))
         .route("/v1/local/system", get(system_info))
@@ -3251,13 +3332,22 @@ mod router_tests {
     /// POST the sample WAV plus `fields` to `uri` on a fresh server (no model
     /// loaded); returns the status and the JSON error body.
     async fn post_audio_fields(uri: &str, fields: &[(&str, &str)]) -> (StatusCode, Value) {
+        post_wav_fields(uri, &sample_wav_bytes(), fields).await
+    }
+
+    /// Like [`post_audio_fields`] with a caller-chosen WAV.
+    async fn post_wav_fields(
+        uri: &str,
+        wav: &[u8],
+        fields: &[(&str, &str)],
+    ) -> (StatusCode, Value) {
         let parent = std::env::temp_dir().canonicalize().unwrap();
         let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
         let token = app.token.clone();
         let router = router(app.clone());
         let boundary = "X-BOUNDARY";
-        let body = multipart_body(boundary, fields, &sample_wav_bytes());
+        let body = multipart_body(boundary, fields, wav);
         let request = Request::builder()
             .method("POST")
             .uri(uri)
@@ -3277,6 +3367,109 @@ mod router_tests {
         drop(app);
         std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
         (status, body)
+    }
+
+    const SPEECH_WAV: &[u8] = include_bytes!("../tests/fixtures/speech-16k.wav");
+
+    #[tokio::test]
+    async fn vad_reports_speech_segments_for_the_speech_fixture() {
+        let (status, body) = post_wav_fields("/v1/audio/vad", SPEECH_WAV, &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!((body["duration"].as_f64().unwrap() - 6.16).abs() < 0.01);
+        assert!(body["speech_ratio"].as_f64().unwrap() > 0.5);
+        let segments = body["segments"].as_array().unwrap();
+        assert!(!segments.is_empty());
+        let first = &segments[0];
+        assert!(first["start"].as_f64().unwrap() < first["end"].as_f64().unwrap());
+        assert!(body["speech_seconds"].as_f64().unwrap() <= body["duration"].as_f64().unwrap());
+        let (status, strict) =
+            post_wav_fields("/v1/audio/vad", SPEECH_WAV, &[("threshold", "0.95")]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            strict["speech_seconds"].as_f64().unwrap() <= body["speech_seconds"].as_f64().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn vad_reports_no_segments_for_silence() {
+        let (status, body) = post_audio_fields("/v1/audio/vad", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["segments"], json!([]));
+        assert_eq!(body["speech_seconds"], 0.0);
+        assert_eq!(body["speech_ratio"], 0.0);
+        assert_eq!(body["duration"], 0.2);
+    }
+
+    #[tokio::test]
+    async fn vad_rejects_bad_parameters_with_invalid_request_error() {
+        for fields in [
+            ("threshold", "0.01"),
+            ("threshold", "0.99"),
+            ("threshold", "loud"),
+            ("min_speech_ms", "-5"),
+            ("speech_pad_ms", "99999999"),
+            ("unknown", "1"),
+        ] {
+            let (status, body) = post_audio_fields("/v1/audio/vad", &[fields]).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{fields:?}");
+            assert_eq!(body["error"]["code"], "invalid_request_error", "{fields:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn vad_from_the_lan_without_a_token_is_unauthorized() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
+        let app = crate::app::open_app_at_full(
+            path.clone(),
+            crate::app::RuntimeLimits::default(),
+            crate::app::BindOverrides::default(),
+            Some(crate::network::NetworkMode::Lan),
+        )
+        .unwrap();
+        *app.network_state.write().unwrap() = crate::network::NetworkReport::lan(Vec::new());
+        let router = gated_router(app.clone());
+        let boundary = "X-BOUNDARY";
+        let request = with_peer(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/vad")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(multipart_body(
+                    boundary,
+                    &[],
+                    &sample_wav_bytes(),
+                )))
+                .unwrap(),
+            lan_peer(),
+        );
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn system_info_reports_the_vad_engine() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let request = build_request("GET", "/v1/local/system", None, &app.user_token);
+        let response = router(app.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["vad"],
+            json!({"engine": "silero-v5", "sample_rate": 16000})
+        );
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
     }
 
     #[tokio::test]

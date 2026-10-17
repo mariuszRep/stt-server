@@ -26,7 +26,11 @@ Other routes require a bearer token. The server implements
 OpenAI Realtime-style transcription stream with committed/tentative text, documented in
 `docs/client-contract.md` section 5a) for mono/stereo WAV from 8–192 kHz (16/24-bit PCM or 32-bit float),
 both sharing one pipeline (parse → decode → plan → queue → run → format) and a 40 MiB body limit.
-Audio is converted to 16 kHz mono before inference. Accepted multipart fields are `file`, `model`,
+`POST /v1/audio/vad` (a local extension, section 5b of `docs/client-contract.md`) finds the speech
+segments of a finished recording with Silero VAD v5 running in-process (pure Rust, no ONNX runtime,
+no loaded model needed): fields `file`, `threshold`, `min_speech_ms`, `min_silence_ms`,
+`speech_pad_ms`, answer `{duration, speech_seconds, speech_ratio, segments:[{start,end}]}` in
+seconds. Live VAD stays client-side. Audio is converted to 16 kHz mono before inference. Accepted multipart fields are `file`, `model`,
 `language`, `prompt`, `temperature`, `response_format` (`json`/`text`/`verbose_json`), and repeatable
 `timestamp_granularities`/`timestamp_granularities[]` (plus `target_language` on translations only, default `en`, any language the model offers; also available live, section 5a); `prompt` is passed to the engine verbatim
 (no server-side composition or trimming) and is only accepted on whisper-family models. `model` is

@@ -176,7 +176,7 @@ where to drop files should read `GET /v1/local/config`'s
   | Level | Routes |
   |---|---|
   | Unauthenticated | `GET /health` |
-  | User (admin token also works) | `GET /readiness`, `GET /v1/models`, `GET /models/manage`, `GET /models/manage/default`, `GET /v1/local/system`, `GET /models/manage/recommendations`, `GET /models/manage/operations/{id}`, `POST /v1/audio/transcriptions`, `POST /v1/audio/translations`, `GET /v1/realtime` (WebSocket, section 5a) |
+  | User (admin token also works) | `GET /readiness`, `GET /v1/models`, `GET /models/manage`, `GET /models/manage/default`, `GET /v1/local/system`, `GET /models/manage/recommendations`, `GET /models/manage/operations/{id}`, `POST /v1/audio/transcriptions`, `POST /v1/audio/translations`, `POST /v1/audio/vad` (section 5b), `GET /v1/realtime` (WebSocket, section 5a) |
   | Admin only | `GET`/`PATCH /v1/local/config`, `POST /models/manage/{id}/download`, `POST /models/manage/{id}/verify`, `POST /models/manage/{id}/default` (set default and load), `DELETE /models/manage/default` (unload and forget the default), `POST /models/manage/unload` (unload, keep the default; section 4), `DELETE /models/manage/{id}` (remove), `POST /models/manage/refresh` (drop-in refresh), `POST /models/manage/import`, `POST /models/manage/import-user` (copy another install's models in; see section 1.4), `POST /models/manage/operations/{id}/cancel`, `POST /v1/local/shutdown` |
 
   The CLI (`stt-server models ...`, `status`, `stop`, `update`, ...)
@@ -878,6 +878,50 @@ then runs, bounded by `queue_wait_timeout_ms`; when that runs out it gets `503 e
   be any language the model offers, not only English; models that cannot stream translate per turn
   (one delta at commit, see "Live translation").
 
+## 5b. Offline speech detection (local extension)
+
+`POST /v1/audio/vad` finds where speech is in a finished recording. OpenAI has no equivalent;
+this is a local extension, so an OpenAI-compatible client never calls it. It is for audio the
+server already has (an uploaded file, a finished recording); live VAD and chunking stay on the
+client, which owns the microphone.
+
+- **Auth and limits:** user token (the admin token also works), same network gate as the other
+  routes. `multipart/form-data`, 40 MiB body, `file` decoded and converted to 16 kHz mono
+  exactly as for transcription (section 5, `decode_wav`: WAV only, at least 100 ms, at most ten
+  minutes). It needs no loaded model, never enters the inference queue (section 4.3) and so
+  never waits behind a transcription; at most two detections run at once, the rest wait for a
+  slot.
+- **Fields:** `file` (required) and optional text fields, all validated before any audio work:
+
+  | Field | Default | Range | Meaning |
+  |---|---|---|---|
+  | `threshold` | 0.5 | 0.05-0.95 | A frame at or above it starts speech. Speech ends after the probability stays below `threshold - 0.15` (never below 0.01) for `min_silence_ms`. |
+  | `min_speech_ms` | 250 | 0-60000 | Shorter segments are dropped. |
+  | `min_silence_ms` | 100 | 0-60000 | A pause shorter than this does not split a segment. |
+  | `speech_pad_ms` | 30 | 0-60000 | Padding added to both ends of every segment. |
+
+  A duplicate field is `400 duplicate_field`, a missing `file` `400 missing_file`, an unknown
+  field, a non-numeric value or one out of range `400 invalid_request_error`. A bad WAV gets the
+  same `invalid_audio` / `unsupported_audio` / `audio_too_short` / `audio_too_long` errors as
+  transcription.
+- **Response** (the repository's speech fixture):
+
+  ```json
+  { "duration": 6.165, "speech_seconds": 5.048, "speech_ratio": 0.8188,
+    "segments": [ { "start": 0.258, "end": 2.942 }, { "start": 3.074, "end": 5.438 } ] }
+  ```
+
+  Times are seconds from the start of the audio, rounded to milliseconds; `speech_ratio` is
+  `speech_seconds / duration`. Silence, a tone or faint noise gives `"segments": []` and
+  `"speech_seconds": 0`.
+- **Engine:** Silero VAD v5 at 16 kHz (MIT), reimplemented in pure Rust in `src/vad.rs` with
+  its weights embedded in the executable (about 1.2 MB); no ONNX runtime is linked. Frames are
+  32 ms; segmenting follows the rules of Silero's `get_speech_timestamps` (without its optional
+  maximum-speech-length splitting), and segments that end up touching after padding are merged.
+  A test pins the frame probabilities to onnxruntime's within 1e-3 on a speech fixture.
+- **Discovery:** `GET /v1/local/system` reports `vad: {engine, sample_rate}` (section 8).
+  `/v1/realtime` is unchanged.
+
 ## 6. Error envelope and codes
 
 Every non-2xx JSON error:
@@ -893,7 +937,7 @@ source (`src/api.rs`, `src/audio.rs`, `src/auth.rs`, `src/catalog.rs`,
 
 | Status | Codes |
 |---|---|
-| 400 | `missing_file`, `missing_model`, `duplicate_field`, `unexpected_field`, `invalid_multipart`, `invalid_body`, `invalid_audio`, `unsupported_audio`, `audio_too_short`, `invalid_temperature`, `invalid_priority`, `invalid_bind_host`, `invalid_bind_port`, `invalid_network_mode`, `invalid_cors_origins`, `invalid_queue_max_waiting`, `invalid_queue_wait_timeout_ms`, `invalid_inference_timeout_ms`, `invalid_user_models_dir`, `invalid_model`, `invalid_quant`, `invalid_backend` |
+| 400 | `invalid_request_error` (`/v1/audio/vad` only: an out-of-range or non-numeric parameter, or an unknown field -- section 5b), `missing_file`, `missing_model`, `duplicate_field`, `unexpected_field`, `invalid_multipart`, `invalid_body`, `invalid_audio`, `unsupported_audio`, `audio_too_short`, `invalid_temperature`, `invalid_priority`, `invalid_bind_host`, `invalid_bind_port`, `invalid_network_mode`, `invalid_cors_origins`, `invalid_queue_max_waiting`, `invalid_queue_wait_timeout_ms`, `invalid_inference_timeout_ms`, `invalid_user_models_dir`, `invalid_model`, `invalid_quant`, `invalid_backend` |
 | 401 | `unauthorized` |
 | 403 | `loopback_only` (`/v1/local/shutdown` from a non-loopback caller), `admin_required` (a valid user token used on an admin-only route -- see section 3), `network_not_private` (a non-loopback caller under `network_mode: "lan"`/`"tailscale"` while the live check doesn't currently allow it -- see 3.1) |
 | 404 | `model_not_found`, `operation_not_found`, `model_not_installed` (verify and remove of a never-installed id; **a transcription/translation naming a model that isn't downloaded or isn't a known id at all -- see 4.3**; `GET /v1/models/{id}` for a non-callable id) |
@@ -976,6 +1020,7 @@ key's presence before reading it:
            "devices": [ { "name": "NVIDIA GeForce RTX 4080", "backend": "vulkan",
                            "memory_bytes": 17179869184 } ] },
   "process": { "pid": 12345, "uptime_ms": 60000, "rss_bytes": 52428800 },
+  "vad": { "engine": "silero-v5", "sample_rate": 16000 },
   "server": { "version": "0.1.0", "host": "127.0.0.1", "port": 54321,
               "data_dir": "C:\\Users\\...\\STT Server" } }
 ```
@@ -1005,6 +1050,8 @@ Notes:
   it should add a `gpu.note` field explaining that and fall back to
   reporting only `vulkan_available` plus the loaded model's observed
   device -- no such fallback is needed on this build.)
+- `vad` advertises offline speech detection (`POST /v1/audio/vad`, section 5b). A client that
+  finds the key absent is talking to an older server and should keep its own detection.
 - `process.uptime_ms` is `now - GetProcessTimes` process creation time (the
   real process start, correct even on the very first call after startup); on
   a platform where that's unavailable it falls back to measuring from the

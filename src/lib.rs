@@ -29,4 +29,5 @@ pub mod service_names;
 pub mod store;
 pub mod sysinfo;
 pub mod update_transaction;
+pub mod vad;
 pub mod verify;

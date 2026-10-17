@@ -37,5 +37,6 @@ only one.
 
 ## Not in scope
 
-Server-side microphone capture or voice-activity detection,
-holding a user's dictation session, and cloud or multi-tenant hosting.
+Server-side microphone capture, holding a user's dictation session, and cloud or
+multi-tenant hosting. Live VAD and chunking stay client-side; offline speech detection on
+finished audio is a server capability (owner direction 2026-10-17).

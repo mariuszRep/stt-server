@@ -51,6 +51,9 @@ pub struct App {
     /// FIFO queue for the single inference slot; see `crate::queue`. Its
     /// waiting-list bound and wait deadline are read live from `limits`.
     pub inference: InferenceQueue,
+    /// Offline speech detection (`POST /v1/audio/vad`) runs beside, not in, the inference
+    /// queue; this caps how many run at once.
+    pub vad_slots: tokio::sync::Semaphore,
     /// Queue/inference limits: settable via `PATCH /v1/local/config` and
     /// overridable per-process by CLI flags (`--queue-max-waiting`,
     /// `--queue-wait-timeout-ms`, `--inference-timeout-ms`). Read at request
@@ -808,6 +811,7 @@ pub fn open_app_at_full(
         token,
         user_token,
         inference: InferenceQueue::new(),
+        vad_slots: tokio::sync::Semaphore::new(2),
         limits: std::sync::RwLock::new(limits),
         selection: tokio::sync::Mutex::new(()),
         // No blanket total-request timeout: a 48 GB model download must not

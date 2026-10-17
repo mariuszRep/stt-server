@@ -20,3 +20,4 @@ candidate-build/
 local-candidate-promote/
 candidate-download/
 .last-candidate.json
+!/tests/fixtures/*.wav
