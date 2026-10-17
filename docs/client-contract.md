@@ -424,7 +424,7 @@ probes) or `catalog_claim` (catalog view, unverified), and `reason`
 | `prompt`, `temperature` | whisper architecture | `max_tokens` (prompt) |
 | `language_hint` | language list | `languages` |
 | `language_detect` | `supports_language_detect` | |
-| `translation` | `supports_translate` and an `en` target | `target_languages` (the model's own list; `[]` when unsupported) |
+| `translation` | `supports_translate` | `target_languages` (the model's own list of target languages; `null` when the model translates but does not advertise its targets, meaning English only; `[]` when unsupported) |
 | `timestamp_granularity` | `max_timestamp_kind` | `max` (`none`/`segment`/`word`/`token`) |
 | `streaming` | `supports_streaming` | `model_claim` |
 | `punctuation` | PNC feature probe | |
@@ -435,10 +435,11 @@ probes) or `catalog_claim` (catalog view, unverified), and `reason`
 | `native_sample_rate` | `native_sample_rate` | `hz` (`unknown`/`not_reported` when 0) |
 
 Translation is per model: a multilingual Whisper reports `supported` with
-`target_languages: ["en"]`; Parakeet and Unified report `unsupported`. In the
-catalog view `translation` follows the catalog's `translate` claim (`unknown`
-with `target_languages: ["en"]` when claimed, `unsupported` with `[]`
-otherwise). `punctuation`, `itn`, `cancellation`, `long_form`, `spec_decode`
+`target_languages: ["en"]`; a model that translates into several languages
+(Canary-style) lists them all; Parakeet and Unified report `unsupported`. In
+the catalog view `translation` follows the catalog's `translate` claim
+(`unknown` with `target_languages: null` when claimed, because the catalog
+does not say into what; `unsupported` with `[]` otherwise). `punctuation`, `itn`, `cancellation`, `long_form`, `spec_decode`
 and `native_sample_rate` have no catalog claim, so before a model has been
 loaded they are `unknown` (`reason: "unverified"`, `evidence:
 "catalog_claim"`); loading the model resolves them.
@@ -645,9 +646,35 @@ returned**, only a client starting a new operation call does:
 | `temperature` | no | `0.0..=1.0`; omit unless `temperature` capability is `supported` |
 | `response_format` | no | `json` (default) \| `text` \| `verbose_json` |
 | `timestamp_granularities` (repeatable) | no | `word` \| `segment`; only meaningful with `verbose_json`; omit `word` unless `word_timestamps` capability is `supported` |
+| `target_language` | no | **`/v1/audio/translations` only** (extension, see below). The language to translate into; default `en`. On `/v1/audio/transcriptions` it is an unknown field. |
 
 Any other field name is rejected as `422 unsupported_capability` before any
 model-aware planning happens; a field sent twice is `400 duplicate_field`.
+
+### Translation (`/v1/audio/translations`)
+
+OpenAI's translations endpoint translates into English only and accepts just
+`file`, `model`, `prompt`, `response_format` and `temperature`. This server
+follows that, with documented extensions:
+
+- **`target_language`** (extension): translate into any language the loaded model
+  offers (`translation.target_languages` in the capability view; a model that
+  translates but does not advertise targets offers `en` only). Default `en`, so an
+  OpenAI client sees no difference. A BCP-47 region suffix or alias on the source
+  is ignored when comparing it with the target (`en-US` is `en`).
+- **`language`** (extension; OpenAI has no `language` on translations): a hint for the
+  *source* language, resolved like on transcriptions.
+- **`timestamp_granularities`** (extension on translations, as on transcriptions
+  here): with `verbose_json`, segment/word timestamps where the model provides them.
+- **Source equals target**: when the source language (the hint, or the single
+  language of a one-language model) is the target, the audio is transcribed
+  instead, as Handy does; `task` reports `transcribe` and `x_diagnostics.target_language`
+  is omitted.
+- **`verbose_json` `language`** is the *source* language (the spoken one, as in OpenAI's
+  verbose translations response); `text` is the translation.
+- Errors: `422 unsupported_capability` when the model does not translate at all,
+  `422 unsupported_target_language` (with `details.target_language` and
+  `details.target_languages`) when it translates but not into the requested language.
 
 ### Format and size limits (reviewed 2026-09-26)
 
@@ -696,6 +723,7 @@ timestamps allow) always populated.
   "engine_timings": { "mel_ms", "encode_ms", "decode_ms" },
   "language_hint_applied": true,      // omitted entirely if no hint was sent
   "applied_language": "en",           // omitted if nothing was resolved
+  "target_language": "de",            // omitted unless the audio was translated
   "truncated": true                    // omitted if false
 }
 ```
@@ -736,7 +764,8 @@ Source: `src/realtime.rs`.
 - **Models**: only models that report `streaming` (parakeet-unified, nemotron streaming, ...; see
   `capabilities.streaming` in `GET /v1/models` and `/models/manage`). Others get the error code
   `streaming_unsupported` and the socket is closed: the client falls back to
-  `POST /v1/audio/transcriptions`.
+  `POST /v1/audio/transcriptions`. The one exception is a *translation session* (see
+  "Live translation" below), which also works on models that translate but cannot stream.
 - **Turns**: client-driven only. Audio between the first `append` and the `commit` is one *item*. After
   `completed` the next `append` starts a new item on the same socket. One item is transcribed at a time.
 
@@ -744,7 +773,7 @@ Source: `src/realtime.rs`.
 
 | Event | Fields | Effect |
 |---|---|---|
-| `transcription_session.update` (also `session.update`) | `session.input_audio_format` (`"pcm16"`), `session.input_audio_sample_rate` (8000-48000, default 24000; extension), `session.input_audio_transcription.{model, language, prompt}`, `session.turn_detection` (must be null) | Changes the session for the *next* item. Reply: `transcription_session.updated` (or `session.updated` when the client used `session.update`). The GA shape (`session.audio.input.{format{type:"audio/pcm", rate}, transcription{model, language or languages[0], prompt}, turn_detection}`) is read too. |
+| `transcription_session.update` (also `session.update`) | `session.input_audio_format` (`"pcm16"`), `session.input_audio_sample_rate` (8000-48000, default 24000; extension), `session.input_audio_transcription.{model, language, prompt, target_language}` (`target_language` is an extension, see "Live translation"), `session.audio.output.language` (OpenAI's name for the same thing), `session.turn_detection` (must be null) | Changes the session for the *next* item. Reply: `transcription_session.updated` (or `session.updated` when the client used `session.update`). The GA shape (`session.audio.input.{format{type:"audio/pcm", rate}, transcription{model, language or languages[0], prompt}, turn_detection}`) is read too. |
 | `input_audio_buffer.append` | `audio`: base64 PCM16 little-endian mono | Feeds the engine immediately. The first one of an item starts the stream (model bind or swap happens here). |
 | `input_audio_buffer.commit` | none | Ends the item: the server replies `input_audio_buffer.committed {item_id, previous_item_id}`, then a last `delta` and `partial`, then `completed`. Error `input_audio_buffer_commit_empty` when no audio was appended. |
 | `input_audio_buffer.clear` | none | Discards the item without a transcript. Reply `input_audio_buffer.cleared`. |
@@ -755,7 +784,7 @@ An item with no client event for 60 s is discarded with error `idle_timeout`.
 
 | Event | Fields |
 |---|---|
-| `transcription_session.created` | `session` (sent on connect): `{id, object:"realtime.transcription_session", input_audio_format, input_audio_sample_rate, input_audio_transcription{model, language, prompt}, turn_detection:null}` |
+| `transcription_session.created` | `session` (sent on connect): `{id, object:"realtime.transcription_session", input_audio_format, input_audio_sample_rate, input_audio_transcription{model, language, target_language, prompt}, turn_detection:null}` |
 | `transcription_session.updated` / `session.updated` | `session` |
 | `input_audio_buffer.committed` / `input_audio_buffer.cleared` | as above |
 | `conversation.item.input_audio_transcription.delta` | `item_id`, `content_index:0`, `delta`: the text *newly committed* since the last delta. Committed text is append-only and never changes, so concatenating deltas gives the committed transcript. |
@@ -765,10 +794,33 @@ An item with no client event for 60 s is discarded with error `idle_timeout`.
 
 Every event also carries `event_id`. Error codes on the socket: `invalid_json`, `invalid_event`,
 `invalid_audio`, `unsupported_audio_format`, `turn_detection_unsupported`,
-`input_audio_buffer_commit_empty`, `idle_timeout`, `streaming_unsupported`, `stream_busy`, plus the
+`input_audio_buffer_commit_empty`, `idle_timeout`, `streaming_unsupported`, `stream_busy`,
+`unsupported_capability` and `unsupported_target_language` (translation sessions), plus the
 batch codes of section 6 for model resolution and the queue (`server_not_ready`, `model_not_installed`,
 `needs_verification`, `model_load_failed`, `queue_full`, `queue_timeout`, `engine_busy`, ...).
 Only `streaming_unsupported` closes the socket; other errors leave it usable.
+
+### Live translation
+
+Setting a target language turns the session into a translation session: every turn is
+translated into that language. Send it as
+`session.input_audio_transcription.target_language` (extension) or as OpenAI's
+`session.audio.output.language`; clear it with an empty string. The languages are the model's
+`translation.target_languages` (section 4.1; English only when a translating model advertises
+none). Without a target the session is a plain transcription session.
+
+- **Errors** come as `error` events on the first `append` of an item (the model is only known
+  then): `unsupported_capability` when the model cannot translate at all,
+  `unsupported_target_language` when it cannot translate into that language. The socket stays open.
+  A source that already is the target (the `language` hint) is simply transcribed.
+- **Models that can stream** translate through the normal streaming path (events as above).
+- **Models that cannot stream** (Whisper-family `translate`, Canary, ...) use the *buffered turn path*:
+  the server collects the turn's audio, and on `input_audio_buffer.commit` runs one batch
+  translation. The batch permit is held only for that run, so the session does not tie up the
+  queue while the user speaks. The reply is `input_audio_buffer.committed`, then **one** `delta`
+  carrying the whole translated turn, a `partial` with the same text as `committed`, and `completed`.
+  There is no text while speaking; the latency is the batch run after the commit. A `clear` before the
+  commit discards the audio without running anything.
 
 ### Concurrency
 
@@ -792,7 +844,9 @@ proceeds normally.
 - `prompt` is accepted but only used by whisper-family models, which do not stream, so it has no effect
   today. `language` is a hint, resolved like the batch endpoint.
 - The `previous_item_id` chain only covers items of the current socket.
-- Translation is not available live (see the `live-translation` goal).
+- Live translation is an extension (OpenAI's Realtime transcription mode has none). `target_language` may
+  be any language the model offers, not only English; models that cannot stream translate per turn
+  (one delta at commit, see "Live translation").
 
 ## 6. Error envelope and codes
 
@@ -815,7 +869,7 @@ source (`src/api.rs`, `src/audio.rs`, `src/auth.rs`, `src/catalog.rs`,
 | 404 | `model_not_found`, `operation_not_found`, `model_not_installed` (verify and remove of a never-installed id; **a transcription/translation naming a model that isn't downloaded or isn't a known id at all -- see 4.3**; `GET /v1/models/{id}` for a non-callable id) |
 | 409 | `already_installed`, `operation_conflict`, `operation_finished` (cancelling a terminal operation), `model_in_use` (removing the selected model), `model_not_installed` (select, before install), **`needs_verification`** (select, or a transcription/translation naming a downloaded-but-unverified model -- see 4), `model_load_failed` (select, or a per-request swap whose load failed -- see 4.3; the previously resident model is left untouched), `unowned_model_path` (refusing to remove a file outside the managed store), `model_loading` (select/load of a different model while a background load is already in progress -- see 4.2) |
 | 413 | `audio_too_long` (payload too large) |
-| 422 | `streaming_unsupported` (socket event only, section 5a), `unsupported_capability`, `engine_unsupported`, `engine_rejected_option`, `prompt_too_long`, `size_mismatch` (import exceeds catalog size), `hash_mismatch` (import/verify SHA-256 or size mismatch) |
+| 422 | `streaming_unsupported` (socket event only, section 5a), `unsupported_capability`, `unsupported_target_language` (translation into a language the model does not offer; also a socket event, section 5a), `engine_unsupported`, `engine_rejected_option`, `prompt_too_long`, `size_mismatch` (import exceeds catalog size), `hash_mismatch` (import/verify SHA-256 or size mismatch) |
 | 429 | `queue_full`, `stream_busy` (socket event only, section 5a) |
 | 500 | `internal_error`, `inference_failed` (message only; not meant to be pattern-matched) |
 | 503 | `server_not_ready` (no default model configured and nothing loading; includes an `operation_id` in `details` when an install/verify that would fix this is already running), `not_ready`, `model_loading` (a `model=default` request while the startup reload is still in progress and nothing is default yet, *or* a request whose named model is being loaded in the background for longer than `queue_wait_timeout_ms` -- `details` carries `model`/`elapsed_ms` -- see 4.2/4.3), `engine_busy`, `queue_timeout` |

@@ -1045,6 +1045,7 @@ struct TranscriptionFields {
     temperature: Option<f32>,
     response_format: Option<String>,
     timestamp_granularities: Vec<String>,
+    target_language: Option<String>,
 }
 
 fn invalid_multipart(error: impl std::fmt::Display) -> ApiError {
@@ -1064,8 +1065,12 @@ fn duplicate_field(name: &str) -> ApiError {
 /// any capability-aware planning happens; a duplicate of a non-repeatable
 /// field is rejected immediately as 400 `duplicate_field`.
 /// `timestamp_granularities` / `timestamp_granularities[]` are the one
-/// repeatable field.
-async fn parse_transcription_multipart(mut multipart: Multipart) -> ApiResult<TranscriptionFields> {
+/// repeatable field. `target_language` (an extension to OpenAI) is accepted
+/// on translations only; on transcriptions it is an unknown field.
+async fn parse_transcription_multipart(
+    mut multipart: Multipart,
+    endpoint: Endpoint,
+) -> ApiResult<TranscriptionFields> {
     let mut file: Option<Vec<u8>> = None;
     let mut model: Option<String> = None;
     let mut language: Option<String> = None;
@@ -1073,6 +1078,7 @@ async fn parse_transcription_multipart(mut multipart: Multipart) -> ApiResult<Tr
     let mut temperature_raw: Option<String> = None;
     let mut response_format: Option<String> = None;
     let mut timestamp_granularities: Vec<String> = Vec::new();
+    let mut target_language: Option<String> = None;
 
     while let Some(field) = multipart.next_field().await.map_err(invalid_multipart)? {
         let name = field.name().unwrap_or("").to_owned();
@@ -1116,6 +1122,12 @@ async fn parse_transcription_multipart(mut multipart: Multipart) -> ApiResult<Tr
             "timestamp_granularities" | "timestamp_granularities[]" => {
                 timestamp_granularities.push(field.text().await.map_err(invalid_multipart)?);
             }
+            "target_language" if endpoint == Endpoint::Translations => {
+                if target_language.is_some() {
+                    return Err(duplicate_field("target_language"));
+                }
+                target_language = Some(field.text().await.map_err(invalid_multipart)?);
+            }
             other => {
                 return Err(ApiError::new(
                     StatusCode::UNPROCESSABLE_ENTITY,
@@ -1153,6 +1165,7 @@ async fn parse_transcription_multipart(mut multipart: Multipart) -> ApiResult<Tr
         temperature,
         response_format,
         timestamp_granularities,
+        target_language,
     })
 }
 
@@ -1229,6 +1242,22 @@ pub(crate) fn resolve_requested_model(app: &App, requested: &str) -> ApiResult<S
         error = error.with_details(json!({"operation_id": operation_id}));
     }
     Err(error)
+}
+
+/// The API error for a caller that could not get a turn in the inference queue.
+pub(crate) fn queue_api_error(error: crate::queue::QueueError) -> ApiError {
+    match error {
+        crate::queue::QueueError::Full => ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "queue_full",
+            "Too many transcriptions are already waiting",
+        ),
+        crate::queue::QueueError::Timeout => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "queue_timeout",
+            "Timed out waiting for a turn in the inference queue",
+        ),
+    }
 }
 
 /// How often `bind_or_swap_model` polls while waiting out a background load
@@ -1342,7 +1371,7 @@ async fn transcribe_or_translate(
     endpoint: Endpoint,
 ) -> ApiResult<Response> {
     authorize(&headers, &app, AccessLevel::User)?;
-    let fields = parse_transcription_multipart(multipart).await?;
+    let fields = parse_transcription_multipart(multipart, endpoint).await?;
 
     // Decode/validate happens before joining the queue; only the actual
     // inference run below waits for a turn.
@@ -1365,18 +1394,7 @@ async fn transcribe_or_translate(
         .inference
         .acquire(limits.queue_max_waiting, wait_timeout)
         .await
-        .map_err(|error| match error {
-            crate::queue::QueueError::Full => ApiError::new(
-                StatusCode::TOO_MANY_REQUESTS,
-                "queue_full",
-                "Too many transcriptions are already waiting",
-            ),
-            crate::queue::QueueError::Timeout => ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "queue_timeout",
-                "Timed out waiting for a turn in the inference queue",
-            ),
-        })?;
+        .map_err(queue_api_error)?;
 
     // Now that this request holds the sole inference permit, make sure the
     // model it asked for is the one loaded -- swapping if needed. This is
@@ -1390,6 +1408,7 @@ async fn transcribe_or_translate(
         temperature: fields.temperature,
         response_format: fields.response_format,
         timestamp_granularities: fields.timestamp_granularities,
+        target_language: fields.target_language,
     };
     let tokenizer_model = model.clone();
     let tokenize = move |text: &str| -> Option<usize> {
@@ -1510,6 +1529,7 @@ async fn transcribe_or_translate(
         applied_language: plan.applied_language.clone(),
         language_evidence,
         timestamps_unavailable,
+        target_language: plan.target_language.clone(),
     };
 
     let formatted = format_response(&transcript, &plan, samples, &extra);
@@ -3175,6 +3195,72 @@ mod router_tests {
         assert_eq!(body["error"]["code"], "duplicate_field");
         drop(app);
         std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    /// POST the sample WAV plus `fields` to `uri` on a fresh server (no model
+    /// loaded); returns the status and the JSON error body.
+    async fn post_audio_fields(uri: &str, fields: &[(&str, &str)]) -> (StatusCode, Value) {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let router = router(app.clone());
+        let boundary = "X-BOUNDARY";
+        let body = multipart_body(boundary, fields, &sample_wav_bytes());
+        let request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn transcriptions_reject_target_language_as_an_unknown_field() {
+        let (status, body) = post_audio_fields(
+            "/v1/audio/transcriptions",
+            &[("model", "default"), ("target_language", "de")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"]["code"], "unsupported_capability");
+    }
+
+    #[tokio::test]
+    async fn translations_accept_target_language_and_reach_the_model_check() {
+        // Field shape passes; with no model selected the request then stops at
+        // the model check, which proves the field was not rejected.
+        let (status, body) = post_audio_fields(
+            "/v1/audio/translations",
+            &[("model", "default"), ("target_language", "de")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["code"], "server_not_ready");
+    }
+
+    #[tokio::test]
+    async fn translations_duplicate_target_language_is_400() {
+        let (status, body) = post_audio_fields(
+            "/v1/audio/translations",
+            &[("target_language", "de"), ("target_language", "fr")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "duplicate_field");
     }
 
     #[tokio::test]

@@ -70,6 +70,10 @@ pub struct ParsedRequest {
     pub temperature: Option<f32>,
     pub response_format: Option<String>,
     pub timestamp_granularities: Vec<String>,
+    /// The language to translate into (`Endpoint::Translations` only; an
+    /// extension to OpenAI, which translates to English only). `None` means
+    /// the default, English.
+    pub target_language: Option<String>,
 }
 
 /// The finished, engine-ready plan.
@@ -419,18 +423,39 @@ pub fn plan(
                     "This model does not support translation",
                 ));
             }
-            let source_is_english = applied_language.as_deref() == Some("en")
-                || (caps.loaded.languages.len() == 1 && caps.loaded.languages[0] == "en");
-            if source_is_english {
+            let target = request
+                .target_language
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .unwrap_or("en")
+                .to_owned();
+            let source_language = applied_language.clone().or_else(|| {
+                (caps.loaded.languages.len() == 1).then(|| caps.loaded.languages[0].clone())
+            });
+            let source_is_target = source_language.as_deref().is_some_and(|source| {
+                canonical_language_code(source) == canonical_language_code(&target)
+            });
+            if source_is_target {
                 // Transcribing instead of translating is correct here (the
-                // source is already English), but the *evidence* for why is
-                // whatever `resolve_language` already determined: an explicit
-                // `en` hint is `user_selected`, and a single-language `en`
-                // model with no hint is `model_constrained`. Neither case is
-                // actually "translated to English" — nothing was translated.
+                // source already is the target; Handy does the same), but the
+                // *evidence* for why is whatever `resolve_language` already
+                // determined: an explicit hint is `user_selected`, and a
+                // single-language model with no hint is `model_constrained`.
+                // Neither case is actually "translated" - nothing was.
                 (PlannedTask::Transcribe, None)
+            } else if !caps.offers_translation_target(&target) {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "unsupported_target_language",
+                    format!("This model cannot translate into '{target}'"),
+                )
+                .with_details(json!({
+                    "target_language": target,
+                    "target_languages": caps.loaded.translate_target_languages,
+                })));
             } else {
-                (PlannedTask::Translate, Some("en".to_string()))
+                (PlannedTask::Translate, Some(target))
             }
         }
     };
@@ -798,6 +823,83 @@ mod tests {
         let err = plan(&r, &non_whisper_caps(), Endpoint::Translations, None).unwrap_err();
         assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(err.code, "unsupported_capability");
+    }
+
+    fn translating_caps(targets: &[&str]) -> EffectiveCaps {
+        let mut caps = whisper_caps();
+        caps.loaded.translate_target_languages = targets.iter().map(|t| t.to_string()).collect();
+        caps
+    }
+
+    fn translate_to(
+        target: &str,
+        language: Option<&str>,
+        caps: &EffectiveCaps,
+    ) -> Result<Plan, ApiError> {
+        let mut r = req();
+        r.language = language.map(str::to_owned);
+        r.target_language = Some(target.to_owned());
+        plan(&r, caps, Endpoint::Translations, None)
+    }
+
+    #[test]
+    fn translation_without_advertised_targets_defaults_to_english() {
+        let caps = translating_caps(&[]);
+        let p = translate_to("en", Some("es"), &caps).unwrap();
+        assert_eq!(p.task, PlannedTask::Translate);
+        assert_eq!(p.target_language.as_deref(), Some("en"));
+        let err = translate_to("fr", Some("es"), &caps).unwrap_err();
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err.code, "unsupported_target_language");
+    }
+
+    #[test]
+    fn translation_to_a_language_the_model_does_not_offer_is_422() {
+        let err = translate_to("fr", Some("es"), &translating_caps(&["en"])).unwrap_err();
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err.code, "unsupported_target_language");
+    }
+
+    #[test]
+    fn translation_to_any_offered_target_plans_a_translate_task() {
+        let caps = translating_caps(&["en", "de"]);
+        let p = translate_to("de", Some("es"), &caps).unwrap();
+        assert_eq!(p.task, PlannedTask::Translate);
+        assert_eq!(p.target_language.as_deref(), Some("de"));
+        assert_eq!(p.to_run_options().target_language.as_deref(), Some("de"));
+        // A blank target is the default, English.
+        let p = translate_to("  ", Some("es"), &caps).unwrap();
+        assert_eq!(p.target_language.as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn translation_where_source_is_the_target_transcribes_instead() {
+        let caps = translating_caps(&["en", "de"]);
+        let p = translate_to("es", Some("es"), &caps).unwrap();
+        assert_eq!(p.task, PlannedTask::Transcribe);
+        assert_eq!(p.target_language, None);
+        assert_eq!(p.language_evidence_hint.as_deref(), Some("user_selected"));
+        // Region tags and aliases count as the same language.
+        let p = translate_to("no", Some("nb"), &caps).unwrap();
+        assert_eq!(p.task, PlannedTask::Transcribe);
+    }
+
+    #[test]
+    fn translation_target_is_checked_only_on_translating_models() {
+        let mut r = req();
+        r.target_language = Some("de".to_string());
+        let err = plan(&r, &non_whisper_caps(), Endpoint::Translations, None).unwrap_err();
+        assert_eq!(err.code, "unsupported_capability");
+    }
+
+    #[test]
+    fn transcriptions_ignore_the_target_language() {
+        let mut r = req();
+        r.language = Some("es".to_string());
+        r.target_language = Some("de".to_string());
+        let p = plan(&r, &whisper_caps(), Endpoint::Transcriptions, None).unwrap();
+        assert_eq!(p.task, PlannedTask::Transcribe);
+        assert_eq!(p.target_language, None);
     }
 
     // --- timestamps -----------------------------------------------------------

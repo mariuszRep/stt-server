@@ -73,6 +73,10 @@ pub struct DiagnosticsExtra {
     /// retried without timestamps because the engine rejected the model's
     /// own advertised granularity.
     pub timestamps_unavailable: bool,
+    /// The language the transcript was translated into; `None` when the run
+    /// was a plain transcription (no target requested, or the source already
+    /// was the target), so the key is omitted from `x_diagnostics`.
+    pub target_language: Option<String>,
 }
 
 fn diagnostics_json(extra: &DiagnosticsExtra) -> Value {
@@ -96,6 +100,9 @@ fn diagnostics_json(extra: &DiagnosticsExtra) -> Value {
     }
     if let Some(language) = &extra.applied_language {
         v["applied_language"] = json!(language);
+    }
+    if let Some(target) = &extra.target_language {
+        v["target_language"] = json!(target);
     }
     if extra.truncated {
         v["truncated"] = json!(true);
@@ -259,6 +266,7 @@ mod tests {
             applied_language: None,
             language_evidence: LanguageEvidence::Unknown,
             timestamps_unavailable: false,
+            target_language: None,
         }
     }
 
@@ -455,6 +463,23 @@ mod tests {
             Formatted::Json(v) => assert_eq!(v["x_diagnostics"]["timestamps_unavailable"], true),
             _ => panic!("expected json"),
         }
+    }
+
+    #[test]
+    fn target_language_diagnostic_only_present_when_translated() {
+        let t = Transcript::default();
+        let p = plan(ResponseFormat::Json, TimestampGranularity::None);
+        let Formatted::Json(plain) = format_response(&t, &p, 16_000, &extra()) else {
+            panic!("expected json");
+        };
+        assert!(plain["x_diagnostics"].get("target_language").is_none());
+
+        let mut e = extra();
+        e.target_language = Some("de".to_string());
+        let Formatted::Json(translated) = format_response(&t, &p, 16_000, &e) else {
+            panic!("expected json");
+        };
+        assert_eq!(translated["x_diagnostics"]["target_language"], "de");
     }
 
     #[test]

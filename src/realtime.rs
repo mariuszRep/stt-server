@@ -41,7 +41,9 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use transcribe_cpp::{Model, RunOptions, StreamOptions};
 use uuid::Uuid;
 
-use crate::api::{bind_or_swap_model, require_installed_verified, resolve_requested_model};
+use crate::api::{
+    bind_or_swap_model, queue_api_error, require_installed_verified, resolve_requested_model,
+};
 use crate::app::App;
 use crate::audio::PcmStream;
 use crate::auth::{authorize, AccessLevel};
@@ -104,6 +106,9 @@ struct SessionConfig {
     id: String,
     model: String,
     language: Option<String>,
+    /// Translate each turn into this language (extension; see section 5a of
+    /// the client contract). `None`: plain transcription.
+    target_language: Option<String>,
     prompt: Option<String>,
     sample_rate: u32,
 }
@@ -118,6 +123,7 @@ impl SessionConfig {
             id: format!("sess_{}", Uuid::new_v4().simple()),
             model: model.unwrap_or_else(|| "default".to_owned()),
             language: None,
+            target_language: None,
             prompt: None,
             sample_rate: DEFAULT_SAMPLE_RATE,
         }
@@ -181,6 +187,15 @@ impl SessionConfig {
                 next.prompt = prompt.as_str().filter(|p| !p.is_empty()).map(str::to_owned);
             }
         }
+        // `input_audio_transcription.target_language` is this server's name;
+        // `audio.output.language` is OpenAI's name for the same thing.
+        if let Some(target) = first(&[
+            "/input_audio_transcription/target_language",
+            "/audio/input/transcription/target_language",
+            "/audio/output/language",
+        ]) {
+            next.target_language = target.as_str().filter(|l| !l.is_empty()).map(str::to_owned);
+        }
         *self = next;
         Ok(())
     }
@@ -194,6 +209,7 @@ impl SessionConfig {
             "input_audio_transcription": {
                 "model": self.model,
                 "language": self.language,
+                "target_language": self.target_language,
                 "prompt": self.prompt,
             },
             "turn_detection": null,
@@ -350,6 +366,32 @@ struct Item {
     decoder: PcmStream,
     committed: String,
     committed_by_client: bool,
+    /// Set for a translation turn on a model that cannot stream: the audio is
+    /// collected here until the client commits (see [`BufferedTurn`]).
+    buffered: Option<BufferedTurn>,
+}
+
+impl Item {
+    /// Hand audio to the stream worker, or collect it for the buffered turn.
+    fn feed(&mut self, pcm: Vec<f32>) {
+        if pcm.is_empty() {
+            return;
+        }
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(Cmd::Feed(pcm));
+        } else if let Some(turn) = &mut self.buffered {
+            turn.pcm.extend(pcm);
+        }
+    }
+
+    /// The client committed: end the stream, or run the buffered turn.
+    fn finalize(&mut self) {
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(Cmd::Finalize);
+        } else if let Some(turn) = self.buffered.take() {
+            tokio::spawn(run_buffered_turn(turn));
+        }
+    }
 }
 
 struct Closed;
@@ -505,12 +547,7 @@ impl Connection {
         }
         let item = self.item.as_mut().expect("item was just started");
         match item.decoder.push(&bytes) {
-            Ok(pcm) if !pcm.is_empty() => {
-                if let Some(commands) = &item.commands {
-                    let _ = commands.send(Cmd::Feed(pcm));
-                }
-            }
-            Ok(_) => {}
+            Ok(pcm) => item.feed(pcm),
             Err(error) => self.send_error(&error).await?,
         }
         Ok(Flow::Continue)
@@ -527,11 +564,9 @@ impl Connection {
             return Ok(Flow::Continue);
         };
         let tail = item.decoder.finish();
-        if let (Ok(pcm), Some(commands)) = (&tail, &item.commands) {
-            if !pcm.is_empty() {
-                let _ = commands.send(Cmd::Feed(pcm.clone()));
-            }
-            let _ = commands.send(Cmd::Finalize);
+        if let Ok(pcm) = &tail {
+            item.feed(pcm.clone());
+            item.finalize();
         }
         item.committed_by_client = true;
         let committed = event(
@@ -618,6 +653,10 @@ impl Connection {
     async fn discard_item(&mut self) {
         if let Some(mut item) = self.item.take() {
             item.commands = None;
+            if item.buffered.is_some() {
+                // Never committed, so no worker is running: nothing to wait for.
+                return;
+            }
             while let Some(update) = item.updates.recv().await {
                 if matches!(update, Update::Ended) {
                     break;
@@ -627,8 +666,81 @@ impl Connection {
     }
 }
 
+/// A translation turn on a model that cannot stream (owner decision D1): the
+/// turn's audio is buffered and, once the client commits, translated by one
+/// batch run. Only that run takes the batch permit.
+struct BufferedTurn {
+    app: std::sync::Arc<App>,
+    model: String,
+    run: RunOptions,
+    pcm: Vec<f32>,
+    stream_slot: tokio::sync::OwnedSemaphorePermit,
+    updates: UnboundedSender<Update>,
+}
+
+/// Translate the buffered turn and report it as one full-turn delta followed
+/// by `completed`.
+async fn run_buffered_turn(turn: BufferedTurn) {
+    let BufferedTurn {
+        app,
+        model,
+        run,
+        pcm,
+        stream_slot,
+        updates,
+    } = turn;
+    let outcome = translate_pcm(&app, &model, run, pcm).await;
+    // Free the slot before announcing the end, as `stream_worker` does.
+    drop(stream_slot);
+    match outcome {
+        Ok(text) => {
+            if !text.is_empty() {
+                let _ = updates.send(Update::Partial {
+                    committed: text.clone(),
+                    tentative: String::new(),
+                    revision: 0,
+                });
+            }
+            let _ = updates.send(Update::Completed(text));
+        }
+        Err(error) => {
+            let _ = updates.send(Update::Failed(error));
+        }
+    }
+    let _ = updates.send(Update::Ended);
+}
+
+/// One batch run of `pcm` against `model_id`, holding the batch permit only
+/// for the run itself.
+async fn translate_pcm(
+    app: &App,
+    model_id: &str,
+    run: RunOptions,
+    pcm: Vec<f32>,
+) -> Result<String, ApiError> {
+    if pcm.is_empty() {
+        return Ok(String::new());
+    }
+    let limits = *app.limits.read().map_err(internal)?;
+    let wait_timeout = limits.queue_wait_timeout_ms.map(Duration::from_millis);
+    let (permit, _) = app
+        .inference
+        .acquire(limits.queue_max_waiting, wait_timeout)
+        .await
+        .map_err(queue_api_error)?;
+    let (model, _, _, _) = bind_or_swap_model(app, model_id, wait_timeout).await?;
+    let transcript = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        model.session()?.run(&pcm, &run)
+    })
+    .await
+    .map_err(internal)?
+    .map_err(map_engine_error)?;
+    Ok(transcript.text.trim().to_owned())
+}
+
 /// Claim the stream slot, bind the model, and start the worker for a new item.
-async fn start_item(app: &App, config: &SessionConfig) -> Result<Item, ApiError> {
+async fn start_item(app: &std::sync::Arc<App>, config: &SessionConfig) -> Result<Item, ApiError> {
     let stream_slot = app.inference.try_acquire_stream().ok_or_else(|| {
         ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -644,45 +756,60 @@ async fn start_item(app: &App, config: &SessionConfig) -> Result<Item, ApiError>
         .inference
         .acquire(limits.queue_max_waiting, wait_timeout)
         .await
-        .map_err(|error| match error {
-            crate::queue::QueueError::Full => ApiError::new(
-                StatusCode::TOO_MANY_REQUESTS,
-                "queue_full",
-                "Too many transcriptions are already waiting",
-            ),
-            crate::queue::QueueError::Timeout => ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "queue_timeout",
-                "Timed out waiting for a turn in the inference queue",
-            ),
-        })?;
+        .map_err(queue_api_error)?;
     let (model, _, _, caps) = bind_or_swap_model(app, &target, wait_timeout).await?;
-    check_streaming(&caps)?;
+    let translating = config.target_language.is_some();
+    let buffered = translating && !caps.loaded.supports_streaming;
+    if !buffered {
+        check_streaming(&caps)?;
+    }
     let request = ParsedRequest {
         language: config.language.clone(),
         prompt: config.prompt.clone(),
         temperature: None,
         response_format: None,
         timestamp_granularities: Vec::new(),
+        target_language: config.target_language.clone(),
     };
-    let run = plan(&request, &caps, Endpoint::Transcriptions, None)?.to_run_options();
+    let endpoint = if translating {
+        Endpoint::Translations
+    } else {
+        Endpoint::Transcriptions
+    };
+    let run = plan(&request, &caps, endpoint, None)?.to_run_options();
     let decoder = PcmStream::new(config.sample_rate)?;
-
-    let (command_tx, command_rx) = mpsc::channel();
     let (update_tx, update_rx) = unbounded_channel();
+    let mut item = Item {
+        id: format!("item_{}", Uuid::new_v4().simple()),
+        commands: None,
+        updates: update_rx,
+        decoder,
+        committed: String::new(),
+        committed_by_client: false,
+        buffered: None,
+    };
+
+    if buffered {
+        // Nothing runs until the commit, so the batch queue moves on now.
+        drop(batch_permit);
+        item.buffered = Some(BufferedTurn {
+            app: app.clone(),
+            model: target,
+            run,
+            pcm: Vec::new(),
+            stream_slot,
+            updates: update_tx,
+        });
+        return Ok(item);
+    }
+    let (command_tx, command_rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("realtime-stream".to_owned())
         .stack_size(16 * 1024 * 1024)
         .spawn(move || stream_worker(model, run, batch_permit, stream_slot, command_rx, update_tx))
         .map_err(internal)?;
-    Ok(Item {
-        id: format!("item_{}", Uuid::new_v4().simple()),
-        commands: Some(command_tx),
-        updates: update_rx,
-        decoder,
-        committed: String::new(),
-        committed_by_client: false,
-    })
+    item.commands = Some(command_tx);
+    Ok(item)
 }
 
 /// The next update from the in-flight item (`None`: its worker vanished);
@@ -973,6 +1100,196 @@ mod tests {
         assert_eq!(no_model["error"]["code"], "server_not_ready");
         let cleared = call(&mut client, json!({"type": "input_audio_buffer.clear"})).await;
         assert_eq!(cleared["type"], "input_audio_buffer.cleared");
+
+        drop(client);
+        server.finish().await;
+    }
+
+    #[test]
+    fn session_update_reads_the_target_language_in_both_shapes() {
+        let mut config = SessionConfig::new(None);
+        assert_eq!(config.target_language, None);
+        config
+            .update(&json!({"input_audio_transcription": {"target_language": "de"}}))
+            .unwrap();
+        assert_eq!(config.target_language.as_deref(), Some("de"));
+        assert_eq!(
+            config.to_json()["input_audio_transcription"]["target_language"],
+            "de"
+        );
+
+        // OpenAI's GA name for the output language.
+        config
+            .update(&json!({"type": "transcription", "audio": {"output": {"language": "fr"}}}))
+            .unwrap();
+        assert_eq!(config.target_language.as_deref(), Some("fr"));
+
+        // An update that does not mention it keeps it; an empty value clears it.
+        config
+            .update(&json!({"input_audio_sample_rate": 16000}))
+            .unwrap();
+        assert_eq!(config.target_language.as_deref(), Some("fr"));
+        config
+            .update(&json!({"input_audio_transcription": {"target_language": ""}}))
+            .unwrap();
+        assert_eq!(config.target_language, None);
+        assert!(config.to_json()["input_audio_transcription"]["target_language"].is_null());
+    }
+
+    #[test]
+    fn translation_session_errors_are_reported_as_error_events() {
+        let caps = |supports_translate, targets: &[&str]| {
+            EffectiveCaps::new(LoadedCaps {
+                arch: "whisper".to_owned(),
+                languages: vec!["en".to_owned(), "es".to_owned()],
+                translate_target_languages: targets.iter().map(|t| t.to_string()).collect(),
+                supports_translate,
+                supports_language_detect: false,
+                max_timestamp_kind: TimestampGranularity::None,
+                ..Default::default()
+            })
+        };
+        let plan_error = |caps: &EffectiveCaps, target: &str| {
+            let request = ParsedRequest {
+                language: Some("es".to_owned()),
+                target_language: Some(target.to_owned()),
+                ..Default::default()
+            };
+            error_event(&plan(&request, caps, Endpoint::Translations, None).unwrap_err())
+        };
+        let none = plan_error(&caps(false, &[]), "en");
+        assert_eq!(none["type"], "error");
+        assert_eq!(none["error"]["code"], "unsupported_capability");
+        let wrong_target = plan_error(&caps(true, &["en", "de"]), "fr");
+        assert_eq!(wrong_target["error"]["code"], "unsupported_target_language");
+        assert_eq!(wrong_target["error"]["type"], "invalid_request_error");
+    }
+
+    fn base64_pcm16(wav_path: &str) -> Vec<String> {
+        let mut reader = hound::WavReader::open(wav_path).unwrap();
+        assert_eq!(reader.spec().sample_rate, 16_000);
+        let bytes: Vec<u8> = reader
+            .samples::<i16>()
+            .flat_map(|s| s.unwrap().to_le_bytes())
+            .collect();
+        bytes
+            .chunks(32_000)
+            .map(|chunk| base64::engine::general_purpose::STANDARD.encode(chunk))
+            .collect()
+    }
+
+    /// Runs a translation turn end to end over a real socket: a model that
+    /// cannot stream, the audio buffered, one batch run on commit, then one
+    /// full-turn delta and `completed`. Needs a local non-streaming model that
+    /// translates (any whisper gguf; it is only read) and a 16 kHz mono wav,
+    /// so it is opt-in:
+    ///
+    /// ```text
+    /// STT_TEST_TRANSLATE_MODEL=<whisper gguf>
+    /// STT_TEST_TRANSLATE_WAV=<16 kHz mono 16-bit wav>
+    /// cargo test realtime_translation_turn -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "needs STT_TEST_TRANSLATE_MODEL and STT_TEST_TRANSLATE_WAV"]
+    async fn realtime_translation_turn_runs_one_batch_translate_on_commit() {
+        let model_path = std::env::var("STT_TEST_TRANSLATE_MODEL").expect("model path");
+        let wav_path = std::env::var("STT_TEST_TRANSLATE_WAV").expect("wav path");
+        let (model, diagnostic) =
+            crate::engine::load_engine(std::path::Path::new(&model_path), "cpu")
+                .expect("model loads");
+        let capabilities = model.capabilities();
+        assert!(
+            !capabilities.supports_streaming,
+            "use a non-streaming model"
+        );
+        assert!(capabilities.supports_translate, "use a translating model");
+
+        let server = TestServer::start().await;
+        let user_token = server.app.user_token.clone();
+        server
+            .app
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO installed(id,path,sha256,source) VALUES('turn-model','unused','x','catalog_download')",
+                [],
+            )
+            .unwrap();
+        *server.app.loaded.lock().unwrap() = Some(crate::engine::LoadedModel::new(
+            "turn-model".to_owned(),
+            model,
+            diagnostic,
+        ));
+
+        let (mut client, _) = tokio_tungstenite::connect_async(
+            server.request("intent=transcription&model=turn-model", Some(&user_token)),
+        )
+        .await
+        .unwrap();
+        next_event(&mut client).await;
+        let updated = call(
+            &mut client,
+            json!({"type": "transcription_session.update", "session": {
+                "input_audio_sample_rate": 16000,
+                "input_audio_transcription": {"target_language": "en"},
+            }}),
+        )
+        .await;
+        assert_eq!(
+            updated["session"]["input_audio_transcription"]["target_language"],
+            "en"
+        );
+
+        for chunk in base64_pcm16(&wav_path) {
+            client
+                .send(ClientMessage::Text(
+                    json!({"type": "input_audio_buffer.append", "audio": chunk})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+        }
+        client
+            .send(ClientMessage::Text(
+                json!({"type": "input_audio_buffer.commit"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+        let mut kinds = Vec::new();
+        let mut delta = None;
+        let mut transcript = None;
+        while transcript.is_none() {
+            let event = next_event(&mut client).await;
+            let kind = event["type"].as_str().unwrap().to_owned();
+            assert_ne!(kind, "error", "{event}");
+            match kind.as_str() {
+                "conversation.item.input_audio_transcription.delta" => {
+                    delta = event["delta"].as_str().map(str::to_owned);
+                }
+                "conversation.item.input_audio_transcription.completed" => {
+                    transcript = event["transcript"].as_str().map(str::to_owned);
+                }
+                _ => {}
+            }
+            kinds.push(kind);
+        }
+        println!(
+            "events: {kinds:?}
+transcript: {transcript:?}"
+        );
+        let transcript = transcript.unwrap();
+        assert!(!transcript.is_empty());
+        assert_eq!(
+            delta.as_deref(),
+            Some(transcript.as_str()),
+            "one full-turn delta"
+        );
+        assert_eq!(kinds[0], "input_audio_buffer.committed");
 
         drop(client);
         server.finish().await;

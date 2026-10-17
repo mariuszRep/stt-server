@@ -297,13 +297,23 @@ impl EffectiveCaps {
         self.loaded.arch != "granite" && !self.loaded.languages.is_empty()
     }
 
+    /// Whether the model translates at all. An empty target list means the
+    /// engine does not advertise its targets, not that there are none: such a
+    /// model is assumed to translate into English only (see
+    /// [`Self::offers_translation_target`]).
     pub fn supports_translation(&self) -> bool {
         self.loaded.supports_translate
-            && self
-                .loaded
-                .translate_target_languages
-                .iter()
-                .any(|l| l == "en")
+    }
+
+    /// Whether the model can translate into `target`: any of its advertised
+    /// target languages, or English when it advertises none.
+    pub fn offers_translation_target(&self, target: &str) -> bool {
+        let targets = &self.loaded.translate_target_languages;
+        if targets.is_empty() {
+            target == "en"
+        } else {
+            targets.iter().any(|offered| offered == target)
+        }
     }
 
     pub fn max_timestamp_granularity(&self) -> TimestampGranularity {
@@ -421,7 +431,15 @@ impl EffectiveCaps {
             evidence: "loaded_model",
             mechanism: Some("task_translate"),
             scope: None,
-            extra: json!({ "target_languages": self.loaded.translate_target_languages }),
+            // An empty list on a translating model means "not advertised":
+            // reported as null (unknown), distinct from `[]` (none).
+            extra: json!({
+                "target_languages": if translation_ok && self.loaded.translate_target_languages.is_empty() {
+                    Value::Null
+                } else {
+                    json!(self.loaded.translate_target_languages)
+                }
+            }),
         };
         // Trust `self.loaded.max_timestamp_kind` directly: it is the
         // engine's own accurate, per-architecture (and, for granite,
@@ -635,14 +653,29 @@ mod tests {
     }
 
     #[test]
-    fn translation_requires_en_target() {
-        let mut loaded = loaded_whisper();
-        loaded.translate_target_languages = vec!["fr".to_string()];
-        let caps = EffectiveCaps::new(loaded);
-        assert!(!caps.supports_translation());
-
+    fn translation_targets_are_the_models_own_list_or_english_when_unadvertised() {
         let caps = EffectiveCaps::new(loaded_whisper());
         assert!(caps.supports_translation());
+        assert!(caps.offers_translation_target("en"));
+        assert!(!caps.offers_translation_target("fr"));
+
+        let mut loaded = loaded_whisper();
+        loaded.translate_target_languages = vec!["en".to_string(), "de".to_string()];
+        let caps = EffectiveCaps::new(loaded);
+        assert!(caps.offers_translation_target("de"));
+        assert!(!caps.offers_translation_target("fr"));
+
+        // No advertised list: still translates, to English only.
+        let mut loaded = loaded_whisper();
+        loaded.translate_target_languages = vec![];
+        let caps = EffectiveCaps::new(loaded);
+        assert!(caps.supports_translation());
+        assert!(caps.offers_translation_target("en"));
+        assert!(!caps.offers_translation_target("de"));
+        assert_eq!(
+            caps.to_json()["translation"]["target_languages"],
+            Value::Null
+        );
     }
 
     #[test]

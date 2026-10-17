@@ -28,7 +28,7 @@ OpenAI Realtime-style transcription stream with committed/tentative text, docume
 both sharing one pipeline (parse → decode → plan → queue → run → format) and a 40 MiB body limit.
 Audio is converted to 16 kHz mono before inference. Accepted multipart fields are `file`, `model`,
 `language`, `prompt`, `temperature`, `response_format` (`json`/`text`/`verbose_json`), and repeatable
-`timestamp_granularities`/`timestamp_granularities[]`; `prompt` is passed to the engine verbatim
+`timestamp_granularities`/`timestamp_granularities[]` (plus `target_language` on translations only, default `en`, any language the model offers; also available live, section 5a); `prompt` is passed to the engine verbatim
 (no server-side composition or trimming) and is only accepted on whisper-family models. `model` is
 optional: an absent field is treated as `model=default` (whichever model is currently selected)
 rather than a 400, since OpenAI-shaped clients typically send it but this server's own SDK client

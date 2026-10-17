@@ -159,15 +159,15 @@ pub fn capability_matrix(model: &CatalogModel) -> Value {
             })
         }
     };
-    // The catalog says whether a model translates, not into what; every
-    // translating model in it is whisper-style (English target only).
+    // The catalog says whether a model translates, not into what: the targets
+    // are unknown (null) until the model is loaded and reports its own.
     let mut translation = claim(
         model.capabilities.translate,
         json!(model.capabilities.translate),
         false,
     );
     translation["target_languages"] = if model.capabilities.translate {
-        json!(["en"])
+        Value::Null
     } else {
         json!([])
     };
@@ -394,7 +394,7 @@ mod tests {
         let whisper = capability_matrix(by_slug("whisper-small"));
         assert_eq!(whisper["translation"]["status"], "unknown");
         assert_eq!(whisper["translation"]["evidence"], "catalog_claim");
-        assert_eq!(whisper["translation"]["target_languages"], json!(["en"]));
+        assert_eq!(whisper["translation"]["target_languages"], Value::Null);
         for slug in ["parakeet-unified-en-0.6b", "parakeet-tdt-0.6b-v3"] {
             let parakeet = capability_matrix(by_slug(slug));
             assert_eq!(parakeet["translation"]["status"], "unsupported", "{slug}");
