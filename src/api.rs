@@ -860,19 +860,7 @@ pub async fn deselect_model(
 ) -> ApiResult<Json<Value>> {
     authorized(&headers, &app)?;
     let _selection = app.selection.lock().await;
-    let _inference = tokio::time::timeout(
-        DESELECT_WAIT_TIMEOUT,
-        app.inference.semaphore().acquire_owned(),
-    )
-    .await
-    .map_err(|_| {
-        ApiError::new(
-            StatusCode::CONFLICT,
-            "model_in_use",
-            "Inference did not finish before the unload timeout",
-        )
-    })?
-    .map_err(internal)?;
+    let _inference = wait_for_idle_inference(&app).await?;
     {
         let db = app.db.lock().map_err(internal)?;
         db.execute("DELETE FROM settings WHERE key='selected_model'", [])
@@ -880,6 +868,37 @@ pub async fn deselect_model(
     }
     *app.loaded.lock().map_err(internal)? = None;
     Ok(Json(json!({"model":null,"loaded":false})))
+}
+
+/// `POST /models/manage/unload`: free the loaded model's memory but keep the
+/// saved default, unlike `DELETE /models/manage/default`. The next request
+/// that needs the model loads it again on demand (section 4.3 of the client
+/// contract), so a client that wants the memory back for a while can unload
+/// without forgetting which model is the default.
+pub async fn unload_model(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    authorized(&headers, &app)?;
+    let _selection = app.selection.lock().await;
+    let _inference = wait_for_idle_inference(&app).await?;
+    *app.loaded.lock().map_err(internal)? = None;
+    Ok(Json(json!({"unloaded":true,"loaded":false})))
+}
+
+/// Take the inference permit so nothing is running while the loaded model is
+/// dropped, giving up with `model_in_use` after `DESELECT_WAIT_TIMEOUT`.
+async fn wait_for_idle_inference(app: &App) -> ApiResult<crate::queue::InferencePermit> {
+    tokio::time::timeout(DESELECT_WAIT_TIMEOUT, app.inference.acquire_unbounded())
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "model_in_use",
+                "Inference did not finish before the unload timeout",
+            )
+        })?
+        .map_err(queue_api_error)
 }
 
 pub async fn select_model(
@@ -1046,6 +1065,7 @@ struct TranscriptionFields {
     response_format: Option<String>,
     timestamp_granularities: Vec<String>,
     target_language: Option<String>,
+    priority: crate::queue::Priority,
 }
 
 fn invalid_multipart(error: impl std::fmt::Display) -> ApiError {
@@ -1067,6 +1087,7 @@ fn duplicate_field(name: &str) -> ApiError {
 /// `timestamp_granularities` / `timestamp_granularities[]` are the one
 /// repeatable field. `target_language` (an extension to OpenAI) is accepted
 /// on translations only; on transcriptions it is an unknown field.
+/// `priority` (another extension) is accepted on both.
 async fn parse_transcription_multipart(
     mut multipart: Multipart,
     endpoint: Endpoint,
@@ -1079,6 +1100,7 @@ async fn parse_transcription_multipart(
     let mut response_format: Option<String> = None;
     let mut timestamp_granularities: Vec<String> = Vec::new();
     let mut target_language: Option<String> = None;
+    let mut priority_raw: Option<String> = None;
 
     while let Some(field) = multipart.next_field().await.map_err(invalid_multipart)? {
         let name = field.name().unwrap_or("").to_owned();
@@ -1128,6 +1150,12 @@ async fn parse_transcription_multipart(
                 }
                 target_language = Some(field.text().await.map_err(invalid_multipart)?);
             }
+            "priority" => {
+                if priority_raw.is_some() {
+                    return Err(duplicate_field("priority"));
+                }
+                priority_raw = Some(field.text().await.map_err(invalid_multipart)?);
+            }
             other => {
                 return Err(ApiError::new(
                     StatusCode::UNPROCESSABLE_ENTITY,
@@ -1156,6 +1184,16 @@ async fn parse_transcription_multipart(
         })?),
         None => None,
     };
+    let priority = match priority_raw.as_deref() {
+        None => crate::queue::Priority::default(),
+        Some(raw) => crate::queue::Priority::parse(raw).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_priority",
+                "priority must be \"normal\" or \"interactive\"",
+            )
+        })?,
+    };
 
     Ok(TranscriptionFields {
         file,
@@ -1166,6 +1204,7 @@ async fn parse_transcription_multipart(
         response_format,
         timestamp_granularities,
         target_language,
+        priority,
     })
 }
 
@@ -1257,6 +1296,12 @@ pub(crate) fn queue_api_error(error: crate::queue::QueueError) -> ApiError {
             "queue_timeout",
             "Timed out waiting for a turn in the inference queue",
         ),
+        crate::queue::QueueError::StreamActive => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "engine_busy",
+            "A live stream is using the requested model",
+        )
+        .with_details(json!({"reason": "stream_active"})),
     }
 }
 
@@ -1392,7 +1437,12 @@ async fn transcribe_or_translate(
     let wait_timeout = limits.queue_wait_timeout_ms.map(Duration::from_millis);
     let (permit, queue_wait_ms) = app
         .inference
-        .acquire(limits.queue_max_waiting, wait_timeout)
+        .acquire_for_model(
+            &target,
+            fields.priority,
+            limits.queue_max_waiting,
+            wait_timeout,
+        )
         .await
         .map_err(queue_api_error)?;
 
@@ -1608,6 +1658,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/local/shutdown", post(shutdown_endpoint))
         .route("/models/manage", get(local_models))
         .route("/models/manage/refresh", post(refresh_models))
+        .route("/models/manage/unload", post(unload_model))
         .route("/models/manage/recommendations", get(recommendations))
         .route(
             "/models/manage/default",
@@ -3263,6 +3314,79 @@ mod router_tests {
         assert_eq!(body["error"]["code"], "duplicate_field");
     }
 
+    #[test]
+    fn a_stream_that_outlasts_the_wait_is_engine_busy_stream_active() {
+        let error = queue_api_error(crate::queue::QueueError::StreamActive);
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.code, "engine_busy");
+        assert_eq!(error.details, Some(json!({"reason": "stream_active"})));
+    }
+
+    #[tokio::test]
+    async fn both_endpoints_accept_a_priority_and_reach_the_model_check() {
+        for uri in ["/v1/audio/transcriptions", "/v1/audio/translations"] {
+            for priority in ["interactive", "normal"] {
+                let (status, body) = post_audio_fields(uri, &[("priority", priority)]).await;
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri} {priority}");
+                assert_eq!(body["error"]["code"], "server_not_ready");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_priority_is_400() {
+        let (status, body) =
+            post_audio_fields("/v1/audio/transcriptions", &[("priority", "urgent")]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_priority");
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_priority_is_400() {
+        let (status, body) = post_audio_fields(
+            "/v1/audio/transcriptions",
+            &[("priority", "normal"), ("priority", "interactive")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "duplicate_field");
+    }
+
+    /// `POST /models/manage/unload` frees the loaded model but, unlike
+    /// `DELETE /models/manage/default`, keeps the saved default.
+    #[tokio::test]
+    async fn unload_keeps_the_saved_default_but_deselect_clears_it() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        app.db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO settings(key,value) VALUES('selected_model','some-model')",
+                [],
+            )
+            .unwrap();
+
+        let request = build_request("POST", "/models/manage/unload", None, &token);
+        let response = router(app.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body, json!({"unloaded": true, "loaded": false}));
+        assert_eq!(selected_id(&app).unwrap().as_deref(), Some("some-model"));
+
+        let request = build_request("DELETE", "/models/manage/default", None, &token);
+        let response = router(app.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(selected_id(&app).unwrap(), None);
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
     #[tokio::test]
     async fn patch_config_rejects_nonexistent_or_relative_user_models_dir() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
@@ -4003,6 +4127,7 @@ mod router_tests {
             ("PATCH", "/v1/local/config", Some(r#"{}"#)),
             ("POST", "/models/manage/refresh", None),
             ("DELETE", "/models/manage/default", None),
+            ("POST", "/models/manage/unload", None),
             ("POST", "/models/manage/not-a-real-id/default", None),
             ("DELETE", "/models/manage/not-a-real-id", None),
             ("POST", "/models/manage/not-a-real-id/download", None),

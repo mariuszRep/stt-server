@@ -141,7 +141,10 @@ byte-identical to upstream) but is otherwise unused.
 ## Inference queue and model switching
 
 Exactly one transcription runs at a time, matching the single resident model. A request that
-arrives while another is running joins a FIFO queue (`src/queue.rs`). By default the queue is
+arrives while another is running joins a FIFO queue (`src/queue.rs`); a request that sends the
+optional `priority=interactive` field is served ahead of waiting normal ones (a dictation turn
+over background work; see `docs/client-contract.md` 4.3). A batch request for the model a live
+stream is using waits for the stream's item to end instead of failing. By default the queue is
 unbounded and a waiter never times out, matching the current shipping server. Three settings make
 these optional and bounded:
 
@@ -188,7 +191,8 @@ off its already-loaded handle while the new model loads on a blocking thread, an
 swap of `app.loaded` is briefly exclusive. A failed load leaves the previous selection in place.
 Note that both models are briefly resident in memory during the swap window; this is accepted as
 a tradeoff for non-blocking switching. `DELETE /models/manage/default` now waits up to 30s for
-a running inference to finish before unloading, returning 409 `model_in_use` only if that timeout
+a running inference to finish before unloading (and clears the saved default; `POST
+/models/manage/unload` unloads only and keeps it), returning 409 `model_in_use` only if that timeout
 elapses. When transcription's readiness check fails (`server_not_ready`), the error includes
 `error.details.operation_id` when an install/import/verify operation is currently queued or
 running.

@@ -21,9 +21,10 @@
 //! - the stream takes the single batch permit only while it begins (model
 //!   bind/swap and `Session::stream`), in FIFO order with batch requests, and
 //!   releases it right after. A batch request for a different model is never
-//!   queued behind a running stream; one for the same model gets
-//!   `503 engine_busy` until the stream finishes (items are short dictation
-//!   utterances).
+//!   queued behind a running stream; one for the same model waits for the
+//!   stream to finish (items are short dictation utterances), bounded by the
+//!   queue wait timeout, then gets `503 engine_busy` (`stream_active`). The
+//!   begin step queues as `interactive`, ahead of waiting batch requests.
 
 use std::sync::mpsc;
 use std::time::Duration;
@@ -49,6 +50,7 @@ use crate::audio::PcmStream;
 use crate::auth::{authorize, AccessLevel};
 use crate::capabilities::EffectiveCaps;
 use crate::errors::{internal, map_engine_error, ApiError};
+use crate::queue::{InferencePermit, Priority, StreamSlot};
 use crate::run_plan::{plan, Endpoint, ParsedRequest};
 
 /// An item that receives no client event for this long is discarded.
@@ -290,7 +292,7 @@ enum Update {
 fn run_stream(
     model: &Model,
     run: &RunOptions,
-    batch_permit: tokio::sync::OwnedSemaphorePermit,
+    batch_permit: InferencePermit,
     commands: &mpsc::Receiver<Cmd>,
     updates: &UnboundedSender<Update>,
 ) -> Result<Option<String>, ApiError> {
@@ -334,8 +336,8 @@ fn run_stream(
 fn stream_worker(
     model: Model,
     run: RunOptions,
-    batch_permit: tokio::sync::OwnedSemaphorePermit,
-    stream_slot: tokio::sync::OwnedSemaphorePermit,
+    batch_permit: InferencePermit,
+    stream_slot: StreamSlot,
     commands: mpsc::Receiver<Cmd>,
     updates: UnboundedSender<Update>,
 ) {
@@ -674,7 +676,7 @@ struct BufferedTurn {
     model: String,
     run: RunOptions,
     pcm: Vec<f32>,
-    stream_slot: tokio::sync::OwnedSemaphorePermit,
+    stream_slot: StreamSlot,
     updates: UnboundedSender<Update>,
 }
 
@@ -725,7 +727,12 @@ async fn translate_pcm(
     let wait_timeout = limits.queue_wait_timeout_ms.map(Duration::from_millis);
     let (permit, _) = app
         .inference
-        .acquire(limits.queue_max_waiting, wait_timeout)
+        .acquire_for_model(
+            model_id,
+            Priority::Normal,
+            limits.queue_max_waiting,
+            wait_timeout,
+        )
         .await
         .map_err(queue_api_error)?;
     let (model, _, _, _) = bind_or_swap_model(app, model_id, wait_timeout).await?;
@@ -752,9 +759,15 @@ async fn start_item(app: &std::sync::Arc<App>, config: &SessionConfig) -> Result
     require_installed_verified(app, &target)?;
     let limits = *app.limits.read().map_err(internal)?;
     let wait_timeout = limits.queue_wait_timeout_ms.map(Duration::from_millis);
+    // A live turn is what a person is waiting on: it goes ahead of queued
+    // batch requests.
     let (batch_permit, _) = app
         .inference
-        .acquire(limits.queue_max_waiting, wait_timeout)
+        .acquire(
+            Priority::Interactive,
+            limits.queue_max_waiting,
+            wait_timeout,
+        )
         .await
         .map_err(queue_api_error)?;
     let (model, _, _, caps) = bind_or_swap_model(app, &target, wait_timeout).await?;
@@ -802,6 +815,10 @@ async fn start_item(app: &std::sync::Arc<App>, config: &SessionConfig) -> Result
         });
         return Ok(item);
     }
+    // Batch requests for this model wait for the stream from here until the
+    // slot is dropped (they are held back by the permit until the stream
+    // has begun, then by this lease).
+    stream_slot.lease_model(&target);
     let (command_tx, command_rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("realtime-stream".to_owned())
@@ -1325,7 +1342,9 @@ transcript: {transcript:?}"
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        let (permit, _) = runtime.block_on(queue.acquire(None, None)).unwrap();
+        let (permit, _) = runtime
+            .block_on(queue.acquire(Priority::Normal, None, None))
+            .unwrap();
         let slot = queue.try_acquire_stream().unwrap();
         assert!(queue.try_acquire_stream().is_none(), "one stream at a time");
         let (command_tx, command_rx) = mpsc::channel();

@@ -164,7 +164,7 @@ pub async fn verify_model(
             return;
         }
         let _selection = task_app.selection.lock().await;
-        let _inference = match task_app.inference.semaphore().acquire_owned().await {
+        let _inference = match task_app.inference.acquire_unbounded().await {
             Ok(permit) => permit,
             Err(_) => return,
         };

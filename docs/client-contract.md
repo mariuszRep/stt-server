@@ -177,7 +177,7 @@ where to drop files should read `GET /v1/local/config`'s
   |---|---|
   | Unauthenticated | `GET /health` |
   | User (admin token also works) | `GET /readiness`, `GET /v1/models`, `GET /models/manage`, `GET /models/manage/default`, `GET /v1/local/system`, `GET /models/manage/recommendations`, `GET /models/manage/operations/{id}`, `POST /v1/audio/transcriptions`, `POST /v1/audio/translations`, `GET /v1/realtime` (WebSocket, section 5a) |
-  | Admin only | `GET`/`PATCH /v1/local/config`, `POST /models/manage/{id}/download`, `POST /models/manage/{id}/verify`, `POST /models/manage/{id}/default` (set default and load), `DELETE /models/manage/default` (unload), `DELETE /models/manage/{id}` (remove), `POST /models/manage/refresh` (drop-in refresh), `POST /models/manage/import`, `POST /models/manage/import-user` (copy another install's models in; see section 1.4), `POST /models/manage/operations/{id}/cancel`, `POST /v1/local/shutdown` |
+  | Admin only | `GET`/`PATCH /v1/local/config`, `POST /models/manage/{id}/download`, `POST /models/manage/{id}/verify`, `POST /models/manage/{id}/default` (set default and load), `DELETE /models/manage/default` (unload and forget the default), `POST /models/manage/unload` (unload, keep the default; section 4), `DELETE /models/manage/{id}` (remove), `POST /models/manage/refresh` (drop-in refresh), `POST /models/manage/import`, `POST /models/manage/import-user` (copy another install's models in; see section 1.4), `POST /models/manage/operations/{id}/cancel`, `POST /v1/local/shutdown` |
 
   The CLI (`stt-server models ...`, `status`, `stop`, `update`, ...)
   reads `auth.token` when it can, falling back to `user.token` only when
@@ -367,8 +367,16 @@ or descriptors.
   `GET /models/manage/default` -> the loaded model's `id` plus its full
   effective-capability matrix (see 4.1), or `{"model": null,
   "effective_capabilities": null}` when nothing is loaded.
-  `DELETE /models/manage/default` unloads it (`{"model": null, "loaded":
-  false}`).
+  `DELETE /models/manage/default` unloads it **and clears the saved default**
+  (`{"model": null, "loaded": false}`).
+- **Unload only (extension):** `POST /models/manage/unload` (admin) frees the
+  loaded model's memory but **keeps the saved default** (`{"unloaded": true,
+  "loaded": false}`). Like `DELETE /models/manage/default` it waits up to 30 s
+  for a running inference to finish (`409 model_in_use` after that). The next
+  request that needs the model loads it again on demand (section 4.3), so a
+  client that needs the memory for something else can free it now and let the
+  next transcription reload it, without losing the user's default. Safe to call
+  when nothing is loaded.
 - **Remove:** `DELETE /models/manage/{id}` -- removes the managed-store
   file (drop-in/`user_folder` models keep their file on disk:
   `{"removed": true, "file_deleted": false}`). For a drop-in model this only
@@ -527,8 +535,8 @@ joins the queue:
 - **Installed but `needs_verification`** -> `409 needs_verification`,
   same as `select`'s existing check.
 
-Requests are served strictly FIFO (per `CONVENTIONS.md`'s single-resident-
-model queue), and **each request keeps the model it resolved to even while
+Requests are served FIFO (per `CONVENTIONS.md`'s single-resident-
+model queue; the optional `priority` field below is the one exception), and **each request keeps the model it resolved to even while
 it waits** -- a later request naming a different model never changes an
 earlier one's outcome. When a request reaches the head of the queue and the
 resident model differs from the one it asked for, the server swaps before
@@ -541,6 +549,26 @@ request fails, with `409 model_load_failed`; the queue continues normally
 for whatever request is next. A three-request sequence naming models A, B, A
 in that order therefore causes two swaps (A->B, B->A), not one -- the second
 A does not get to reuse the first A's load.
+
+**Priority (extension).** A request may send the multipart field
+`priority` (section 5): `interactive` or `normal` (the default). Interactive
+requests wait ahead of every waiting normal request; within a class the order
+is FIFO, and a request already running is never interrupted. It is for a
+caller that has a person waiting on one request (a dictation turn) while other
+callers queue background work on the same server. A server whose clients never
+send `priority` is strictly FIFO, exactly as before. `queue_max_waiting` and
+`queue_wait_timeout_ms` count and bound both classes alike. The live-stream
+endpoint (section 5a) begins its stream as `interactive`.
+
+**Batch requests wait for a live stream on the same model.** While a live
+stream (section 5a) holds a model, the engine refuses any other run on that
+model. A transcription/translation naming that model therefore waits for the
+stream's item to end (items are short dictation utterances), and then joins
+the queue as usual. The wait is bounded by `queue_wait_timeout_ms` together
+with the queue wait (unbounded when that is `null`); when it runs out the
+request gets `503 engine_busy` with `details: {"reason": "stream_active"}`,
+which is safe to retry. A request for any other model is not delayed by the
+stream.
 
 **Timestamp gate (Bug 1, corrected):** an earlier revision of this fix
 distrusted `transcribe_cpp::Model::capabilities().max_timestamp_kind` and
@@ -646,6 +674,7 @@ returned**, only a client starting a new operation call does:
 | `temperature` | no | `0.0..=1.0`; omit unless `temperature` capability is `supported` |
 | `response_format` | no | `json` (default) \| `text` \| `verbose_json` |
 | `timestamp_granularities` (repeatable) | no | `word` \| `segment`; only meaningful with `verbose_json`; omit `word` unless `word_timestamps` capability is `supported` |
+| `priority` | no | **Extension.** `normal` (default) or `interactive`. Interactive requests are served before waiting normal ones, FIFO within each class; see 4.3. Any other value is `400 invalid_priority`. |
 | `target_language` | no | **`/v1/audio/translations` only** (extension, see below). The language to translate into; default `en`. On `/v1/audio/transcriptions` it is an unknown field. |
 
 Any other field name is rejected as `422 unsupported_capability` before any
@@ -826,10 +855,11 @@ none). Without a target the session is a plain transcription session.
 
 At most **one live stream** runs at a time (an `append` that would start a second one gets
 `stream_busy`). A stream takes the single batch permit only while it begins, in FIFO order with batch
-requests, then releases it: batch requests are not queued behind it. The transcribe-cpp library refuses
-overlapping runs on the *same* model while it streams, so a batch request for the streaming model gets
-`503 engine_busy` until the item ends (items are short dictation utterances); a request for another model
-proceeds normally.
+requests (as `interactive`, ahead of waiting normal ones; see 4.3), then releases it: batch requests are not queued
+behind it. The transcribe-cpp library refuses overlapping runs on the *same* model while it streams, so a
+batch request for the streaming model waits until the item ends (items are short dictation utterances) and
+then runs, bounded by `queue_wait_timeout_ms`; when that runs out it gets `503 engine_busy` with
+`details.reason: "stream_active"` (see 4.3). A request for another model proceeds normally.
 
 ### Deviations from OpenAI
 
@@ -863,7 +893,7 @@ source (`src/api.rs`, `src/audio.rs`, `src/auth.rs`, `src/catalog.rs`,
 
 | Status | Codes |
 |---|---|
-| 400 | `missing_file`, `missing_model`, `duplicate_field`, `unexpected_field`, `invalid_multipart`, `invalid_body`, `invalid_audio`, `unsupported_audio`, `audio_too_short`, `invalid_temperature`, `invalid_bind_host`, `invalid_bind_port`, `invalid_network_mode`, `invalid_cors_origins`, `invalid_queue_max_waiting`, `invalid_queue_wait_timeout_ms`, `invalid_inference_timeout_ms`, `invalid_user_models_dir`, `invalid_model`, `invalid_quant`, `invalid_backend` |
+| 400 | `missing_file`, `missing_model`, `duplicate_field`, `unexpected_field`, `invalid_multipart`, `invalid_body`, `invalid_audio`, `unsupported_audio`, `audio_too_short`, `invalid_temperature`, `invalid_priority`, `invalid_bind_host`, `invalid_bind_port`, `invalid_network_mode`, `invalid_cors_origins`, `invalid_queue_max_waiting`, `invalid_queue_wait_timeout_ms`, `invalid_inference_timeout_ms`, `invalid_user_models_dir`, `invalid_model`, `invalid_quant`, `invalid_backend` |
 | 401 | `unauthorized` |
 | 403 | `loopback_only` (`/v1/local/shutdown` from a non-loopback caller), `admin_required` (a valid user token used on an admin-only route -- see section 3), `network_not_private` (a non-loopback caller under `network_mode: "lan"`/`"tailscale"` while the live check doesn't currently allow it -- see 3.1) |
 | 404 | `model_not_found`, `operation_not_found`, `model_not_installed` (verify and remove of a never-installed id; **a transcription/translation naming a model that isn't downloaded or isn't a known id at all -- see 4.3**; `GET /v1/models/{id}` for a non-callable id) |
@@ -872,7 +902,7 @@ source (`src/api.rs`, `src/audio.rs`, `src/auth.rs`, `src/catalog.rs`,
 | 422 | `streaming_unsupported` (socket event only, section 5a), `unsupported_capability`, `unsupported_target_language` (translation into a language the model does not offer; also a socket event, section 5a), `engine_unsupported`, `engine_rejected_option`, `prompt_too_long`, `size_mismatch` (import exceeds catalog size), `hash_mismatch` (import/verify SHA-256 or size mismatch) |
 | 429 | `queue_full`, `stream_busy` (socket event only, section 5a) |
 | 500 | `internal_error`, `inference_failed` (message only; not meant to be pattern-matched) |
-| 503 | `server_not_ready` (no default model configured and nothing loading; includes an `operation_id` in `details` when an install/verify that would fix this is already running), `not_ready`, `model_loading` (a `model=default` request while the startup reload is still in progress and nothing is default yet, *or* a request whose named model is being loaded in the background for longer than `queue_wait_timeout_ms` -- `details` carries `model`/`elapsed_ms` -- see 4.2/4.3), `engine_busy`, `queue_timeout` |
+| 503 | `server_not_ready` (no default model configured and nothing loading; includes an `operation_id` in `details` when an install/verify that would fix this is already running), `not_ready`, `model_loading` (a `model=default` request while the startup reload is still in progress and nothing is default yet, *or* a request whose named model is being loaded in the background for longer than `queue_wait_timeout_ms` -- `details` carries `model`/`elapsed_ms` -- see 4.2/4.3), `engine_busy` (the engine refused an overlapping run; `details.reason: "stream_active"` when a live stream held the requested model for the whole `queue_wait_timeout_ms` -- see 4.3), `queue_timeout` |
 | 504 | `inference_timeout` |
 | 507 | `insufficient_memory` (insufficient storage) |
 
