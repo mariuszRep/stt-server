@@ -2,13 +2,13 @@
 name: live-streaming-endpoint
 title: Live Streaming Transcription, OpenAI Realtime-Style, with Committed/Tentative Text
 description: A WebSocket endpoint that transcribes microphone audio while it is spoken, shaped like OpenAI's Realtime API in transcription mode, and exposes Handy's committed/tentative split as an extension.
-status: in_progress
+status: done
 type: feature
 scope: stt-server
 attempt: 1
 max_attempts: 4
-last_result: implemented and gated with unit and socket tests; not yet verified with a real streaming model
-next_action: run the ignored worker test with a real streaming model (parakeet-unified-en-0.6b or nemotron-*-streaming) and a WAV, record the evidence, then mark done; then the SDK and Stanzo adopt it.
+last_result: success
+next_action: null
 success_criteria:
   - GET /v1/realtime?intent=transcription upgrades to a WebSocket with the same bearer-token auth as the other routes.
   - The events follow OpenAI's transcription mode (session created/update, input_audio_buffer append/commit/clear, transcription delta/completed, error); every deviation is documented in docs/client-contract.md section 5a.
@@ -36,6 +36,11 @@ source: user
 
 ## Open decisions for the owner
 
-- VISION.md still lists "Live streaming transcripts" under Not in scope; this goal was requested by the owner and
-  VISION.md was not edited (it needs an explicit instruction).
+- VISION.md listed live streaming under Not in scope; the owner has since asked for it, and VISION.md now lists it in scope (2026-10-17).
 - Translation in live mode: see the draft goal `live-translation`.
+
+## Verification Log
+- 2026-10-17: owner ran a real model test on a separate server with parakeet-unified (first text 2.4 s warm). The SDK's createStream (stt-sdk 4d3bfdf, fd67224) is used by Stanzo voice and Live mode (fd400e2, 97a2b4d); the owner tested Live dictation and voice: works. The ignored worker test (`src/realtime.rs`) was not recorded as run in this repo; the owner's real-model test is the evidence.
+
+## Final Outcome
+Done 2026-10-17. `GET /v1/realtime?intent=transcription` streams live transcripts (OpenAI Realtime transcription mode, with the committed/tentative partial extension) with a real streaming model, and Stanzo's Live mode consumes it through the SDK's createStream. The owner tested Live dictation and voice.
