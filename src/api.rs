@@ -52,7 +52,7 @@ pub async fn get_config(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiR
         "network_mode": stored_network_mode.map(|mode| mode.as_str()),
         "preferred_backend":backend_preference(&app)?,
         "max_audio_bytes":40 * 1024 * 1024,
-        "streaming":false,
+        "streaming":true,
         "cors_allowed_origins":app.cors_origins,
         "queue_max_waiting": limits.queue_max_waiting,
         "queue_wait_timeout_ms": limits.queue_wait_timeout_ms,
@@ -574,6 +574,17 @@ fn custom_model_view(installed: &crate::store::InstalledFile) -> Value {
     let claims = installed.custom_claims.clone().unwrap_or(Value::Null);
     let languages = installed.custom_languages.clone().unwrap_or_default();
     let multi_language = languages.len() > 1;
+    let mut effective_capabilities = json!({
+        "prompt": {"status": "unknown"},
+        "temperature": {"status": "unknown"},
+        "language_hint": {"status": if multi_language { "unknown" } else { "unsupported" }},
+        "language_detect": {"status": "unknown"},
+        "translation": {"status": "unknown"},
+        "timestamp_granularity": {"status": "unknown"},
+        "streaming": {"status": if claims["streaming"] == true { "unknown" } else { "unsupported" }},
+        "response_formats": {"json": "supported", "text": "unsupported", "verbose_json": "unsupported"},
+    });
+    crate::capabilities::add_unverified_engine_controls(&mut effective_capabilities);
     json!({
         "id": installed.id,
         "name": custom_model_name(installed),
@@ -583,16 +594,7 @@ fn custom_model_view(installed: &crate::store::InstalledFile) -> Value {
         "custom": true,
         "evidence": "gguf_header",
         "model_capabilities": claims,
-        "effective_capabilities": {
-            "prompt": {"status": "unknown"},
-            "temperature": {"status": "unknown"},
-            "language_hint": {"status": if multi_language { "unknown" } else { "unsupported" }},
-            "language_detect": {"status": "unknown"},
-            "translation": {"status": "unknown"},
-            "timestamp_granularity": {"status": "unknown"},
-            "streaming": {"status": "unsupported"},
-            "response_formats": {"json": "supported", "text": "unsupported", "verbose_json": "unsupported"},
-        },
+        "effective_capabilities": effective_capabilities,
         "downloaded": true,
         "installed_quant": installed.quant,
         "installable": false,
@@ -661,7 +663,7 @@ fn callable_capabilities(app: &App, id: &str, catalog_fallback: Option<Value>) -
         return Ok(cached.to_json());
     }
     Ok(catalog_fallback.unwrap_or_else(|| {
-        json!({
+        let mut unknown = json!({
             "prompt": {"status": "unknown"},
             "temperature": {"status": "unknown"},
             "language_hint": {"status": "unknown"},
@@ -670,7 +672,9 @@ fn callable_capabilities(app: &App, id: &str, catalog_fallback: Option<Value>) -
             "timestamp_granularity": {"status": "unknown"},
             "streaming": {"status": "unsupported"},
             "response_formats": {"json": "supported", "text": "unsupported", "verbose_json": "unsupported"},
-        })
+        });
+        crate::capabilities::add_unverified_engine_controls(&mut unknown);
+        unknown
     }))
 }
 
@@ -856,19 +860,7 @@ pub async fn deselect_model(
 ) -> ApiResult<Json<Value>> {
     authorized(&headers, &app)?;
     let _selection = app.selection.lock().await;
-    let _inference = tokio::time::timeout(
-        DESELECT_WAIT_TIMEOUT,
-        app.inference.semaphore().acquire_owned(),
-    )
-    .await
-    .map_err(|_| {
-        ApiError::new(
-            StatusCode::CONFLICT,
-            "model_in_use",
-            "Inference did not finish before the unload timeout",
-        )
-    })?
-    .map_err(internal)?;
+    let _inference = wait_for_idle_inference(&app).await?;
     {
         let db = app.db.lock().map_err(internal)?;
         db.execute("DELETE FROM settings WHERE key='selected_model'", [])
@@ -876,6 +868,37 @@ pub async fn deselect_model(
     }
     *app.loaded.lock().map_err(internal)? = None;
     Ok(Json(json!({"model":null,"loaded":false})))
+}
+
+/// `POST /models/manage/unload`: free the loaded model's memory but keep the
+/// saved default, unlike `DELETE /models/manage/default`. The next request
+/// that needs the model loads it again on demand (section 4.3 of the client
+/// contract), so a client that wants the memory back for a while can unload
+/// without forgetting which model is the default.
+pub async fn unload_model(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    authorized(&headers, &app)?;
+    let _selection = app.selection.lock().await;
+    let _inference = wait_for_idle_inference(&app).await?;
+    *app.loaded.lock().map_err(internal)? = None;
+    Ok(Json(json!({"unloaded":true,"loaded":false})))
+}
+
+/// Take the inference permit so nothing is running while the loaded model is
+/// dropped, giving up with `model_in_use` after `DESELECT_WAIT_TIMEOUT`.
+async fn wait_for_idle_inference(app: &App) -> ApiResult<crate::queue::InferencePermit> {
+    tokio::time::timeout(DESELECT_WAIT_TIMEOUT, app.inference.acquire_unbounded())
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "model_in_use",
+                "Inference did not finish before the unload timeout",
+            )
+        })?
+        .map_err(queue_api_error)
 }
 
 pub async fn select_model(
@@ -1041,6 +1064,8 @@ struct TranscriptionFields {
     temperature: Option<f32>,
     response_format: Option<String>,
     timestamp_granularities: Vec<String>,
+    target_language: Option<String>,
+    priority: crate::queue::Priority,
 }
 
 fn invalid_multipart(error: impl std::fmt::Display) -> ApiError {
@@ -1060,8 +1085,13 @@ fn duplicate_field(name: &str) -> ApiError {
 /// any capability-aware planning happens; a duplicate of a non-repeatable
 /// field is rejected immediately as 400 `duplicate_field`.
 /// `timestamp_granularities` / `timestamp_granularities[]` are the one
-/// repeatable field.
-async fn parse_transcription_multipart(mut multipart: Multipart) -> ApiResult<TranscriptionFields> {
+/// repeatable field. `target_language` (an extension to OpenAI) is accepted
+/// on translations only; on transcriptions it is an unknown field.
+/// `priority` (another extension) is accepted on both.
+async fn parse_transcription_multipart(
+    mut multipart: Multipart,
+    endpoint: Endpoint,
+) -> ApiResult<TranscriptionFields> {
     let mut file: Option<Vec<u8>> = None;
     let mut model: Option<String> = None;
     let mut language: Option<String> = None;
@@ -1069,6 +1099,8 @@ async fn parse_transcription_multipart(mut multipart: Multipart) -> ApiResult<Tr
     let mut temperature_raw: Option<String> = None;
     let mut response_format: Option<String> = None;
     let mut timestamp_granularities: Vec<String> = Vec::new();
+    let mut target_language: Option<String> = None;
+    let mut priority_raw: Option<String> = None;
 
     while let Some(field) = multipart.next_field().await.map_err(invalid_multipart)? {
         let name = field.name().unwrap_or("").to_owned();
@@ -1112,6 +1144,18 @@ async fn parse_transcription_multipart(mut multipart: Multipart) -> ApiResult<Tr
             "timestamp_granularities" | "timestamp_granularities[]" => {
                 timestamp_granularities.push(field.text().await.map_err(invalid_multipart)?);
             }
+            "target_language" if endpoint == Endpoint::Translations => {
+                if target_language.is_some() {
+                    return Err(duplicate_field("target_language"));
+                }
+                target_language = Some(field.text().await.map_err(invalid_multipart)?);
+            }
+            "priority" => {
+                if priority_raw.is_some() {
+                    return Err(duplicate_field("priority"));
+                }
+                priority_raw = Some(field.text().await.map_err(invalid_multipart)?);
+            }
             other => {
                 return Err(ApiError::new(
                     StatusCode::UNPROCESSABLE_ENTITY,
@@ -1140,6 +1184,16 @@ async fn parse_transcription_multipart(mut multipart: Multipart) -> ApiResult<Tr
         })?),
         None => None,
     };
+    let priority = match priority_raw.as_deref() {
+        None => crate::queue::Priority::default(),
+        Some(raw) => crate::queue::Priority::parse(raw).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_priority",
+                "priority must be \"normal\" or \"interactive\"",
+            )
+        })?,
+    };
 
     Ok(TranscriptionFields {
         file,
@@ -1149,6 +1203,8 @@ async fn parse_transcription_multipart(mut multipart: Multipart) -> ApiResult<Tr
         temperature,
         response_format,
         timestamp_granularities,
+        target_language,
+        priority,
     })
 }
 
@@ -1171,7 +1227,10 @@ fn formatted_into_response(formatted: Formatted) -> Response {
 /// goal): 404 `model_not_installed` for an unknown or not-downloaded id, 409
 /// `needs_verification` for one that is downloaded but not yet verified.
 /// Never triggers a download or any other side effect.
-fn require_installed_verified(app: &App, id: &str) -> ApiResult<crate::store::InstalledFile> {
+pub(crate) fn require_installed_verified(
+    app: &App,
+    id: &str,
+) -> ApiResult<crate::store::InstalledFile> {
     match installed_file(app, id)? {
         Some(file) if !file.needs_verification => Ok(file),
         Some(_) => Err(ApiError::new(
@@ -1196,7 +1255,7 @@ fn require_installed_verified(app: &App, id: &str) -> ApiResult<crate::store::In
 /// (503 `server_not_ready`) -- this is about the *startup* reload, not a
 /// per-request swap, so it is checked once, up front, without touching the
 /// queue.
-fn resolve_requested_model(app: &App, requested: &str) -> ApiResult<String> {
+pub(crate) fn resolve_requested_model(app: &App, requested: &str) -> ApiResult<String> {
     if requested != "default" {
         return Ok(requested.to_owned());
     }
@@ -1224,6 +1283,28 @@ fn resolve_requested_model(app: &App, requested: &str) -> ApiResult<String> {
     Err(error)
 }
 
+/// The API error for a caller that could not get a turn in the inference queue.
+pub(crate) fn queue_api_error(error: crate::queue::QueueError) -> ApiError {
+    match error {
+        crate::queue::QueueError::Full => ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "queue_full",
+            "Too many transcriptions are already waiting",
+        ),
+        crate::queue::QueueError::Timeout => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "queue_timeout",
+            "Timed out waiting for a turn in the inference queue",
+        ),
+        crate::queue::QueueError::StreamActive => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "engine_busy",
+            "A live stream is using the requested model",
+        )
+        .with_details(json!({"reason": "stream_active"})),
+    }
+}
+
 /// How often `bind_or_swap_model` polls while waiting out a background load
 /// for the same model it needs (see the loop's comment below).
 const MODEL_SWAP_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -1243,7 +1324,7 @@ const MODEL_SWAP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// honours) -- only once that is exceeded does this give up with 503
 /// `model_loading`. A load this function starts itself is a plain blocking
 /// call with no such wait: it either finishes or fails outright.
-async fn bind_or_swap_model(
+pub(crate) async fn bind_or_swap_model(
     app: &App,
     target: &str,
     wait_timeout: Option<Duration>,
@@ -1335,7 +1416,7 @@ async fn transcribe_or_translate(
     endpoint: Endpoint,
 ) -> ApiResult<Response> {
     authorize(&headers, &app, AccessLevel::User)?;
-    let fields = parse_transcription_multipart(multipart).await?;
+    let fields = parse_transcription_multipart(multipart, endpoint).await?;
 
     // Decode/validate happens before joining the queue; only the actual
     // inference run below waits for a turn.
@@ -1356,20 +1437,14 @@ async fn transcribe_or_translate(
     let wait_timeout = limits.queue_wait_timeout_ms.map(Duration::from_millis);
     let (permit, queue_wait_ms) = app
         .inference
-        .acquire(limits.queue_max_waiting, wait_timeout)
+        .acquire_for_model(
+            &target,
+            fields.priority,
+            limits.queue_max_waiting,
+            wait_timeout,
+        )
         .await
-        .map_err(|error| match error {
-            crate::queue::QueueError::Full => ApiError::new(
-                StatusCode::TOO_MANY_REQUESTS,
-                "queue_full",
-                "Too many transcriptions are already waiting",
-            ),
-            crate::queue::QueueError::Timeout => ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "queue_timeout",
-                "Timed out waiting for a turn in the inference queue",
-            ),
-        })?;
+        .map_err(queue_api_error)?;
 
     // Now that this request holds the sole inference permit, make sure the
     // model it asked for is the one loaded -- swapping if needed. This is
@@ -1383,6 +1458,7 @@ async fn transcribe_or_translate(
         temperature: fields.temperature,
         response_format: fields.response_format,
         timestamp_granularities: fields.timestamp_granularities,
+        target_language: fields.target_language,
     };
     let tokenizer_model = model.clone();
     let tokenize = move |text: &str| -> Option<usize> {
@@ -1503,6 +1579,7 @@ async fn transcribe_or_translate(
         applied_language: plan.applied_language.clone(),
         language_evidence,
         timestamps_unavailable,
+        target_language: plan.target_language.clone(),
     };
 
     let formatted = format_response(&transcript, &plan, samples, &extra);
@@ -1523,6 +1600,83 @@ pub async fn translations(
     multipart: Multipart,
 ) -> ApiResult<Response> {
     transcribe_or_translate(app, headers, multipart, Endpoint::Translations).await
+}
+
+fn invalid_vad_request(message: impl Into<String>) -> ApiError {
+    ApiError::new(
+        StatusCode::BAD_REQUEST,
+        "invalid_request_error",
+        message.into(),
+    )
+}
+
+/// One optional numeric `/v1/audio/vad` field, `None` when it was not sent.
+fn vad_option<T: std::str::FromStr>(
+    options: &std::collections::HashMap<String, String>,
+    name: &str,
+) -> ApiResult<Option<T>> {
+    options
+        .get(name)
+        .map(|raw| {
+            raw.trim()
+                .parse()
+                .map_err(|_| invalid_vad_request(format!("{name} must be a number")))
+        })
+        .transpose()
+}
+
+/// `POST /v1/audio/vad`: speech segments of a finished recording. A local extension (OpenAI has
+/// no equivalent) that needs no loaded model, so it neither uses the inference queue nor waits
+/// for it; its own two-slot semaphore keeps a burst of requests from taking every core.
+pub async fn audio_vad(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> ApiResult<Json<Value>> {
+    authorize(&headers, &app, AccessLevel::User)?;
+    let mut file: Option<Vec<u8>> = None;
+    let mut options = std::collections::HashMap::new();
+    while let Some(field) = multipart.next_field().await.map_err(invalid_multipart)? {
+        let name = field.name().unwrap_or("").to_owned();
+        match name.as_str() {
+            "file" => {
+                if file.is_some() {
+                    return Err(duplicate_field("file"));
+                }
+                file = Some(field.bytes().await.map_err(invalid_multipart)?.to_vec());
+            }
+            "threshold" | "min_speech_ms" | "min_silence_ms" | "speech_pad_ms" => {
+                let text = field.text().await.map_err(invalid_multipart)?;
+                if options.insert(name.clone(), text).is_some() {
+                    return Err(duplicate_field(&name));
+                }
+            }
+            other => {
+                return Err(invalid_vad_request(format!(
+                    "Field {other} is not supported"
+                )))
+            }
+        }
+    }
+    let file = file.ok_or_else(|| {
+        ApiError::new(StatusCode::BAD_REQUEST, "missing_file", "file is required")
+    })?;
+    let defaults = crate::vad::Params::default();
+    let params = crate::vad::Params {
+        threshold: vad_option(&options, "threshold")?.unwrap_or(defaults.threshold),
+        min_speech_ms: vad_option(&options, "min_speech_ms")?.unwrap_or(defaults.min_speech_ms),
+        min_silence_ms: vad_option(&options, "min_silence_ms")?.unwrap_or(defaults.min_silence_ms),
+        speech_pad_ms: vad_option(&options, "speech_pad_ms")?.unwrap_or(defaults.speech_pad_ms),
+    };
+    params.validate().map_err(invalid_vad_request)?;
+
+    let _slot = app.vad_slots.acquire().await.map_err(internal)?;
+    let report = tokio::task::spawn_blocking(move || {
+        decode_wav(&file).map(|samples| crate::vad::report(&samples, &params))
+    })
+    .await
+    .map_err(internal)??;
+    Ok(Json(report))
 }
 
 /// `POST /models/manage/refresh`: a durable operation (kind `refresh`)
@@ -1575,11 +1729,17 @@ pub fn router(app: Arc<App>) -> Router {
             "/v1/audio/translations",
             post(translations).layer(DefaultBodyLimit::max(40 * 1024 * 1024)),
         )
+        .route(
+            "/v1/audio/vad",
+            post(audio_vad).layer(DefaultBodyLimit::max(40 * 1024 * 1024)),
+        )
+        .route("/v1/realtime", get(crate::realtime::realtime))
         .route("/v1/local/system", get(system_info))
         .route("/v1/local/config", get(get_config).patch(patch_config))
         .route("/v1/local/shutdown", post(shutdown_endpoint))
         .route("/models/manage", get(local_models))
         .route("/models/manage/refresh", post(refresh_models))
+        .route("/models/manage/unload", post(unload_model))
         .route("/models/manage/recommendations", get(recommendations))
         .route(
             "/models/manage/default",
@@ -2762,6 +2922,8 @@ mod router_tests {
             whisper_ext_accepted: None,
             prompt_max_tokens: None,
             timestamp_granularity_rejected: false,
+            supports_streaming: false,
+            ..Default::default()
         });
         app.live_caps
             .lock()
@@ -3163,6 +3325,257 @@ mod router_tests {
             .unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["error"]["code"], "duplicate_field");
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    /// POST the sample WAV plus `fields` to `uri` on a fresh server (no model
+    /// loaded); returns the status and the JSON error body.
+    async fn post_audio_fields(uri: &str, fields: &[(&str, &str)]) -> (StatusCode, Value) {
+        post_wav_fields(uri, &sample_wav_bytes(), fields).await
+    }
+
+    /// Like [`post_audio_fields`] with a caller-chosen WAV.
+    async fn post_wav_fields(
+        uri: &str,
+        wav: &[u8],
+        fields: &[(&str, &str)],
+    ) -> (StatusCode, Value) {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        let router = router(app.clone());
+        let boundary = "X-BOUNDARY";
+        let body = multipart_body(boundary, fields, wav);
+        let request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+        (status, body)
+    }
+
+    const SPEECH_WAV: &[u8] = include_bytes!("../tests/fixtures/speech-16k.wav");
+
+    #[tokio::test]
+    async fn vad_reports_speech_segments_for_the_speech_fixture() {
+        let (status, body) = post_wav_fields("/v1/audio/vad", SPEECH_WAV, &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!((body["duration"].as_f64().unwrap() - 6.16).abs() < 0.01);
+        assert!(body["speech_ratio"].as_f64().unwrap() > 0.5);
+        let segments = body["segments"].as_array().unwrap();
+        assert!(!segments.is_empty());
+        let first = &segments[0];
+        assert!(first["start"].as_f64().unwrap() < first["end"].as_f64().unwrap());
+        assert!(body["speech_seconds"].as_f64().unwrap() <= body["duration"].as_f64().unwrap());
+        let (status, strict) =
+            post_wav_fields("/v1/audio/vad", SPEECH_WAV, &[("threshold", "0.95")]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            strict["speech_seconds"].as_f64().unwrap() <= body["speech_seconds"].as_f64().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn vad_reports_no_segments_for_silence() {
+        let (status, body) = post_audio_fields("/v1/audio/vad", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["segments"], json!([]));
+        assert_eq!(body["speech_seconds"], 0.0);
+        assert_eq!(body["speech_ratio"], 0.0);
+        assert_eq!(body["duration"], 0.2);
+    }
+
+    #[tokio::test]
+    async fn vad_rejects_bad_parameters_with_invalid_request_error() {
+        for fields in [
+            ("threshold", "0.01"),
+            ("threshold", "0.99"),
+            ("threshold", "loud"),
+            ("min_speech_ms", "-5"),
+            ("speech_pad_ms", "99999999"),
+            ("unknown", "1"),
+        ] {
+            let (status, body) = post_audio_fields("/v1/audio/vad", &[fields]).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{fields:?}");
+            assert_eq!(body["error"]["code"], "invalid_request_error", "{fields:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn vad_from_the_lan_without_a_token_is_unauthorized() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
+        let app = crate::app::open_app_at_full(
+            path.clone(),
+            crate::app::RuntimeLimits::default(),
+            crate::app::BindOverrides::default(),
+            Some(crate::network::NetworkMode::Lan),
+        )
+        .unwrap();
+        *app.network_state.write().unwrap() = crate::network::NetworkReport::lan(Vec::new());
+        let router = gated_router(app.clone());
+        let boundary = "X-BOUNDARY";
+        let request = with_peer(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/vad")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(multipart_body(
+                    boundary,
+                    &[],
+                    &sample_wav_bytes(),
+                )))
+                .unwrap(),
+            lan_peer(),
+        );
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn system_info_reports_the_vad_engine() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let request = build_request("GET", "/v1/local/system", None, &app.user_token);
+        let response = router(app.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["vad"],
+            json!({"engine": "silero-v5", "sample_rate": 16000})
+        );
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn transcriptions_reject_target_language_as_an_unknown_field() {
+        let (status, body) = post_audio_fields(
+            "/v1/audio/transcriptions",
+            &[("model", "default"), ("target_language", "de")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"]["code"], "unsupported_capability");
+    }
+
+    #[tokio::test]
+    async fn translations_accept_target_language_and_reach_the_model_check() {
+        // Field shape passes; with no model selected the request then stops at
+        // the model check, which proves the field was not rejected.
+        let (status, body) = post_audio_fields(
+            "/v1/audio/translations",
+            &[("model", "default"), ("target_language", "de")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["code"], "server_not_ready");
+    }
+
+    #[tokio::test]
+    async fn translations_duplicate_target_language_is_400() {
+        let (status, body) = post_audio_fields(
+            "/v1/audio/translations",
+            &[("target_language", "de"), ("target_language", "fr")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "duplicate_field");
+    }
+
+    #[test]
+    fn a_stream_that_outlasts_the_wait_is_engine_busy_stream_active() {
+        let error = queue_api_error(crate::queue::QueueError::StreamActive);
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.code, "engine_busy");
+        assert_eq!(error.details, Some(json!({"reason": "stream_active"})));
+    }
+
+    #[tokio::test]
+    async fn both_endpoints_accept_a_priority_and_reach_the_model_check() {
+        for uri in ["/v1/audio/transcriptions", "/v1/audio/translations"] {
+            for priority in ["interactive", "normal"] {
+                let (status, body) = post_audio_fields(uri, &[("priority", priority)]).await;
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri} {priority}");
+                assert_eq!(body["error"]["code"], "server_not_ready");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_priority_is_400() {
+        let (status, body) =
+            post_audio_fields("/v1/audio/transcriptions", &[("priority", "urgent")]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_priority");
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_priority_is_400() {
+        let (status, body) = post_audio_fields(
+            "/v1/audio/transcriptions",
+            &[("priority", "normal"), ("priority", "interactive")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "duplicate_field");
+    }
+
+    /// `POST /models/manage/unload` frees the loaded model but, unlike
+    /// `DELETE /models/manage/default`, keeps the saved default.
+    #[tokio::test]
+    async fn unload_keeps_the_saved_default_but_deselect_clears_it() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        app.db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO settings(key,value) VALUES('selected_model','some-model')",
+                [],
+            )
+            .unwrap();
+
+        let request = build_request("POST", "/models/manage/unload", None, &token);
+        let response = router(app.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body, json!({"unloaded": true, "loaded": false}));
+        assert_eq!(selected_id(&app).unwrap().as_deref(), Some("some-model"));
+
+        let request = build_request("DELETE", "/models/manage/default", None, &token);
+        let response = router(app.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(selected_id(&app).unwrap(), None);
         drop(app);
         std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
     }
@@ -3907,6 +4320,7 @@ mod router_tests {
             ("PATCH", "/v1/local/config", Some(r#"{}"#)),
             ("POST", "/models/manage/refresh", None),
             ("DELETE", "/models/manage/default", None),
+            ("POST", "/models/manage/unload", None),
             ("POST", "/models/manage/not-a-real-id/default", None),
             ("DELETE", "/models/manage/not-a-real-id", None),
             ("POST", "/models/manage/not-a-real-id/download", None),

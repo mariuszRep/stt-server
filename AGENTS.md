@@ -10,8 +10,9 @@ models and serves batch transcription through an OpenAI-compatible API.
 3. This file
 4. The relevant goal: `.projectflows/goals/<status>/<slug>/GOAL.md` in this repository, and
    for cross-repo context the workspace goals in
-   `D:\Users\mariu\Projects\voice-typer\.projectflows\goals\in_progress\`
-   (`build-stt-server-next`, `migrate-voice-typer-to-stt-server-next`, `promote-stt-server-next-to-stt-server`)
+   `D:\Users\mariu\Projects\voice-typer\.projectflows\goals\done\`
+   (`build-stt-server-next`, `migrate-voice-typer-to-stt-server-next`,
+   `promote-stt-server-next-to-stt-server`: historical slugs, all completed)
 5. `README.md`, `docs/client-contract.md`, then the relevant source
 
 ## Repository
@@ -19,17 +20,21 @@ models and serves batch transcription through an OpenAI-compatible API.
 - `mariuszRep/stt-server`, checked out in the workspace as `voice-typer/stt-server` on the
   integration branch `voice-typer-windows` (see the workspace `AGENTS.md` for the sibling-clone
   rules and the cross-repo train).
-- This code was developed as `stt-server-next` and took over this repository at 0.3.0. The
+- This code was first developed under the working name `stt-server-next` and took over this repository at 0.3.0. The
   earlier provider-based server is preserved at tag `legacy-provider-final` and branch
   `legacy`; the previous `main` at tag `legacy-main-final`. Its releases (up to v0.2.10) are
   untouched. Do not delete those refs.
 - Do not create other branches, force-push, rebase, or amend.
+- Current names: executable `stt-server.exe`; Windows service `OpenVibeSttServer` (display name `STT Server`; renamed from `OpenVibeSttNext` in 0.3.2: `service install` migrates and `service uninstall` removes a legacy one); autostart
+  value `OpenVibeSttServer`; per-user data `%LOCALAPPDATA%\OpenVibeAI\STT Server`; machine-wide
+  program `%ProgramFiles%\OpenVibeAI\STT Server`, data `%ProgramData%\OpenVibeAI\STT Server`.
+  The `STT Server Next` folders in `src/app.rs` are legacy-migration only.
 
 ## Boundaries
 
 | Owns | Must not own |
 |---|---|
-| Model catalog, download, import, drop-in refresh, verification, selection, loading, removal; batch transcription and translation; capability matrix; queue; CLI and process modes; install scope and data folder; auth with admin and user tokens; network modes (local, LAN, Tailscale); CORS; self-update; system information; SQLite state | Microphone capture, chunking, VAD, the dictation session, prompt or vocabulary construction, transcript editing (all client-side); provider processes or descriptors; hardware-based model ranking |
+| Model catalog, download, import, drop-in refresh, verification, selection, loading, removal; batch transcription and translation; offline speech detection on finished audio (Silero, pure Rust); capability matrix; queue; CLI and process modes; install scope and data folder; auth with admin and user tokens; network modes (local, LAN, Tailscale); CORS; self-update; system information; SQLite state | Microphone capture, live VAD and chunking (client-side; offline speech detection on finished audio is a server capability, owner direction 2026-10-17), the dictation session, prompt or vocabulary construction, transcript editing (all client-side); provider processes or descriptors; hardware-based model ranking |
 
 ## Layout
 
@@ -39,6 +44,10 @@ models and serves batch transcription through an OpenAI-compatible API.
   capabilities, request planning, responses
 - `src/download.rs`, `src/import.rs`, `src/verify.rs`, `src/dropin.rs`, `src/gguf_probe.rs`
 - `src/queue.rs`, `src/engine.rs` — inference queue and model load/swap
+- `src/realtime.rs` — live streaming transcription over WebSocket (`GET /v1/realtime`)
+- `src/vad.rs` — offline speech detection (`POST /v1/audio/vad`): pure-Rust Silero v5 forward pass,
+  weights in `assets/silero_v5_16k.f32` (exported by `scripts/export_silero_weights.py`; golden
+  probabilities from `scripts/silero_golden.py` in `tests/vad_golden.json`) and the segmenter
 - `src/import_user.rs` — copy a user's models into a machine-wide install
 - `src/store.rs` migrations; `src/discovery.rs`, `src/autostart.rs`, `src/service.rs`,
   `src/sysinfo.rs`

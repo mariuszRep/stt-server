@@ -1,5 +1,5 @@
 $ErrorActionPreference = 'Stop'
-$name = 'OpenVibeSttNext'
+$name = 'OpenVibeSttServer'
 $before = Get-CimInstance Win32_Service -Filter "Name='$name'"
 if ($null -eq $before -or $before.State -ne 'Running' -or $before.ProcessId -le 0) {
     throw 'The test service is not running.'

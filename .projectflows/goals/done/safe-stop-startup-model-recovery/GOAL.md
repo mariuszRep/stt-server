@@ -43,7 +43,7 @@ Self-update, release publishing, SDK/app changes, CLI feature expansion, model c
 
 ## Related goals
 
-- draft/ready-for-voice-typer: this goal addresses its startup/file resilience subset.
+- cancelled/ready-for-voice-typer: this goal addresses its startup/file resilience subset.
 - Workspace migration and build-stt-server-next goals remain the overall acceptance record.
 
 ## Ready For Execution

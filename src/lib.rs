@@ -20,11 +20,14 @@ pub mod model_cli;
 pub mod network;
 pub mod operations;
 pub mod queue;
+pub mod realtime;
 pub mod run_plan;
 pub mod selfupdate;
 #[cfg(windows)]
 pub mod service;
+pub mod service_names;
 pub mod store;
 pub mod sysinfo;
 pub mod update_transaction;
+pub mod vad;
 pub mod verify;

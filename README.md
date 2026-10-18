@@ -22,11 +22,17 @@ to `0` for a `server.json` written before this field existed, meaning "older tha
 client requires"). `GET /v1/local/system`'s `server` section reports the same two fields.
 Other routes require a bearer token. The server implements
 `GET /readiness`, `GET /v1/models`, and OpenAI-style `POST /v1/audio/transcriptions` and
-`POST /v1/audio/translations` for mono/stereo WAV from 8–192 kHz (16/24-bit PCM or 32-bit float),
+`POST /v1/audio/translations` (plus the live WebSocket `GET /v1/realtime?intent=transcription`, an
+OpenAI Realtime-style transcription stream with committed/tentative text, documented in
+`docs/client-contract.md` section 5a) for mono/stereo WAV from 8–192 kHz (16/24-bit PCM or 32-bit float),
 both sharing one pipeline (parse → decode → plan → queue → run → format) and a 40 MiB body limit.
-Audio is converted to 16 kHz mono before inference. Accepted multipart fields are `file`, `model`,
+`POST /v1/audio/vad` (a local extension, section 5b of `docs/client-contract.md`) finds the speech
+segments of a finished recording with Silero VAD v5 running in-process (pure Rust, no ONNX runtime,
+no loaded model needed): fields `file`, `threshold`, `min_speech_ms`, `min_silence_ms`,
+`speech_pad_ms`, answer `{duration, speech_seconds, speech_ratio, segments:[{start,end}]}` in
+seconds. Live VAD stays client-side. Audio is converted to 16 kHz mono before inference. Accepted multipart fields are `file`, `model`,
 `language`, `prompt`, `temperature`, `response_format` (`json`/`text`/`verbose_json`), and repeatable
-`timestamp_granularities`/`timestamp_granularities[]`; `prompt` is passed to the engine verbatim
+`timestamp_granularities`/`timestamp_granularities[]` (plus `target_language` on translations only, default `en`, any language the model offers; also available live, section 5a); `prompt` is passed to the engine verbatim
 (no server-side composition or trimming) and is only accepted on whisper-family models. `model` is
 optional: an absent field is treated as `model=default` (whichever model is currently selected)
 rather than a 400, since OpenAI-shaped clients typically send it but this server's own SDK client
@@ -139,7 +145,10 @@ byte-identical to upstream) but is otherwise unused.
 ## Inference queue and model switching
 
 Exactly one transcription runs at a time, matching the single resident model. A request that
-arrives while another is running joins a FIFO queue (`src/queue.rs`). By default the queue is
+arrives while another is running joins a FIFO queue (`src/queue.rs`); a request that sends the
+optional `priority=interactive` field is served ahead of waiting normal ones (a dictation turn
+over background work; see `docs/client-contract.md` 4.3). A batch request for the model a live
+stream is using waits for the stream's item to end instead of failing. By default the queue is
 unbounded and a waiter never times out, matching the current shipping server. Three settings make
 these optional and bounded:
 
@@ -186,7 +195,8 @@ off its already-loaded handle while the new model loads on a blocking thread, an
 swap of `app.loaded` is briefly exclusive. A failed load leaves the previous selection in place.
 Note that both models are briefly resident in memory during the swap window; this is accepted as
 a tradeoff for non-blocking switching. `DELETE /models/manage/default` now waits up to 30s for
-a running inference to finish before unloading, returning 409 `model_in_use` only if that timeout
+a running inference to finish before unloading (and clears the saved default; `POST
+/models/manage/unload` unloads only and keeps it), returning 409 `model_in_use` only if that timeout
 elapses. When transcription's readiness check fails (`server_not_ready`), the error includes
 `error.details.operation_id` when an install/import/verify operation is currently queued or
 running.

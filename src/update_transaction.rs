@@ -102,8 +102,55 @@ impl Journal {
     }
     fn advance(&mut self, phase: Phase) -> Result<()> {
         self.phase = phase;
+        if phase.terminal() {
+            // A finished transaction no longer needs (or blocks on) recovery.
+            self.armed = false;
+        }
         self.save()
     }
+}
+
+/// Windows `fs::canonicalize` returns verbatim paths (`\\?\C:\...`). Task
+/// Scheduler and the paths stored in `server.json` use the plain form, so every
+/// path that is compared, or written for an external consumer, goes through
+/// this. Paths that need the verbatim form (longer than MAX_PATH, or with no
+/// plain equivalent) are returned unchanged.
+pub fn simplify_path(path: &Path) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        if rest.len() < 258 {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        let bytes = rest.as_bytes();
+        let drive = bytes.len() >= 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes.len() == 2 || bytes[2] == b'\\');
+        if drive && rest.len() < 260 {
+            return PathBuf::from(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Path equality that ignores the verbatim prefix, separator style, trailing
+/// separators and (on Windows) letter case.
+pub fn same_path(a: &Path, b: &Path) -> bool {
+    fn key(path: &Path) -> String {
+        let simple = simplify_path(path);
+        let mut text = simple.to_string_lossy().replace('/', "\\");
+        while text.len() > 3 && text.ends_with('\\') {
+            text.pop();
+        }
+        if cfg!(windows) {
+            text = text.to_lowercase();
+        }
+        text
+    }
+    key(a) == key(b)
 }
 
 pub fn journal_path(data_dir: &Path) -> PathBuf {
@@ -365,20 +412,31 @@ pub fn task_xml(journal: &Journal, sid: &str) -> String {
     };
     let arguments = format!(
         "__update-worker {} --recover",
-        quote_windows_arg(&journal.data_dir.display().to_string())
+        quote_windows_arg(&simplify_path(&journal.data_dir).display().to_string())
     );
     format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Triggers>{trigger}</Triggers><Principals><Principal id="Owner"><UserId>{principal}</UserId><LogonType>{logon}</LogonType><RunLevel>{level}</RunLevel></Principal></Principals><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings><Actions Context="Owner"><Exec><Command>{}</Command><Arguments>{}</Arguments></Exec></Actions></Task>"#,
-        xml(&journal.worker().display().to_string()),
+        r#"<?xml version="1.0" encoding="UTF-16"?><Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Triggers>{trigger}</Triggers><Principals><Principal id="Owner"><UserId>{principal}</UserId><LogonType>{logon}</LogonType><RunLevel>{level}</RunLevel></Principal></Principals><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings><Actions Context="Owner"><Exec><Command>{}</Command><Arguments>{}</Arguments></Exec></Actions></Task>"#,
+        xml(&simplify_path(&journal.worker()).display().to_string()),
         xml(&arguments)
     )
+}
+
+/// The bytes `schtasks /Create /XML` accepts: UTF-16LE with a BOM, matching the
+/// `encoding="UTF-16"` declaration. A UTF-8 file is rejected ("unable to switch
+/// the encoding").
+pub fn task_xml_bytes(journal: &Journal, sid: &str) -> Vec<u8> {
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in task_xml(journal, sid).encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
 }
 impl TaskRunner for WindowsTasks {
     fn register(&self, journal: &Journal) -> Result<()> {
         #[cfg(windows)]
         {
             let task_file = journal.work_dir.join("recovery-task.xml");
-            fs::write(&task_file, task_xml(journal, &owner_sid()?)).map_err(err)?;
+            fs::write(&task_file, task_xml_bytes(journal, &owner_sid()?)).map_err(err)?;
             run_command(
                 hidden_command("schtasks.exe")
                     .args(["/Create", "/TN", &journal.task_name, "/XML"])
@@ -451,7 +509,24 @@ pub async fn validation(data_dir: &Path) -> Result<Value> {
 /// All ordinary service stop/start operations go through SCM, preserving its
 /// account, configuration and recovery policy rather than launching `run`.
 fn service_command(action: &str) -> Result<()> {
-    run_command(hidden_command("sc.exe").args([action, "OpenVibeSttNext"]))
+    struct Sc;
+    impl crate::service_names::ServiceControl for Sc {
+        fn exists(&self, name: &str) -> std::result::Result<bool, Box<dyn std::error::Error>> {
+            Ok(
+                bounded_output(hidden_command("sc.exe").args(["query", name]))?
+                    .status
+                    .success(),
+            )
+        }
+        fn stop_and_delete(&self, _: &str) -> std::result::Result<(), Box<dyn std::error::Error>> {
+            Err("the updater never deletes services".into())
+        }
+    }
+    // Legacy migration: an install from before the rename is still registered
+    // under the old name until `service install` is next run, and must still be
+    // stopped and started by its registered name.
+    let name = crate::service_names::active_name(&Sc);
+    run_command(hidden_command("sc.exe").args([action, name]))
 }
 
 pub async fn stop(journal: &Journal) -> Result<()> {
@@ -662,9 +737,34 @@ fn cleanup(journal: &mut Journal, tasks: &impl TaskRunner) -> Result<()> {
 /// A run worker applies only a freshly prepared transaction. A recovery worker
 /// always rolls back any uncommitted transaction, never guesses it succeeded.
 pub async fn worker(data_dir: &Path, recover: bool, tasks: &impl TaskRunner) -> Result<()> {
+    let result = run_worker(data_dir, recover, tasks).await;
+    // Best effort and never changes the outcome: the finished transaction's own
+    // folder is kept (this process runs from it and the journal still points
+    // at it); it is pruned by the next update.
+    if let Ok(Some(journal)) = read_journal(data_dir) {
+        if journal.phase.terminal() {
+            prune_finished_work_dirs(data_dir, Some(&journal.work_dir));
+        }
+    }
+    result
+}
+
+async fn run_worker(data_dir: &Path, recover: bool, tasks: &impl TaskRunner) -> Result<()> {
     let _lock = lock(data_dir)?;
     let mut journal = read_journal(data_dir)?.ok_or("No update journal")?;
-    validate_journal(&journal, data_dir)?;
+    if let Err(cause) = validate_journal(&journal, data_dir) {
+        // A freshly prepared transaction has not touched the executable or the
+        // database yet, so a failed check can safely be abandoned: remove the
+        // recovery task and disarm, otherwise startup and the next update are
+        // refused and only manual cleanup could unblock the user.
+        if journal.armed && journal.phase == Phase::Prepared {
+            journal.error = Some(format!("{cause}; update abandoned, nothing changed"));
+            journal.armed = false;
+            journal.advance(Phase::Restored)?;
+            cleanup(&mut journal, tasks)?;
+        }
+        return Err(cause);
+    }
     if journal.phase.terminal() {
         return cleanup(&mut journal, tasks);
     }
@@ -691,6 +791,69 @@ pub async fn worker(data_dir: &Path, recover: bool, tasks: &impl TaskRunner) -> 
     cleanup(&mut journal, tasks)
 }
 
+const WORK_DIR_PREFIX: &str = ".stt-update-";
+
+/// Deletes finished `.stt-update-<uuid>` folders next to the journal's
+/// executable. Never touches `keep`, the folder of a journal that is not
+/// terminal or is still armed, or anything that is not named like a work
+/// folder. Failures are logged and ignored.
+fn prune_finished_work_dirs(data_dir: &Path, keep: Option<&Path>) {
+    let journal = match read_journal(data_dir) {
+        Ok(journal) => journal,
+        Err(e) => {
+            eprintln!("update cleanup skipped, journal unreadable: {e}");
+            return;
+        }
+    };
+    let Some(journal) = journal else { return };
+    let Some(exe_dir) = journal.launch.executable.parent() else {
+        return;
+    };
+    let protected = (!journal.phase.terminal() || journal.armed).then_some(journal.work_dir);
+    prune_work_dirs(exe_dir, keep, protected.as_deref(), |dir| {
+        fs::remove_dir_all(dir)
+    });
+}
+
+fn prune_work_dirs(
+    exe_dir: &Path,
+    keep: Option<&Path>,
+    protected: Option<&Path>,
+    remove: impl Fn(&Path) -> std::io::Result<()>,
+) {
+    let entries = match fs::read_dir(exe_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!(
+                "update cleanup skipped, cannot list {}: {e}",
+                exe_dir.display()
+            );
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_work_dir = entry.file_name().to_str().is_some_and(|name| {
+            name.strip_prefix(WORK_DIR_PREFIX)
+                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+        });
+        // file_type does not follow symlinks, so a link is never traversed.
+        if !is_work_dir || !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        if [keep, protected]
+            .into_iter()
+            .flatten()
+            .any(|p| same_path(p, &path))
+        {
+            continue;
+        }
+        if let Err(e) = remove(&path) {
+            eprintln!("could not remove old update folder {}: {e}", path.display());
+        }
+    }
+}
+
 fn validate_journal(journal: &Journal, data_dir: &Path) -> Result<()> {
     if fs::canonicalize(&journal.data_dir).map_err(err)?
         != fs::canonicalize(data_dir).map_err(err)?
@@ -702,8 +865,10 @@ fn validate_journal(journal: &Journal, data_dir: &Path) -> Result<()> {
         .executable
         .parent()
         .ok_or("Executable has no directory")?;
-    if journal.work_dir != parent.join(format!(".stt-update-{}", journal.id))
-        || uuid::Uuid::parse_str(&journal.id).is_err()
+    if !same_path(
+        &journal.work_dir,
+        &parent.join(format!(".stt-update-{}", journal.id)),
+    ) || uuid::Uuid::parse_str(&journal.id).is_err()
     {
         return Err("Invalid update artifact paths".into());
     }
@@ -718,17 +883,50 @@ pub async fn prepare(
     timeout: u64,
     tasks: &impl TaskRunner,
 ) -> Result<Journal> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let result = prepare_with_id(data_dir, release, timeout, tasks, &id).await;
+    if result.is_err() {
+        // A failure before the journal exists (for example a bad download)
+        // must not leave a work folder with a copy of the executable behind.
+        let journal_exists = read_journal(data_dir)
+            .ok()
+            .flatten()
+            .is_some_and(|j| j.id == id);
+        if !journal_exists {
+            if let Some(dir) = std::env::current_exe()
+                .ok()
+                .and_then(|e| fs::canonicalize(e).ok())
+                .and_then(|e| e.parent().map(|p| p.join(format!(".stt-update-{id}"))))
+            {
+                let _ = fs::remove_dir_all(dir);
+            }
+        }
+    }
+    result
+}
+
+async fn prepare_with_id(
+    data_dir: &Path,
+    release: &selfupdate::ReleaseInfo,
+    timeout: u64,
+    tasks: &impl TaskRunner,
+    id: &str,
+) -> Result<Journal> {
     if let Some(mut old) = read_journal(data_dir)? {
         if !old.phase.terminal() && old.armed {
             return Err("Previous update requires recovery before another update".into());
         }
         cleanup(&mut old, tasks)?;
+        // The previous transaction is over: its folder (previous.exe, recovery
+        // copy) is no longer needed once a new update replaces its journal.
+        prune_finished_work_dirs(data_dir, None);
     }
-    let executable = fs::canonicalize(std::env::current_exe().map_err(err)?).map_err(err)?;
-    let data_dir = fs::canonicalize(data_dir).map_err(err)?;
+    let executable =
+        simplify_path(&fs::canonicalize(std::env::current_exe().map_err(err)?).map_err(err)?);
+    let data_dir = simplify_path(&fs::canonicalize(data_dir).map_err(err)?);
     let stopped_guard = discovery::acquire_lock(&data_dir).ok();
     let was_running = stopped_guard.is_none();
-    let launch: Launch = if was_running {
+    let mut launch: Launch = if was_running {
         discovery::read_server_json(&data_dir).and_then(|i| i.launch)
             .ok_or("Running server lacks launch metadata; restart it with this version before updating")?
     } else {
@@ -742,9 +940,13 @@ pub async fn prepare(
             Err(e) => return Err(err(e)),
         }
     };
-    if fs::canonicalize(&launch.executable).map_err(err)? != executable {
+    if !same_path(
+        &fs::canonicalize(&launch.executable).map_err(err)?,
+        &executable,
+    ) {
         return Err("Executable does not own this data directory".into());
     }
+    launch.executable = executable.clone();
     let baseline = if was_running {
         Some(validation(&data_dir).await?)
     } else {
@@ -756,7 +958,7 @@ pub async fn prepare(
     {
         return Err("Finish or cancel model operations before updating".into());
     }
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = id.to_owned();
     let work_dir = executable
         .parent()
         .unwrap()
@@ -864,6 +1066,23 @@ fn saved_network_mode(data_dir: &Path, flags: &RunFlags) -> Result<String> {
         .unwrap_or_else(|| "local".into()))
 }
 
+#[cfg(windows)]
+fn stop_inheriting_stdio() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+    for handle in [
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ] {
+        if !handle.is_null() {
+            // SAFETY: a standard handle owned by this process; failure is harmless.
+            unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+        }
+    }
+}
+#[cfg(not(windows))]
+fn stop_inheriting_stdio() {}
+
 pub async fn install(data_dir: PathBuf, yes: bool, json_output: bool, timeout: u64) -> Result<()> {
     let check = selfupdate::check_latest(
         &reqwest::Client::new(),
@@ -887,6 +1106,10 @@ pub async fn install(data_dir: PathBuf, yes: bool, json_output: bool, timeout: u
     let guard = lock(&data_dir)?;
     let journal = prepare(&data_dir, &check.release, timeout, &WindowsTasks).await?;
     let log = File::create(journal.work_dir.join("worker.log")).map_err(err)?;
+    // The worker (and the server it restarts) must not keep this CLI's own
+    // stdout/stderr open: a caller reading them through a pipe or file would
+    // otherwise wait until the restarted server exits.
+    stop_inheriting_stdio();
     let mut command = hidden_command(journal.worker());
     command
         .arg("__update-worker")
@@ -978,6 +1201,48 @@ mod tests {
             armed: true,
             error: None,
         }
+    }
+
+    #[test]
+    fn task_xml_bytes_are_utf16le_with_bom_and_matching_declaration() {
+        let journal = sample_journal(PathBuf::from("w"), PathBuf::from("d"));
+        let bytes = task_xml_bytes(&journal, "S-1-5-21-1-2-3-1001");
+        assert_eq!(&bytes[..2], &[0xFF, 0xFE]);
+        assert_eq!((bytes.len() - 2) % 2, 0);
+        let units: Vec<u16> = bytes[2..]
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let text = String::from_utf16(&units).unwrap();
+        assert!(text.starts_with(r#"<?xml version="1.0" encoding="UTF-16"?>"#));
+        assert_eq!(text, task_xml(&journal, "S-1-5-21-1-2-3-1001"));
+    }
+
+    /// Registers and deletes a uniquely named per-user task with the real
+    /// `schtasks.exe` (no admin needed). The guard deletes it even on failure.
+    #[cfg(windows)]
+    #[test]
+    fn real_schtasks_accepts_generated_recovery_task_xml() {
+        struct Cleanup(String, PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = hidden_command("schtasks.exe")
+                    .args(["/Delete", "/TN", &self.0, "/F"])
+                    .output();
+                let _ = fs::remove_dir_all(&self.1);
+            }
+        }
+        let work = temp_dir("schtasks");
+        fs::create_dir_all(&work).unwrap();
+        let journal = sample_journal(work.clone(), work.join("data"));
+        let _cleanup = Cleanup(journal.task_name.clone(), work);
+        WindowsTasks.register(&journal).unwrap();
+        let query = hidden_command("schtasks.exe")
+            .args(["/Query", "/TN", &journal.task_name])
+            .output()
+            .unwrap();
+        assert!(query.status.success(), "task was not registered");
+        WindowsTasks.remove(&journal).unwrap();
     }
 
     // --- validate_response: the decision function behind "expected-version
@@ -1206,5 +1471,241 @@ mod tests {
         assert_eq!(fs::read(&exe_path).unwrap(), b"old exe bytes");
 
         let _ = fs::remove_dir_all(&journal.data_dir);
+    }
+
+    // --- Windows verbatim paths and failure cleanup ---
+
+    #[test]
+    fn simplify_path_strips_only_a_safe_verbatim_prefix() {
+        let simple = |text: &str| simplify_path(Path::new(text));
+        assert_eq!(simple(r"\\?\C:\bin\a.exe"), PathBuf::from(r"C:\bin\a.exe"));
+        assert_eq!(simple(r"\\?\C:\"), PathBuf::from(r"C:\"));
+        assert_eq!(simple(r"C:\bin\a.exe"), PathBuf::from(r"C:\bin\a.exe"));
+        assert_eq!(
+            simple(r"\\?\UNC\host\share\a.exe"),
+            PathBuf::from(r"\\host\share\a.exe")
+        );
+        // No plain equivalent: left untouched.
+        assert_eq!(
+            simple(r"\\?\Volume{1234}\a.exe"),
+            PathBuf::from(r"\\?\Volume{1234}\a.exe")
+        );
+        let long = format!(r"\\?\C:\{}", "a".repeat(300));
+        assert_eq!(simple(&long), PathBuf::from(&long));
+    }
+
+    #[test]
+    fn same_path_ignores_prefix_separators_and_trailing_slash() {
+        assert!(same_path(
+            Path::new(r"\\?\C:\bin\.stt-update-1"),
+            Path::new(r"C:\bin\.stt-update-1")
+        ));
+        assert!(same_path(
+            Path::new(r"C:/bin/x"),
+            Path::new(r"\\?\C:\bin\x\")
+        ));
+        assert!(!same_path(Path::new(r"C:\bin\x"), Path::new(r"C:\bin\y")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn same_path_ignores_case_on_windows() {
+        assert!(same_path(
+            Path::new(r"\\?\C:\Users\Bin\.stt-update-1"),
+            Path::new(r"c:\users\bin\.STT-update-1")
+        ));
+    }
+
+    /// Mirrors the real layout: `prepare` builds work_dir from the canonical
+    /// (verbatim on Windows) executable, while `launch.executable` comes from
+    /// server.json without the prefix.
+    fn armed_fixture(label: &str) -> (PathBuf, Journal) {
+        let root = temp_dir(label);
+        let bin = root.join("bin");
+        let data_dir = root.join("data");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+        let mut journal = sample_journal(PathBuf::new(), data_dir);
+        journal.work_dir = bin.join(format!(".stt-update-{}", journal.id));
+        fs::create_dir_all(&journal.work_dir).unwrap();
+        fs::write(journal.worker(), b"recovery exe").unwrap();
+        journal.old_sha256 = sha256_file(&journal.worker()).unwrap();
+        journal.launch.executable = simplify_path(&bin.join("stt-server.exe"));
+        (root, journal)
+    }
+
+    #[test]
+    fn validation_accepts_canonical_work_dir_with_plain_launch_executable() {
+        let (root, journal) = armed_fixture("paths");
+        // root comes from canonicalize(), so on Windows this is verbatim.
+        assert_eq!(
+            journal.work_dir.parent().unwrap(),
+            root.join("bin"),
+            "fixture should use the canonical form"
+        );
+        journal.save().unwrap();
+        validate_journal(&journal, &journal.data_dir).unwrap();
+        // The plain spelling of the data dir and a different case also pass.
+        validate_journal(&journal, &simplify_path(&journal.data_dir)).unwrap();
+        // A work dir that is not beside the executable is still rejected.
+        let mut wrong = journal.clone();
+        wrong.work_dir = root
+            .join("elsewhere")
+            .join(format!(".stt-update-{}", wrong.id));
+        assert_eq!(
+            validate_journal(&wrong, &wrong.data_dir).unwrap_err(),
+            "Invalid update artifact paths"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn task_command_and_arguments_carry_no_verbatim_prefix() {
+        let (root, journal) = armed_fixture("task-paths");
+        let xml = task_xml(&journal, "S-1-5-21-1-2-3-1001");
+        assert!(!xml.contains(r"\\?\"), "{xml}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[derive(Default)]
+    struct RecordingTasks {
+        removed: std::cell::Cell<u32>,
+    }
+    impl TaskRunner for RecordingTasks {
+        fn register(&self, _: &Journal) -> Result<()> {
+            Ok(())
+        }
+        fn remove(&self, _: &Journal) -> Result<()> {
+            self.removed.set(self.removed.get() + 1);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_worker_failure_after_arming_removes_the_task_and_disarms() {
+        let (root, journal) = armed_fixture("fail-cleanup");
+        // Corrupt the protected recovery copy: validation fails after arming.
+        fs::write(journal.worker(), b"tampered").unwrap();
+        journal.save().unwrap();
+        assert!(maintenance(&journal.data_dir));
+
+        let tasks = RecordingTasks::default();
+        let error = worker(&journal.data_dir, false, &tasks).await.unwrap_err();
+        assert!(error.contains("hash mismatch"), "{error}");
+
+        assert_eq!(tasks.removed.get(), 1, "recovery task must be removed");
+        let after = read_journal(&journal.data_dir).unwrap().unwrap();
+        assert!(!after.armed);
+        assert_eq!(after.phase, Phase::Restored);
+        assert!(after.task_removed);
+        assert!(after.error.unwrap().contains("nothing changed"));
+        assert!(!maintenance(&journal.data_dir), "startup must work again");
+        // A later update is not refused for a pending recovery.
+        drop(startup_guard(&journal.data_dir).unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reaching_a_terminal_phase_disarms_the_journal() {
+        for phase in [Phase::Committed, Phase::Restored] {
+            let (root, mut journal) = armed_fixture("terminal-disarm");
+            assert!(journal.armed);
+            journal.advance(Phase::Replacing).unwrap();
+            assert!(journal.armed);
+            journal.advance(phase).unwrap();
+            assert!(!journal.armed);
+            assert!(!read_journal(&journal.data_dir).unwrap().unwrap().armed);
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failure_after_the_executable_was_touched_stays_armed_for_recovery() {
+        let (root, mut journal) = armed_fixture("fail-armed");
+        journal.phase = Phase::Replacing;
+        fs::write(journal.worker(), b"tampered").unwrap();
+        journal.save().unwrap();
+        let tasks = RecordingTasks::default();
+        worker(&journal.data_dir, true, &tasks).await.unwrap_err();
+        assert_eq!(tasks.removed.get(), 0);
+        assert!(read_journal(&journal.data_dir).unwrap().unwrap().armed);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn work_name() -> String {
+        format!("{WORK_DIR_PREFIX}{}", uuid::Uuid::new_v4())
+    }
+
+    #[test]
+    fn pruning_removes_finished_folders_and_keeps_armed_keep_and_unrelated() {
+        let root = temp_dir("prune");
+        fs::create_dir_all(&root).unwrap();
+        let mk = |name: &str| {
+            let dir = root.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("previous.exe"), b"x").unwrap();
+            dir
+        };
+        let old_a = mk(&work_name());
+        let old_b = mk(&work_name());
+        let armed = mk(&work_name());
+        let keep = mk(&work_name());
+        let unrelated = mk("other-folder");
+        let lookalike = mk(".stt-update-notes");
+        let file = root.join(work_name());
+        fs::write(&file, b"not a folder").unwrap();
+        prune_work_dirs(&root, Some(&keep), Some(&armed), |d| fs::remove_dir_all(d));
+        assert!(!old_a.exists() && !old_b.exists());
+        assert!(armed.exists() && keep.exists());
+        assert!(unrelated.exists() && lookalike.exists() && file.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pruning_tolerates_deletion_errors() {
+        let root = temp_dir("prune-errors");
+        fs::create_dir_all(&root).unwrap();
+        let dirs: Vec<_> = (0..3)
+            .map(|_| {
+                let d = root.join(work_name());
+                fs::create_dir_all(&d).unwrap();
+                d
+            })
+            .collect();
+        let attempts = std::cell::Cell::new(0);
+        prune_work_dirs(&root, None, None, |_| {
+            attempts.set(attempts.get() + 1);
+            Err(std::io::Error::other("in use"))
+        });
+        assert_eq!(attempts.get(), 3);
+        assert!(dirs.iter().all(|d| d.exists()));
+        prune_work_dirs(&root.join("missing"), None, None, |_| Ok(()));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn worker_prunes_other_folders_after_commit_but_not_while_armed() {
+        let (root, mut journal) = armed_fixture("prune-worker");
+        let exe_dir = journal.launch.executable.parent().unwrap().to_path_buf();
+        let stale = exe_dir.join(work_name());
+        fs::create_dir_all(&stale).unwrap();
+        // Armed, non-terminal journal: a failing recovery must not prune.
+        journal.phase = Phase::Replacing;
+        fs::write(journal.worker(), b"tampered").unwrap();
+        journal.save().unwrap();
+        worker(&journal.data_dir, true, &RecordingTasks::default())
+            .await
+            .unwrap_err();
+        assert!(stale.exists());
+        // Terminal journal: stale folder goes, own folder stays.
+        journal.phase = Phase::Committed;
+        journal.armed = false;
+        journal.save().unwrap();
+        worker(&journal.data_dir, false, &RecordingTasks::default())
+            .await
+            .ok();
+        assert!(!stale.exists());
+        assert!(journal.work_dir.exists());
+        let _ = fs::remove_dir_all(root);
     }
 }

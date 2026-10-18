@@ -159,7 +159,7 @@ Implemented the remaining success criteria: the model manager path rename and it
 - `scripts/catalog_sweep.py`: every API call path updated to `/models/manage/...`.
 - `docs/client-contract.md` (route table in section 3, section 4's model-centric flow, the old-call
   mapping table in section 9), `README.md` (API section, CLI usage block and command
-  descriptions), and `.projectflows/goals/ready/hands-on-acceptance-tests/GOAL.md` (every
+  descriptions), and `.projectflows/goals/in_progress/hands-on-acceptance-tests/GOAL.md` (every
   `/v1/local/models*` path and `models select`/`install` wording replaced; steps otherwise
   unchanged) updated to the new paths/names.
 - Internal "selected" -> "default" naming: left the `selected_model` settings/DB key name as-is

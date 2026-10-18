@@ -25,6 +25,7 @@ only one.
 - **Transcription stays simple.** Applications send finished audio and get text back. The
   client owns the dictation session: microphone, chunking, prompts and vocabulary, and editing
   the result. The server passes a prompt through unchanged and never rewrites a transcript.
+- **Live transcripts.** `GET /v1/realtime` streams audio over a WebSocket and returns text while it is still being spoken (OpenAI Realtime transcription mode).
 - **Runs the way people need it.** By default it starts and stops with the app that uses it,
   installed just for that person. It can also run on its own: at Windows sign-in for one person,
   or installed for the whole machine as a shared server (a Windows Service) that other users,
@@ -36,5 +37,6 @@ only one.
 
 ## Not in scope
 
-Live streaming transcripts, server-side microphone capture or voice-activity detection,
-holding a user's dictation session, and cloud or multi-tenant hosting.
+Server-side microphone capture, holding a user's dictation session, and cloud or
+multi-tenant hosting. Live VAD and chunking stay client-side; offline speech detection on
+finished audio is a server capability (owner direction 2026-10-17).
