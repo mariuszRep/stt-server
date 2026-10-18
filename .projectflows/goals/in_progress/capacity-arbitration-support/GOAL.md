@@ -55,5 +55,6 @@ generic and optional.
   The five pre-existing queue tests pass unchanged apart from the added `Priority::Normal` argument.
 - 2026-10-17: Stanzo side built and tested by automation, as reported at delivery; not yet exercised by the owner under
   real memory pressure.
+- 2026-10-18: the Memory status line in Stanzo that showed the capacity reading was removed by the owner's request; the owner's memory scenarios are still untested, so this goal stays in progress.
 - Not verified: a real streaming model holding the lease while an HTTP batch waits (needs a local streaming model; the
   ignored `realtime_worker_streams_a_wav_through_a_streaming_model` test exercises the worker only).

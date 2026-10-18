@@ -2,13 +2,13 @@
 name: live-translation
 title: Translation, OpenAI-Style, in Batch and Live Streaming
 description: Translate speech the way OpenAI and Handy do, in both the batch endpoint and the live streaming endpoint, and let Stanzo use it as a workflow option.
-status: in_progress
+status: done
 type: feature
 scope: stt-server, stt-sdk, whisper-vibes (Stanzo)
 attempt: 1
 max_attempts: 4
-last_result: partial
-next_action: owner test with a translating model - batch and live, and the Stanzo translation workflow option. Built: batch and live in stt-server (S1, S2), stt-sdk exposure (S3), Stanzo workflow option (S4, edba781 in whisper-vibes). Still open - a real multi-target model (Canary) check; the srt/vtt output formats are the separate draft goal subtitle-response-formats (owner decision D2).
+last_result: passed
+next_action: null
 success_criteria:
   - Batch translation (/v1/audio/translations, already present in stt-server) is checked against OpenAI's contract and Handy's behaviour, gaps listed and fixed.
   - The live streaming endpoint can translate as well as transcribe (OpenAI-style session option), for models that support it; others give a clear OpenAI-style error.
@@ -63,5 +63,9 @@ the OpenAI API while keeping Handy's committed/tentative streaming semantics; la
   `committed, delta, partial, completed`, delta equal to the full transcript.
 - 2026-10-17: S3 and S4 built and tested by automation, as reported at delivery; owner test with a translating model
   is the next step.
+- 2026-10-18: owner hands-on on the installed Stanzo: spoke Polish with Whisper Medium and Translate to English on, and got English text. Built on the way: the SDK counts a catalog claim as translating until the engine confirms (stt-sdk 03db719, a4e85ba, 56e8b07) and Stanzo shows Translate to for a model not yet loaded (whisper-vibes dadcce7); the AI dev spec `translation.spec` proves the translations request and the refetch after the model loads.
 - Not verified: a real multi-target translating model (Canary) and the `verbose_json` `language` of an
   auto-detected source on a translate run; documented as the source language from the plan/engine report.
+
+## Final Outcome
+Done 2026-10-18 on the owner's hands-on test (Polish spoken, Whisper Medium, Translate to English: English text). Batch and live translation in stt-server (3ed7867), the SDK exposure (stt-sdk 03db719, a4e85ba, 56e8b07), the Stanzo workflow option (edba781, dadcce7). Not covered and not part of this goal: a multi-target model such as Canary has not been tried, and srt/vtt output is the draft goal `subtitle-response-formats`.
