@@ -171,6 +171,12 @@ pub fn capability_matrix(model: &CatalogModel) -> Value {
     } else {
         json!([])
     };
+    // Subtitles are rendered from segment timestamps; only the loaded model confirms them.
+    let subtitles = if has_timestamps {
+        "unknown"
+    } else {
+        "unsupported"
+    };
     let mut matrix = json!({
         "prompt": claim(is_whisper_arch, Value::Null, !is_whisper_arch),
         "temperature": claim(is_whisper_arch, Value::Null, !is_whisper_arch),
@@ -183,7 +189,7 @@ pub fn capability_matrix(model: &CatalogModel) -> Value {
         "translation": translation,
         "timestamp_granularity": claim(has_timestamps, json!(model.capabilities.timestamps), false),
         "streaming": claim(model.capabilities.streaming, json!(model.capabilities.streaming), false),
-        "response_formats": {"json": "supported", "text": "supported", "verbose_json": "unknown"},
+        "response_formats": {"json": "supported", "text": "supported", "verbose_json": "unknown", "srt": subtitles, "vtt": subtitles},
     });
     capabilities::add_unverified_engine_controls(&mut matrix);
     matrix

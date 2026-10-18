@@ -672,8 +672,8 @@ returned**, only a client starting a new operation call does:
 | `language` | no | BCP-47-ish hint; omit unless the selected model's `language_hint` capability is `supported` |
 | `prompt` | no | opaque, verbatim text; omit unless `prompt` capability is `supported` |
 | `temperature` | no | `0.0..=1.0`; omit unless `temperature` capability is `supported` |
-| `response_format` | no | `json` (default) \| `text` \| `verbose_json` |
-| `timestamp_granularities` (repeatable) | no | `word` \| `segment`; only meaningful with `verbose_json`; omit `word` unless `word_timestamps` capability is `supported` |
+| `response_format` | no | `json` (default) \| `text` \| `verbose_json` \| `srt` \| `vtt` (subtitles, see Subtitle formats below) |
+| `timestamp_granularities` (repeatable) | no | `word` \| `segment`; only meaningful with `verbose_json` (ignored with `srt`/`vtt`); omit `word` unless `word_timestamps` capability is `supported` |
 | `priority` | no | **Extension.** `normal` (default) or `interactive`. Interactive requests are served before waiting normal ones, FIFO within each class; see 4.3. Any other value is `400 invalid_priority`. |
 | `target_language` | no | **`/v1/audio/translations` only** (extension, see below). The language to translate into; default `en`. On `/v1/audio/transcriptions` it is an unknown field. |
 
@@ -743,6 +743,30 @@ follows that, with documented extensions:
 `text` only for `response_format: "text"` (plain body, not JSON). For
 `verbose_json`, the same shape as `json` with `segments` (and `words`, if
 timestamps allow) always populated.
+
+### Subtitle formats (`srt`, `vtt`)
+
+`response_format=srt` or `vtt` works on both endpoints and returns the subtitle file as the body
+with `Content-Type: text/plain; charset=utf-8` (as OpenAI does; no `x_diagnostics`). One cue per
+segment the engine returns, so the cue timing and text are the `verbose_json` segments':
+
+- `srt`: numbered cues, `HH:MM:SS,mmm --> HH:MM:SS,mmm`, the text lines, a blank line after each
+  cue. Text is written verbatim apart from trimming and dropping blank lines.
+- `vtt`: the `WEBVTT` header and a blank line, then `HH:MM:SS.mmm --> HH:MM:SS.mmm` cues with `&`,
+  `<` and `>` escaped as entities.
+- Hours are not capped (`01:02:03,456`, `100:00:00,000`); a cue whose end precedes its start is
+  clamped to a zero-length cue; segments with no text are skipped and the numbering stays dense.
+- Silence gives an empty `srt` body and a header-only `vtt` body.
+- Models whose timestamp ceiling is `token` (gigaam, medasr) return no segments, so, as in
+  `verbose_json`, one cue spans the decoded tokens.
+- A model with no segment timestamps (`timestamp_granularity` unsupported) is
+  `422 unsupported_capability` ("... does not produce segment timestamps ..."), never an empty or
+  invented file; the same code comes back if a model that should have produced timing returned none
+  for text it recognised. There is no silent downgrade: the timestamps are an explicit request.
+- Capabilities: `response_formats.srt` and `.vtt` in the capability view are `supported` when the
+  loaded model supports segment timestamps, `unsupported` when it does not, and `unknown` for a
+  model that is not loaded (catalog claims it can, or custom model).
+- `timestamp_granularities` is ignored with these formats.
 
 ### `x_diagnostics` (present on every JSON response)
 

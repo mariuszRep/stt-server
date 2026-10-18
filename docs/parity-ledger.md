@@ -257,8 +257,9 @@ run against that specific model, which is out of scope for this read-only pass.
 - No `prompt_max_tokens` ceiling is exposed by transcribe-cpp 0.2.3 (documented in
   `capabilities.rs`'s field doc already); Handy does not expose one either via its own
   `WhisperRunOptions`, so this is parity, not a gap.
-- Handy supports SRT/VTT export in its own UI layer (client-side), which this server
-  intentionally does not own (`response_formats` correctly reports `srt`/`vtt` unsupported).
+- Handy supports SRT/VTT export in its own UI layer (client-side). This server also returns them,
+  as OpenAI's endpoints do (`response_format=srt|vtt`, rendered from the segment timestamps; see
+  the `subtitle-response-formats` goal and `client-contract.md`).
 - Granite/GigaAM/MedASR/Qwen3-ASR/Voxtral/Cohere/Fun-ASR-Nano have no equivalent engine or UI
   code in Handy at all, so "parity with Handy" is not a meaningful standard for them; transcribe-
   cpp's own source is the correct ground truth and was used instead for this pass.

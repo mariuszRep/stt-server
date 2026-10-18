@@ -42,6 +42,7 @@ models and serves batch transcription through an OpenAI-compatible API.
 - `src/api.rs` router and handlers; `src/app.rs` state and startup reconciliation
 - `src/catalog.rs`, `src/capabilities.rs`, `src/run_plan.rs`, `src/format.rs` — models,
   capabilities, request planning, responses
+- `src/subtitles.rs` � SRT and WebVTT rendering for `response_format=srt|vtt` (pure; cues come from `format.rs`)
 - `src/download.rs`, `src/import.rs`, `src/verify.rs`, `src/dropin.rs`, `src/gguf_probe.rs`
 - `src/queue.rs`, `src/engine.rs` — inference queue and model load/swap
 - `src/realtime.rs` — live streaming transcription over WebSocket (`GET /v1/realtime`)

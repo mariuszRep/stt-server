@@ -34,7 +34,7 @@ seconds. Live VAD stays client-side. `POST /v1/audio/embeddings` (section 5c) re
 embedding ("voice fingerprint") per speech segment (CAM++ trained on VoxCeleb, pure Rust on the CPU, no loaded
 model needed): fields `file`, optional `segments` (`[{start,end}]` in seconds, else the server's own speech
 detection) and `encoding_format` (`float` or `base64`). Audio is converted to 16 kHz mono before inference. Accepted multipart fields are `file`, `model`,
-`language`, `prompt`, `temperature`, `response_format` (`json`/`text`/`verbose_json`), and repeatable
+`language`, `prompt`, `temperature`, `response_format` (`json`/`text`/`verbose_json`/`srt`/`vtt`), and repeatable
 `timestamp_granularities`/`timestamp_granularities[]` (plus `target_language` on translations only, default `en`, any language the model offers; also available live, section 5a); `prompt` is passed to the engine verbatim
 (no server-side composition or trimming) and is only accepted on whisper-family models. `model` is
 optional: an absent field is treated as `model=default` (whichever model is currently selected)

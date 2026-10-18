@@ -582,7 +582,7 @@ fn custom_model_view(installed: &crate::store::InstalledFile) -> Value {
         "translation": {"status": "unknown"},
         "timestamp_granularity": {"status": "unknown"},
         "streaming": {"status": if claims["streaming"] == true { "unknown" } else { "unsupported" }},
-        "response_formats": {"json": "supported", "text": "unsupported", "verbose_json": "unsupported"},
+        "response_formats": {"json": "supported", "text": "unsupported", "verbose_json": "unsupported", "srt": "unknown", "vtt": "unknown"},
     });
     crate::capabilities::add_unverified_engine_controls(&mut effective_capabilities);
     json!({
@@ -671,7 +671,7 @@ fn callable_capabilities(app: &App, id: &str, catalog_fallback: Option<Value>) -
             "translation": {"status": "unknown"},
             "timestamp_granularity": {"status": "unknown"},
             "streaming": {"status": "unsupported"},
-            "response_formats": {"json": "supported", "text": "unsupported", "verbose_json": "unsupported"},
+            "response_formats": {"json": "supported", "text": "unsupported", "verbose_json": "unsupported", "srt": "unknown", "vtt": "unknown"},
         });
         crate::capabilities::add_unverified_engine_controls(&mut unknown);
         unknown
@@ -1582,7 +1582,7 @@ async fn transcribe_or_translate(
         target_language: plan.target_language.clone(),
     };
 
-    let formatted = format_response(&transcript, &plan, samples, &extra);
+    let formatted = format_response(&transcript, &plan, samples, &extra)?;
     Ok(formatted_into_response(formatted))
 }
 
@@ -3610,6 +3610,32 @@ mod router_tests {
                 assert_eq!(body["error"]["code"], "server_not_ready");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn subtitle_formats_are_accepted_on_both_endpoints_and_reach_the_model_check() {
+        for uri in ["/v1/audio/transcriptions", "/v1/audio/translations"] {
+            for format in ["srt", "vtt"] {
+                let (status, body) = post_audio_fields(uri, &[("response_format", format)]).await;
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri} {format}");
+                assert_eq!(body["error"]["code"], "server_not_ready");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn subtitle_text_is_served_as_plain_text() {
+        let body = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHi\n\n";
+        let response = formatted_into_response(Formatted::PlainText(body.to_string()));
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(bytes, body.as_bytes());
     }
 
     #[tokio::test]
