@@ -54,6 +54,12 @@ pub struct App {
     /// Offline speech detection (`POST /v1/audio/vad`) runs beside, not in, the inference
     /// queue; this caps how many run at once.
     pub vad_slots: tokio::sync::Semaphore,
+    /// Speaker embeddings (`POST /v1/audio/embeddings`) likewise run beside the queue, on the
+    /// CPU, and never take the GPU; this caps how many run at once.
+    pub speaker_slots: tokio::sync::Semaphore,
+    /// Diarization (`POST /v1/audio/diarize`) runs on the CPU beside the queue as well, on its
+    /// own slot, so it neither waits behind embeddings nor takes cores from two of them at once.
+    pub diarize_slots: tokio::sync::Semaphore,
     /// Queue/inference limits: settable via `PATCH /v1/local/config` and
     /// overridable per-process by CLI flags (`--queue-max-waiting`,
     /// `--queue-wait-timeout-ms`, `--inference-timeout-ms`). Read at request
@@ -812,6 +818,8 @@ pub fn open_app_at_full(
         user_token,
         inference: InferenceQueue::new(),
         vad_slots: tokio::sync::Semaphore::new(2),
+        speaker_slots: tokio::sync::Semaphore::new(2),
+        diarize_slots: tokio::sync::Semaphore::new(1),
         limits: std::sync::RwLock::new(limits),
         selection: tokio::sync::Mutex::new(()),
         // No blanket total-request timeout: a 48 GB model download must not

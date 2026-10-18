@@ -5,9 +5,12 @@
 //!
 //! See `parity-design.md` "Responses" for the decided shape.
 
+use axum::http::StatusCode;
 use serde_json::{json, Value};
 
+use crate::errors::{ApiError, ApiResult};
 use crate::run_plan::{Plan, ResponseFormat};
+use crate::subtitles::{render_srt, render_vtt, Cue};
 
 /// The Handy-style waterfall for how the reported language was decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +124,66 @@ pub enum Formatted {
     PlainText(String),
 }
 
+/// The transcript's timed segments, as `verbose_json` and the subtitle formats report them.
+///
+/// Bug 2 root cause (verified against transcribe-cpp-sys 0.2.3's
+/// vendored C++, `arch/gigaam/model.cpp` and `arch/medasr/model.cpp`
+/// `run()`): those two families' `run()` ignores the requested
+/// timestamp granularity entirely and always fills only
+/// `transcript.tokens` (real per-token `t0_ms`/`t1_ms`, computed
+/// from the decoder's frame index), never `transcript.segments`
+/// or `.words`, unlike parakeet/whisper, which always populate
+/// `segments`. Their catalog/engine-reported ceiling is
+/// genuinely `TOKEN` (see `capabilities::EffectiveCaps::
+/// max_timestamp_granularity`'s doc comment), so a
+/// `verbose_json` request against them is not incapable, it was
+/// just reading the wrong field on our side: `transcript.tokens`
+/// held real timing data that `segments`/`words` being empty
+/// made look like the model produced nothing. Synthesize one
+/// honest segment spanning the decoded tokens rather than report
+/// empty timing for a model that did produce it.
+fn timed_segments(transcript: &transcribe_cpp::Transcript, plan: &Plan) -> Vec<Cue> {
+    if !transcript.segments.is_empty() {
+        transcript
+            .segments
+            .iter()
+            .map(|seg| Cue {
+                start_ms: seg.t0_ms,
+                end_ms: seg.t1_ms,
+                text: seg.text.clone(),
+            })
+            .collect()
+    } else if plan.timestamps != crate::capabilities::TimestampGranularity::None
+        && !transcript.tokens.is_empty()
+    {
+        vec![Cue {
+            start_ms: transcript.tokens.first().unwrap().t0_ms,
+            end_ms: transcript.tokens.last().unwrap().t1_ms,
+            text: transcript.text.clone(),
+        }]
+    } else {
+        Vec::new()
+    }
+}
+
+/// An `srt`/`vtt` body from the transcript's timed segments. A transcript with text but no timing
+/// cannot become subtitles honestly, so that is a 422 rather than an invented cue.
+fn subtitle_body(
+    transcript: &transcribe_cpp::Transcript,
+    plan: &Plan,
+    render: fn(&[Cue]) -> String,
+) -> ApiResult<Formatted> {
+    let cues = timed_segments(transcript, plan);
+    if cues.is_empty() && !transcript.text.trim().is_empty() {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_capability",
+            "The model returned no segment timestamps for this audio, so subtitles cannot be built",
+        ));
+    }
+    Ok(Formatted::PlainText(render(&cues)))
+}
+
 /// Format a finished (possibly truncated) transcript per the plan's
 /// `response_format`. `samples` is the input PCM sample count, at the fixed
 /// 16 kHz engine rate, used for `duration = samples / 16000`.
@@ -129,9 +192,9 @@ pub fn format_response(
     plan: &Plan,
     samples: usize,
     extra: &DiagnosticsExtra,
-) -> Formatted {
+) -> ApiResult<Formatted> {
     let diagnostics = diagnostics_json(extra);
-    match plan.response_format {
+    Ok(match plan.response_format {
         ResponseFormat::Json => Formatted::Json(json!({
             "text": transcript.text,
             "x_diagnostics": diagnostics,
@@ -144,50 +207,18 @@ pub fn format_response(
                 .clone()
                 .or_else(|| transcript.language.clone());
 
-            // Bug 2 root cause (verified against transcribe-cpp-sys 0.2.3's
-            // vendored C++, `arch/gigaam/model.cpp` and `arch/medasr/model.cpp`
-            // `run()`): those two families' `run()` ignores the requested
-            // timestamp granularity entirely and always fills only
-            // `transcript.tokens` (real per-token `t0_ms`/`t1_ms`, computed
-            // from the decoder's frame index), never `transcript.segments`
-            // or `.words` -- unlike parakeet/whisper, which always populate
-            // `segments`. Their catalog/engine-reported ceiling is
-            // genuinely `TOKEN` (see `capabilities::EffectiveCaps::
-            // max_timestamp_granularity`'s doc comment), so a
-            // `verbose_json` request against them is not incapable, it was
-            // just reading the wrong field on our side: `transcript.tokens`
-            // held real timing data that `segments`/`words` being empty
-            // made look like the model produced nothing. Synthesize one
-            // honest segment spanning the decoded tokens rather than report
-            // empty timing for a model that did produce it.
-            let segments: Vec<Value> = if !transcript.segments.is_empty() {
-                transcript
-                    .segments
-                    .iter()
-                    .enumerate()
-                    .map(|(id, seg)| {
-                        json!({
-                            "id": id,
-                            "start": seg.t0_ms as f64 / 1000.0,
-                            "end": seg.t1_ms as f64 / 1000.0,
-                            "text": seg.text,
-                        })
+            let segments: Vec<Value> = timed_segments(transcript, plan)
+                .into_iter()
+                .enumerate()
+                .map(|(id, cue)| {
+                    json!({
+                        "id": id,
+                        "start": cue.start_ms as f64 / 1000.0,
+                        "end": cue.end_ms as f64 / 1000.0,
+                        "text": cue.text,
                     })
-                    .collect()
-            } else if plan.timestamps != crate::capabilities::TimestampGranularity::None
-                && !transcript.tokens.is_empty()
-            {
-                let start = transcript.tokens.first().unwrap().t0_ms as f64 / 1000.0;
-                let end = transcript.tokens.last().unwrap().t1_ms as f64 / 1000.0;
-                vec![json!({
-                    "id": 0,
-                    "start": start,
-                    "end": end,
-                    "text": transcript.text,
-                })]
-            } else {
-                Vec::new()
-            };
+                })
+                .collect();
 
             let mut body = json!({
                 "task": match plan.task {
@@ -239,7 +270,9 @@ pub fn format_response(
             }
             Formatted::Json(body)
         }
-    }
+        ResponseFormat::Srt => return subtitle_body(transcript, plan, render_srt),
+        ResponseFormat::Vtt => return subtitle_body(transcript, plan, render_vtt),
+    })
 }
 
 #[cfg(test)]
@@ -294,7 +327,7 @@ mod tests {
             ..Default::default()
         };
         let p = plan(ResponseFormat::Json, TimestampGranularity::None);
-        let out = format_response(&t, &p, 16_000, &extra());
+        let out = format_response(&t, &p, 16_000, &extra()).unwrap();
         match out {
             Formatted::Json(v) => {
                 assert_eq!(v["text"], "hello");
@@ -312,8 +345,94 @@ mod tests {
             ..Default::default()
         };
         let p = plan(ResponseFormat::Text, TimestampGranularity::None);
-        let out = format_response(&t, &p, 16_000, &extra());
+        let out = format_response(&t, &p, 16_000, &extra()).unwrap();
         assert_eq!(out, Formatted::PlainText("hello".to_string()));
+    }
+
+    fn two_segment_transcript() -> Transcript {
+        Transcript {
+            text: "Hi there. Bye now.".to_string(),
+            segments: vec![
+                Segment {
+                    t0_ms: 0,
+                    t1_ms: 1500,
+                    text: " Hi there.".to_string(),
+                    ..Default::default()
+                },
+                Segment {
+                    t0_ms: 3_600_000,
+                    t1_ms: 3_601_250,
+                    text: " Bye now.".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn srt_format_renders_the_segments_as_plain_text() {
+        let p = plan(ResponseFormat::Srt, TimestampGranularity::Segment);
+        let out = format_response(&two_segment_transcript(), &p, 16_000, &extra()).unwrap();
+        let expected = "1\n00:00:00,000 --> 00:00:01,500\nHi there.\n\n2\n01:00:00,000 --> 01:00:01,250\nBye now.\n\n";
+        assert_eq!(out, Formatted::PlainText(expected.to_string()));
+    }
+
+    #[test]
+    fn vtt_format_renders_the_segments_as_plain_text() {
+        let p = plan(ResponseFormat::Vtt, TimestampGranularity::Segment);
+        let out = format_response(&two_segment_transcript(), &p, 16_000, &extra()).unwrap();
+        let expected = "WEBVTT\n\n00:00:00.000 --> 00:00:01.500\nHi there.\n\n01:00:00.000 --> 01:00:01.250\nBye now.\n\n";
+        assert_eq!(out, Formatted::PlainText(expected.to_string()));
+    }
+
+    #[test]
+    fn subtitles_of_token_only_models_span_the_decoded_tokens() {
+        let token = |t0_ms, t1_ms, text: &str| transcribe_cpp::Token {
+            t0_ms,
+            t1_ms,
+            text: text.to_string(),
+            ..Default::default()
+        };
+        let t = Transcript {
+            text: "hello world".to_string(),
+            tokens: vec![token(400, 800, "hello"), token(900, 2100, " world")],
+            ..Default::default()
+        };
+        let p = plan(ResponseFormat::Srt, TimestampGranularity::Segment);
+        assert_eq!(
+            format_response(&t, &p, 16_000, &extra()).unwrap(),
+            Formatted::PlainText("1\n00:00:00,400 --> 00:00:02,100\nhello world\n\n".to_string())
+        );
+    }
+
+    #[test]
+    fn an_empty_transcript_gives_an_empty_srt_and_a_header_only_vtt() {
+        let t = Transcript::default();
+        let srt = plan(ResponseFormat::Srt, TimestampGranularity::Segment);
+        let vtt = plan(ResponseFormat::Vtt, TimestampGranularity::Segment);
+        assert_eq!(
+            format_response(&t, &srt, 16_000, &extra()).unwrap(),
+            Formatted::PlainText(String::new())
+        );
+        assert_eq!(
+            format_response(&t, &vtt, 16_000, &extra()).unwrap(),
+            Formatted::PlainText("WEBVTT\n\n".to_string())
+        );
+    }
+
+    #[test]
+    fn subtitles_without_any_timing_are_a_422_not_an_invented_cue() {
+        let t = Transcript {
+            text: "no timing".to_string(),
+            ..Default::default()
+        };
+        for format in [ResponseFormat::Srt, ResponseFormat::Vtt] {
+            let p = plan(format, TimestampGranularity::Segment);
+            let err = format_response(&t, &p, 16_000, &extra()).unwrap_err();
+            assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(err.code, "unsupported_capability");
+        }
     }
 
     #[test]
@@ -329,7 +448,7 @@ mod tests {
             ..Default::default()
         };
         let p = plan(ResponseFormat::VerboseJson, TimestampGranularity::Segment);
-        let out = format_response(&t, &p, 32_000, &extra());
+        let out = format_response(&t, &p, 32_000, &extra()).unwrap();
         match out {
             Formatted::Json(v) => {
                 assert_eq!(v["task"], "transcribe");
@@ -356,7 +475,7 @@ mod tests {
             ..Default::default()
         };
         let p = plan(ResponseFormat::VerboseJson, TimestampGranularity::Word);
-        let out = format_response(&t, &p, 8_000, &extra());
+        let out = format_response(&t, &p, 8_000, &extra()).unwrap();
         match out {
             Formatted::Json(v) => {
                 assert_eq!(v["words"][0]["word"], "hi");
@@ -377,13 +496,13 @@ mod tests {
 
         let mut e = extra();
         e.applied_language = Some("fr".to_string());
-        let out = format_response(&t, &p, 16_000, &e);
+        let out = format_response(&t, &p, 16_000, &e).unwrap();
         match out {
             Formatted::Json(v) => assert_eq!(v["language"], "fr"),
             _ => panic!("expected json"),
         }
 
-        let out2 = format_response(&t, &p, 16_000, &extra());
+        let out2 = format_response(&t, &p, 16_000, &extra()).unwrap();
         match out2 {
             Formatted::Json(v) => assert_eq!(v["language"], "es"),
             _ => panic!("expected json"),
@@ -394,7 +513,7 @@ mod tests {
     fn truncated_flag_only_present_when_true() {
         let t = Transcript::default();
         let p = plan(ResponseFormat::Json, TimestampGranularity::None);
-        let out = format_response(&t, &p, 16_000, &extra());
+        let out = format_response(&t, &p, 16_000, &extra()).unwrap();
         match out {
             Formatted::Json(v) => assert!(v["x_diagnostics"].get("truncated").is_none()),
             _ => panic!("expected json"),
@@ -402,7 +521,7 @@ mod tests {
 
         let mut e = extra();
         e.truncated = true;
-        let out2 = format_response(&t, &p, 16_000, &e);
+        let out2 = format_response(&t, &p, 16_000, &e).unwrap();
         match out2 {
             Formatted::Json(v) => assert_eq!(v["x_diagnostics"]["truncated"], true),
             _ => panic!("expected json"),
@@ -413,7 +532,7 @@ mod tests {
     fn language_hint_applied_key_omitted_when_no_hint_was_sent() {
         let t = Transcript::default();
         let p = plan(ResponseFormat::Json, TimestampGranularity::None);
-        let out = format_response(&t, &p, 16_000, &extra());
+        let out = format_response(&t, &p, 16_000, &extra()).unwrap();
         match out {
             Formatted::Json(v) => {
                 assert!(v["x_diagnostics"].get("language_hint_applied").is_none())
@@ -429,7 +548,7 @@ mod tests {
 
         let mut e_false = extra();
         e_false.language_hint_applied = Some(false);
-        let out = format_response(&t, &p, 16_000, &e_false);
+        let out = format_response(&t, &p, 16_000, &e_false).unwrap();
         match out {
             Formatted::Json(v) => assert_eq!(v["x_diagnostics"]["language_hint_applied"], false),
             _ => panic!("expected json"),
@@ -437,7 +556,7 @@ mod tests {
 
         let mut e_true = extra();
         e_true.language_hint_applied = Some(true);
-        let out2 = format_response(&t, &p, 16_000, &e_true);
+        let out2 = format_response(&t, &p, 16_000, &e_true).unwrap();
         match out2 {
             Formatted::Json(v) => assert_eq!(v["x_diagnostics"]["language_hint_applied"], true),
             _ => panic!("expected json"),
@@ -448,7 +567,7 @@ mod tests {
     fn timestamps_unavailable_flag_only_present_when_true() {
         let t = Transcript::default();
         let p = plan(ResponseFormat::VerboseJson, TimestampGranularity::None);
-        let out = format_response(&t, &p, 16_000, &extra());
+        let out = format_response(&t, &p, 16_000, &extra()).unwrap();
         match out {
             Formatted::Json(v) => {
                 assert!(v["x_diagnostics"].get("timestamps_unavailable").is_none())
@@ -458,7 +577,7 @@ mod tests {
 
         let mut e = extra();
         e.timestamps_unavailable = true;
-        let out2 = format_response(&t, &p, 16_000, &e);
+        let out2 = format_response(&t, &p, 16_000, &e).unwrap();
         match out2 {
             Formatted::Json(v) => assert_eq!(v["x_diagnostics"]["timestamps_unavailable"], true),
             _ => panic!("expected json"),
@@ -469,14 +588,14 @@ mod tests {
     fn target_language_diagnostic_only_present_when_translated() {
         let t = Transcript::default();
         let p = plan(ResponseFormat::Json, TimestampGranularity::None);
-        let Formatted::Json(plain) = format_response(&t, &p, 16_000, &extra()) else {
+        let Formatted::Json(plain) = format_response(&t, &p, 16_000, &extra()).unwrap() else {
             panic!("expected json");
         };
         assert!(plain["x_diagnostics"].get("target_language").is_none());
 
         let mut e = extra();
         e.target_language = Some("de".to_string());
-        let Formatted::Json(translated) = format_response(&t, &p, 16_000, &e) else {
+        let Formatted::Json(translated) = format_response(&t, &p, 16_000, &e).unwrap() else {
             panic!("expected json");
         };
         assert_eq!(translated["x_diagnostics"]["target_language"], "de");

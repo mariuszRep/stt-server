@@ -47,6 +47,10 @@ pub enum ResponseFormat {
     Json,
     Text,
     VerboseJson,
+    /// SubRip subtitles built from the segment timestamps.
+    Srt,
+    /// WebVTT subtitles built from the segment timestamps.
+    Vtt,
 }
 
 impl ResponseFormat {
@@ -55,6 +59,8 @@ impl ResponseFormat {
             "json" => Some(ResponseFormat::Json),
             "text" => Some(ResponseFormat::Text),
             "verbose_json" => Some(ResponseFormat::VerboseJson),
+            "srt" => Some(ResponseFormat::Srt),
+            "vtt" => Some(ResponseFormat::Vtt),
             _ => None,
         }
     }
@@ -409,6 +415,20 @@ pub fn plan(
                 (TimestampGranularity::None, false)
             }
         }
+        ResponseFormat::Srt | ResponseFormat::Vtt => {
+            // Subtitles are segment timestamps rendered as cues. A model that cannot
+            // produce them gets an error, not an empty or invented file, and the
+            // choice is explicit so it is never silently downgraded.
+            // `timestamp_granularities` only shapes `verbose_json` and is ignored here.
+            if !caps.supports_segment_timestamps() {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "unsupported_capability",
+                    "This model does not produce segment timestamps, so it cannot return srt or vtt",
+                ));
+            }
+            (TimestampGranularity::Segment, true)
+        }
         ResponseFormat::Json | ResponseFormat::Text => (TimestampGranularity::None, false),
     };
 
@@ -534,6 +554,15 @@ mod tests {
             prompt_max_tokens: None,
             timestamp_granularity_rejected: false,
             supports_streaming: false,
+            ..Default::default()
+        })
+    }
+
+    fn no_timestamps_caps() -> EffectiveCaps {
+        EffectiveCaps::new(LoadedCaps {
+            arch: "canary".to_string(),
+            languages: vec!["en".to_string()],
+            max_timestamp_kind: TimestampGranularity::None,
             ..Default::default()
         })
     }
@@ -1033,12 +1062,58 @@ mod tests {
     // --- response_format --------------------------------------------------
 
     #[test]
-    fn srt_response_format_is_422() {
+    fn an_unknown_response_format_is_422() {
         let mut r = req();
-        r.response_format = Some("srt".to_string());
+        r.response_format = Some("diarized_json".to_string());
         let err = plan(&r, &whisper_caps(), Endpoint::Transcriptions, None).unwrap_err();
         assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(err.code, "unsupported_capability");
+    }
+
+    #[test]
+    fn srt_and_vtt_plan_explicit_segment_timestamps_on_both_endpoints() {
+        for format in ["srt", "vtt"] {
+            for endpoint in [Endpoint::Transcriptions, Endpoint::Translations] {
+                let mut r = req();
+                r.response_format = Some(format.to_string());
+                let p = plan(&r, &whisper_caps(), endpoint, None).unwrap();
+                assert_eq!(p.timestamps, TimestampGranularity::Segment, "{format}");
+                assert!(p.timestamps_explicit, "{format}");
+                assert_eq!(
+                    p.response_format,
+                    if format == "srt" {
+                        ResponseFormat::Srt
+                    } else {
+                        ResponseFormat::Vtt
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn srt_and_vtt_ignore_timestamp_granularities() {
+        let mut r = req();
+        r.response_format = Some("srt".to_string());
+        r.timestamp_granularities = vec!["word".to_string()];
+        let p = plan(&r, &whisper_caps(), Endpoint::Transcriptions, None).unwrap();
+        assert_eq!(p.timestamps, TimestampGranularity::Segment);
+    }
+
+    #[test]
+    fn srt_and_vtt_are_422_on_a_model_without_segment_timestamps() {
+        for format in ["srt", "vtt"] {
+            let mut r = req();
+            r.response_format = Some(format.to_string());
+            let err = plan(&r, &no_timestamps_caps(), Endpoint::Transcriptions, None).unwrap_err();
+            assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(err.code, "unsupported_capability");
+            assert!(
+                err.message.contains("segment timestamps"),
+                "{}",
+                err.message
+            );
+        }
     }
 
     // --- to_run_options -----------------------------------------------------

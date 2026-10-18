@@ -519,6 +519,12 @@ impl EffectiveCaps {
             }
         };
 
+        // Subtitles are rendered from segment timestamps, so they follow that control.
+        let subtitles = if matches!(timestamp_granularity.status, Status::Supported) {
+            "supported"
+        } else {
+            "unsupported"
+        };
         json!({
             "prompt": prompt_vocab.to_json(),
             "temperature": temperature.to_json(),
@@ -533,7 +539,7 @@ impl EffectiveCaps {
             "long_form": feature(self.loaded.supports_long_form).to_json(),
             "spec_decode": feature(self.loaded.supports_spec_decode).to_json(),
             "native_sample_rate": native_sample_rate.to_json(),
-            "response_formats": {"json": "supported", "text": "supported", "verbose_json": "supported", "srt": "unsupported", "vtt": "unsupported"},
+            "response_formats": {"json": "supported", "text": "supported", "verbose_json": "supported", "srt": subtitles, "vtt": subtitles},
             "feature_initial_prompt_flag": self.loaded.feature_initial_prompt_flag,
             "whisper_ext_accepted": self.loaded.whisper_ext_accepted,
             "arch": self.loaded.arch,
@@ -750,6 +756,22 @@ mod tests {
         assert_eq!(json["itn"]["status"], "supported");
         assert_eq!(json["punctuation"]["status"], "unsupported");
         assert_eq!(json["spec_decode"]["status"], "unsupported");
+    }
+
+    #[test]
+    fn subtitle_formats_follow_segment_timestamps() {
+        let with = EffectiveCaps::new(loaded_whisper()).to_json();
+        assert_eq!(with["response_formats"]["srt"], "supported");
+        assert_eq!(with["response_formats"]["vtt"], "supported");
+        let mut none = loaded_non_whisper();
+        none.max_timestamp_kind = TimestampGranularity::None;
+        let without = EffectiveCaps::new(none).to_json();
+        assert_eq!(without["response_formats"]["srt"], "unsupported");
+        assert_eq!(without["response_formats"]["vtt"], "unsupported");
+        let mut rejected = loaded_whisper();
+        rejected.timestamp_granularity_rejected = true;
+        let rejected = EffectiveCaps::new(rejected).to_json();
+        assert_eq!(rejected["response_formats"]["srt"], "unsupported");
     }
 
     #[test]

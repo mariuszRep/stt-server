@@ -582,7 +582,7 @@ fn custom_model_view(installed: &crate::store::InstalledFile) -> Value {
         "translation": {"status": "unknown"},
         "timestamp_granularity": {"status": "unknown"},
         "streaming": {"status": if claims["streaming"] == true { "unknown" } else { "unsupported" }},
-        "response_formats": {"json": "supported", "text": "unsupported", "verbose_json": "unsupported"},
+        "response_formats": {"json": "supported", "text": "unsupported", "verbose_json": "unsupported", "srt": "unknown", "vtt": "unknown"},
     });
     crate::capabilities::add_unverified_engine_controls(&mut effective_capabilities);
     json!({
@@ -671,7 +671,7 @@ fn callable_capabilities(app: &App, id: &str, catalog_fallback: Option<Value>) -
             "translation": {"status": "unknown"},
             "timestamp_granularity": {"status": "unknown"},
             "streaming": {"status": "unsupported"},
-            "response_formats": {"json": "supported", "text": "unsupported", "verbose_json": "unsupported"},
+            "response_formats": {"json": "supported", "text": "unsupported", "verbose_json": "unsupported", "srt": "unknown", "vtt": "unknown"},
         });
         crate::capabilities::add_unverified_engine_controls(&mut unknown);
         unknown
@@ -1582,7 +1582,7 @@ async fn transcribe_or_translate(
         target_language: plan.target_language.clone(),
     };
 
-    let formatted = format_response(&transcript, &plan, samples, &extra);
+    let formatted = format_response(&transcript, &plan, samples, &extra)?;
     Ok(formatted_into_response(formatted))
 }
 
@@ -1602,7 +1602,7 @@ pub async fn translations(
     transcribe_or_translate(app, headers, multipart, Endpoint::Translations).await
 }
 
-fn invalid_vad_request(message: impl Into<String>) -> ApiError {
+fn invalid_request(message: impl Into<String>) -> ApiError {
     ApiError::new(
         StatusCode::BAD_REQUEST,
         "invalid_request_error",
@@ -1620,9 +1620,56 @@ fn vad_option<T: std::str::FromStr>(
         .map(|raw| {
             raw.trim()
                 .parse()
-                .map_err(|_| invalid_vad_request(format!("{name} must be a number")))
+                .map_err(|_| invalid_request(format!("{name} must be a number")))
         })
         .transpose()
+}
+
+/// The multipart shape of the offline audio endpoints: a required `file` plus text fields from
+/// `allowed`, each at most once, and the repeatable text fields from `lists` (any number of
+/// times, in order); anything else is a 400.
+struct AudioForm {
+    file: Vec<u8>,
+    options: std::collections::HashMap<String, String>,
+    lists: std::collections::HashMap<String, Vec<String>>,
+}
+
+async fn read_audio_form(
+    mut multipart: Multipart,
+    allowed: &[&str],
+    lists: &[&str],
+) -> ApiResult<AudioForm> {
+    let mut file: Option<Vec<u8>> = None;
+    let mut options = std::collections::HashMap::new();
+    let mut listed: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    while let Some(field) = multipart.next_field().await.map_err(invalid_multipart)? {
+        let name = field.name().unwrap_or("").to_owned();
+        if name == "file" {
+            if file.is_some() {
+                return Err(duplicate_field("file"));
+            }
+            file = Some(field.bytes().await.map_err(invalid_multipart)?.to_vec());
+        } else if allowed.contains(&name.as_str()) {
+            let text = field.text().await.map_err(invalid_multipart)?;
+            if options.insert(name.clone(), text).is_some() {
+                return Err(duplicate_field(&name));
+            }
+        } else if lists.contains(&name.as_str()) {
+            let text = field.text().await.map_err(invalid_multipart)?;
+            listed.entry(name).or_default().push(text);
+        } else {
+            return Err(invalid_request(format!("Field {name} is not supported")));
+        }
+    }
+    let file = file.ok_or_else(|| {
+        ApiError::new(StatusCode::BAD_REQUEST, "missing_file", "file is required")
+    })?;
+    Ok(AudioForm {
+        file,
+        options,
+        lists: listed,
+    })
 }
 
 /// `POST /v1/audio/vad`: speech segments of a finished recording. A local extension (OpenAI has
@@ -1631,36 +1678,20 @@ fn vad_option<T: std::str::FromStr>(
 pub async fn audio_vad(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
-    mut multipart: Multipart,
+    multipart: Multipart,
 ) -> ApiResult<Json<Value>> {
     authorize(&headers, &app, AccessLevel::User)?;
-    let mut file: Option<Vec<u8>> = None;
-    let mut options = std::collections::HashMap::new();
-    while let Some(field) = multipart.next_field().await.map_err(invalid_multipart)? {
-        let name = field.name().unwrap_or("").to_owned();
-        match name.as_str() {
-            "file" => {
-                if file.is_some() {
-                    return Err(duplicate_field("file"));
-                }
-                file = Some(field.bytes().await.map_err(invalid_multipart)?.to_vec());
-            }
-            "threshold" | "min_speech_ms" | "min_silence_ms" | "speech_pad_ms" => {
-                let text = field.text().await.map_err(invalid_multipart)?;
-                if options.insert(name.clone(), text).is_some() {
-                    return Err(duplicate_field(&name));
-                }
-            }
-            other => {
-                return Err(invalid_vad_request(format!(
-                    "Field {other} is not supported"
-                )))
-            }
-        }
-    }
-    let file = file.ok_or_else(|| {
-        ApiError::new(StatusCode::BAD_REQUEST, "missing_file", "file is required")
-    })?;
+    let AudioForm { file, options, .. } = read_audio_form(
+        multipart,
+        &[
+            "threshold",
+            "min_speech_ms",
+            "min_silence_ms",
+            "speech_pad_ms",
+        ],
+        &[],
+    )
+    .await?;
     let defaults = crate::vad::Params::default();
     let params = crate::vad::Params {
         threshold: vad_option(&options, "threshold")?.unwrap_or(defaults.threshold),
@@ -1668,11 +1699,146 @@ pub async fn audio_vad(
         min_silence_ms: vad_option(&options, "min_silence_ms")?.unwrap_or(defaults.min_silence_ms),
         speech_pad_ms: vad_option(&options, "speech_pad_ms")?.unwrap_or(defaults.speech_pad_ms),
     };
-    params.validate().map_err(invalid_vad_request)?;
+    params.validate().map_err(invalid_request)?;
 
     let _slot = app.vad_slots.acquire().await.map_err(internal)?;
     let report = tokio::task::spawn_blocking(move || {
         decode_wav(&file).map(|samples| crate::vad::report(&samples, &params))
+    })
+    .await
+    .map_err(internal)??;
+    Ok(Json(report))
+}
+
+/// `POST /v1/audio/embeddings`: a speaker embedding ("voice fingerprint") per speech segment of
+/// a finished recording. A local extension (OpenAI's `/v1/embeddings` is for text) that needs no
+/// loaded model; like the VAD it runs beside the inference queue, on its own slots.
+pub async fn audio_embeddings(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> ApiResult<Json<Value>> {
+    authorize(&headers, &app, AccessLevel::User)?;
+    let AudioForm { file, options, .. } =
+        read_audio_form(multipart, &["segments", "encoding_format"], &[]).await?;
+    let encoding = match options.get("encoding_format").map(|raw| raw.trim()) {
+        None | Some("float") => crate::speaker::Encoding::Float,
+        Some("base64") => crate::speaker::Encoding::Base64,
+        Some(_) => {
+            return Err(invalid_request("encoding_format must be float or base64"));
+        }
+    };
+    let segments = options
+        .get("segments")
+        .map(|raw| crate::speaker::parse_segments(raw))
+        .transpose()
+        .map_err(invalid_request)?;
+
+    let _slot = app.speaker_slots.acquire().await.map_err(internal)?;
+    let report = tokio::task::spawn_blocking(move || {
+        decode_wav(&file)
+            .map(|samples| crate::speaker::report(&samples, segments.as_deref(), encoding))
+    })
+    .await
+    .map_err(internal)??;
+    Ok(Json(report))
+}
+
+/// `POST /v1/audio/diarize`: who spoke when in a finished recording, shaped like OpenAI's
+/// `diarized_json` segments but without text. A local extension: CPU only, beside the inference
+/// queue, on its own slot.
+pub async fn audio_diarize(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> ApiResult<Json<Value>> {
+    use crate::speaker::diarize;
+    authorize(&headers, &app, AccessLevel::User)?;
+    let AudioForm {
+        file,
+        options,
+        mut lists,
+    } = read_audio_form(
+        multipart,
+        &["segments", "threshold", "max_speakers"],
+        &[
+            "known_speaker_names[]",
+            "known_speaker_embeddings[]",
+            "known_speaker_references[]",
+        ],
+    )
+    .await?;
+    let segments = options
+        .get("segments")
+        .map(|raw| crate::speaker::parse_segments(raw))
+        .transpose()
+        .map_err(invalid_request)?;
+    let threshold = options
+        .get("threshold")
+        .map_or(Ok(diarize::DEFAULT_THRESHOLD), |raw| {
+            diarize::parse_threshold(raw)
+        })
+        .map_err(invalid_request)?;
+    let max_speakers = options
+        .get("max_speakers")
+        .map_or(Ok(diarize::MAX_SPEAKERS), |raw| {
+            diarize::parse_max_speakers(raw)
+        })
+        .map_err(invalid_request)?;
+    let mut take = |name: &str| lists.remove(name).unwrap_or_default();
+    let (names, embeddings, references) = (
+        take("known_speaker_names[]"),
+        take("known_speaker_embeddings[]"),
+        take("known_speaker_references[]"),
+    );
+    diarize::check_known_lists(&names, &embeddings, &references).map_err(invalid_request)?;
+    let names = diarize::parse_names(&names).map_err(invalid_request)?;
+    let profiles = embeddings
+        .iter()
+        .enumerate()
+        .map(|(index, raw)| {
+            diarize::parse_embedding(raw)
+                .map_err(|e| invalid_request(format!("known_speaker_embeddings[][{index}]: {e}")))
+        })
+        .collect::<ApiResult<Vec<_>>>()?;
+    let clips = references
+        .iter()
+        .enumerate()
+        .map(|(index, raw)| {
+            diarize::parse_reference(raw)
+                .map_err(|e| invalid_request(format!("known_speaker_references[][{index}]: {e}")))
+        })
+        .collect::<ApiResult<Vec<_>>>()?;
+
+    let _slot = app.diarize_slots.acquire().await.map_err(internal)?;
+    let report = tokio::task::spawn_blocking(move || {
+        let embedded = clips
+            .iter()
+            .enumerate()
+            .map(|(index, clip)| {
+                let reference_error = |detail: String| {
+                    invalid_request(format!("known_speaker_references[][{index}]: {detail}"))
+                };
+                let samples = decode_wav(clip).map_err(|e| reference_error(e.message))?;
+                diarize::reference_embedding(&samples).map_err(reference_error)
+            })
+            .collect::<ApiResult<Vec<_>>>()?;
+        let known = names
+            .into_iter()
+            .zip(profiles.into_iter().chain(embedded))
+            .map(|(name, embedding)| diarize::KnownSpeaker { name, embedding })
+            .collect();
+        decode_wav(&file).map(|samples| {
+            diarize::report(
+                &samples,
+                &diarize::Request {
+                    segments,
+                    threshold,
+                    max_speakers,
+                    known,
+                },
+            )
+        })
     })
     .await
     .map_err(internal)??;
@@ -1732,6 +1898,14 @@ pub fn router(app: Arc<App>) -> Router {
         .route(
             "/v1/audio/vad",
             post(audio_vad).layer(DefaultBodyLimit::max(40 * 1024 * 1024)),
+        )
+        .route(
+            "/v1/audio/embeddings",
+            post(audio_embeddings).layer(DefaultBodyLimit::max(40 * 1024 * 1024)),
+        )
+        .route(
+            "/v1/audio/diarize",
+            post(audio_diarize).layer(DefaultBodyLimit::max(40 * 1024 * 1024)),
         )
         .route("/v1/realtime", get(crate::realtime::realtime))
         .route("/v1/local/system", get(system_info))
@@ -3417,6 +3591,60 @@ mod router_tests {
     }
 
     #[tokio::test]
+    async fn embeddings_fingerprint_the_requested_segments() {
+        let segments = r#"[{"start": 0.3, "end": 2.9}, {"start": 3.0, "end": 3.2}]"#;
+        let (status, body) = post_wav_fields(
+            "/v1/audio/embeddings",
+            SPEECH_WAV,
+            &[("segments", segments)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["model"], "campplus-voxceleb-v1");
+        assert_eq!(body["dim"], 512);
+        assert_eq!(body["duration"], 6.165);
+        let entries = body["segments"].as_array().unwrap();
+        assert_eq!(entries[0]["embedding"].as_array().unwrap().len(), 512);
+        assert!(entries[1]["embedding"].is_null());
+    }
+
+    #[tokio::test]
+    async fn embeddings_reject_bad_parameters_with_invalid_request_error() {
+        for fields in [
+            ("encoding_format", "hex"),
+            ("segments", "not json"),
+            ("segments", r#"[{"start": 2, "end": 1}]"#),
+            ("unknown", "1"),
+        ] {
+            let (status, body) = post_audio_fields("/v1/audio/embeddings", &[fields]).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{fields:?}");
+            assert_eq!(body["error"]["code"], "invalid_request_error", "{fields:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn diarize_labels_the_speech_fixture_and_rejects_bad_parameters() {
+        let (status, body) = post_wav_fields("/v1/audio/diarize", SPEECH_WAV, &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["duration"], 6.165);
+        let segments = body["segments"].as_array().unwrap();
+        assert!(!segments.is_empty());
+        assert_eq!(segments[0]["type"], "transcript.text.segment");
+        assert_eq!(segments[0]["speaker"], "A");
+        for fields in [
+            ("threshold", "2"),
+            ("max_speakers", "0"),
+            ("segments", "not json"),
+            ("known_speaker_names[]", "Ann"),
+            ("unknown", "1"),
+        ] {
+            let (status, body) = post_audio_fields("/v1/audio/diarize", &[fields]).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{fields:?}");
+            assert_eq!(body["error"]["code"], "invalid_request_error", "{fields:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn vad_from_the_lan_without_a_token_is_unauthorized() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
         let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
@@ -3453,7 +3681,7 @@ mod router_tests {
     }
 
     #[tokio::test]
-    async fn system_info_reports_the_vad_engine() {
+    async fn system_info_reports_the_vad_embedding_and_diarization_engines() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
         let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
@@ -3467,6 +3695,14 @@ mod router_tests {
         assert_eq!(
             body["vad"],
             json!({"engine": "silero-v5", "sample_rate": 16000})
+        );
+        assert_eq!(
+            body["speaker_embedding"],
+            json!({"engine": "campplus-voxceleb-v1", "dim": 512, "sample_rate": 16000})
+        );
+        assert_eq!(
+            body["diarization"],
+            json!({"engine": "campplus-voxceleb-v1-average-linkage", "max_speakers": 26})
         );
         drop(app);
         std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
@@ -3524,6 +3760,32 @@ mod router_tests {
                 assert_eq!(body["error"]["code"], "server_not_ready");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn subtitle_formats_are_accepted_on_both_endpoints_and_reach_the_model_check() {
+        for uri in ["/v1/audio/transcriptions", "/v1/audio/translations"] {
+            for format in ["srt", "vtt"] {
+                let (status, body) = post_audio_fields(uri, &[("response_format", format)]).await;
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri} {format}");
+                assert_eq!(body["error"]["code"], "server_not_ready");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn subtitle_text_is_served_as_plain_text() {
+        let body = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHi\n\n";
+        let response = formatted_into_response(Formatted::PlainText(body.to_string()));
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(bytes, body.as_bytes());
     }
 
     #[tokio::test]

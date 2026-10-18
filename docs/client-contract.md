@@ -176,7 +176,7 @@ where to drop files should read `GET /v1/local/config`'s
   | Level | Routes |
   |---|---|
   | Unauthenticated | `GET /health` |
-  | User (admin token also works) | `GET /readiness`, `GET /v1/models`, `GET /models/manage`, `GET /models/manage/default`, `GET /v1/local/system`, `GET /models/manage/recommendations`, `GET /models/manage/operations/{id}`, `POST /v1/audio/transcriptions`, `POST /v1/audio/translations`, `POST /v1/audio/vad` (section 5b), `GET /v1/realtime` (WebSocket, section 5a) |
+  | User (admin token also works) | `GET /readiness`, `GET /v1/models`, `GET /models/manage`, `GET /models/manage/default`, `GET /v1/local/system`, `GET /models/manage/recommendations`, `GET /models/manage/operations/{id}`, `POST /v1/audio/transcriptions`, `POST /v1/audio/translations`, `POST /v1/audio/vad` (section 5b), `POST /v1/audio/embeddings` (section 5c), `GET /v1/realtime` (WebSocket, section 5a) |
   | Admin only | `GET`/`PATCH /v1/local/config`, `POST /models/manage/{id}/download`, `POST /models/manage/{id}/verify`, `POST /models/manage/{id}/default` (set default and load), `DELETE /models/manage/default` (unload and forget the default), `POST /models/manage/unload` (unload, keep the default; section 4), `DELETE /models/manage/{id}` (remove), `POST /models/manage/refresh` (drop-in refresh), `POST /models/manage/import`, `POST /models/manage/import-user` (copy another install's models in; see section 1.4), `POST /models/manage/operations/{id}/cancel`, `POST /v1/local/shutdown` |
 
   The CLI (`stt-server models ...`, `status`, `stop`, `update`, ...)
@@ -672,8 +672,8 @@ returned**, only a client starting a new operation call does:
 | `language` | no | BCP-47-ish hint; omit unless the selected model's `language_hint` capability is `supported` |
 | `prompt` | no | opaque, verbatim text; omit unless `prompt` capability is `supported` |
 | `temperature` | no | `0.0..=1.0`; omit unless `temperature` capability is `supported` |
-| `response_format` | no | `json` (default) \| `text` \| `verbose_json` |
-| `timestamp_granularities` (repeatable) | no | `word` \| `segment`; only meaningful with `verbose_json`; omit `word` unless `word_timestamps` capability is `supported` |
+| `response_format` | no | `json` (default) \| `text` \| `verbose_json` \| `srt` \| `vtt` (subtitles, see Subtitle formats below) |
+| `timestamp_granularities` (repeatable) | no | `word` \| `segment`; only meaningful with `verbose_json` (ignored with `srt`/`vtt`); omit `word` unless `word_timestamps` capability is `supported` |
 | `priority` | no | **Extension.** `normal` (default) or `interactive`. Interactive requests are served before waiting normal ones, FIFO within each class; see 4.3. Any other value is `400 invalid_priority`. |
 | `target_language` | no | **`/v1/audio/translations` only** (extension, see below). The language to translate into; default `en`. On `/v1/audio/transcriptions` it is an unknown field. |
 
@@ -743,6 +743,30 @@ follows that, with documented extensions:
 `text` only for `response_format: "text"` (plain body, not JSON). For
 `verbose_json`, the same shape as `json` with `segments` (and `words`, if
 timestamps allow) always populated.
+
+### Subtitle formats (`srt`, `vtt`)
+
+`response_format=srt` or `vtt` works on both endpoints and returns the subtitle file as the body
+with `Content-Type: text/plain; charset=utf-8` (as OpenAI does; no `x_diagnostics`). One cue per
+segment the engine returns, so the cue timing and text are the `verbose_json` segments':
+
+- `srt`: numbered cues, `HH:MM:SS,mmm --> HH:MM:SS,mmm`, the text lines, a blank line after each
+  cue. Text is written verbatim apart from trimming and dropping blank lines.
+- `vtt`: the `WEBVTT` header and a blank line, then `HH:MM:SS.mmm --> HH:MM:SS.mmm` cues with `&`,
+  `<` and `>` escaped as entities.
+- Hours are not capped (`01:02:03,456`, `100:00:00,000`); a cue whose end precedes its start is
+  clamped to a zero-length cue; segments with no text are skipped and the numbering stays dense.
+- Silence gives an empty `srt` body and a header-only `vtt` body.
+- Models whose timestamp ceiling is `token` (gigaam, medasr) return no segments, so, as in
+  `verbose_json`, one cue spans the decoded tokens.
+- A model with no segment timestamps (`timestamp_granularity` unsupported) is
+  `422 unsupported_capability` ("... does not produce segment timestamps ..."), never an empty or
+  invented file; the same code comes back if a model that should have produced timing returned none
+  for text it recognised. There is no silent downgrade: the timestamps are an explicit request.
+- Capabilities: `response_formats.srt` and `.vtt` in the capability view are `supported` when the
+  loaded model supports segment timestamps, `unsupported` when it does not, and `unknown` for a
+  model that is not loaded (catalog claims it can, or custom model).
+- `timestamp_granularities` is ignored with these formats.
 
 ### `x_diagnostics` (present on every JSON response)
 
@@ -922,6 +946,141 @@ client, which owns the microphone.
 - **Discovery:** `GET /v1/local/system` reports `vad: {engine, sample_rate}` (section 8).
   `/v1/realtime` is unchanged.
 
+## 5c. Speaker embeddings (local extension)
+
+`POST /v1/audio/embeddings` returns a speaker embedding (a "voice fingerprint") for each speech
+segment of a finished recording. OpenAI's `/v1/embeddings` is for text and has no audio
+equivalent, so this is a local extension that an OpenAI-compatible client never calls. It is the
+groundwork for speaker separation: embeddings say how alike two stretches of speech sound, which
+a client uses to match a voice against saved profiles or to cluster a recording by speaker. The
+server does not decide who is who; the SDK has the comparison helpers (`cosineSimilarity`,
+`matchSpeaker`, `clusterSpeakers`).
+
+- **Auth and limits:** exactly as section 5b: user token (the admin token also works),
+  `multipart/form-data`, 40 MiB body, `file` decoded and converted to 16 kHz mono as for
+  transcription. It needs no loaded model, never enters the inference queue (section 4.3), runs on
+  the CPU only and never touches the GPU; at most two requests run at once, the rest wait for a
+  slot.
+- **Fields:** `file` (required) and optional text fields:
+
+  | Field | Default | Meaning |
+  |---|---|---|
+  | `segments` | the server's own speech detection | JSON array `[{"start": 0.3, "end": 2.9}, ...]`, seconds from the start of the audio; other keys are ignored. At most 1000 entries, each with `start >= 0` and `end > start`. An `end` past the audio is clamped. |
+  | `encoding_format` | `float` | `float` (JSON numbers) or `base64` (the little-endian `f32` bytes, a third of the size). |
+
+  Without `segments` the server runs the same detection as `POST /v1/audio/vad` with its default
+  parameters and embeds every segment it finds. A duplicate field is `400 duplicate_field`, a
+  missing `file` `400 missing_file`, an unknown field, a bad `encoding_format` or malformed
+  `segments` `400 invalid_request_error`; a bad WAV gets the usual `invalid_audio` /
+  `unsupported_audio` / `audio_too_short` / `audio_too_long`.
+- **Response** (abridged; each embedding has `dim` entries):
+
+  ```json
+  { "model": "campplus-voxceleb-v1", "dim": 512, "duration": 11.67,
+    "segments": [ { "start": 0.0,   "end": 2.535, "embedding": [0.0213, -0.0087, ...] },
+                  { "start": 2.935, "end": 5.77,  "embedding": [-0.0102, 0.0341, ...] },
+                  { "start": 6.0,   "end": 6.3,   "embedding": null } ] }
+  ```
+
+  `start` and `end` echo the requested segment (or the detected one), rounded to milliseconds.
+  A segment shorter than 0.5 s, or one that starts beyond the end of the audio, has
+  `"embedding": null`. Embeddings are unit vectors, so cosine similarity is their dot product.
+  `model` names the embedding space: vectors of different models never compare, so a client that
+  saves voice profiles stores `model` with them and discards them when it changes.
+- **Long segments:** a segment up to 3 s is embedded whole. A longer one is cut into 3 s windows
+  every 1.5 s (the last aligned to the end), and the window embeddings are averaged and
+  normalised again; one request uses at most four threads for the windows.
+- **How alike:** with this model, two stretches of the same voice usually score a cosine similarity
+  of 0.5 and up and different voices 0.3 and below (the repository's two-voice fixture: 0.70-0.88
+  against 0.26-0.30). The model's published verification threshold is about 0.4.
+- **Engine:** CAM++ trained on VoxCeleb ([3D-Speaker](https://github.com/modelscope/3D-Speaker),
+  Apache-2.0; the `iic/speech_campplus_sv_en_voxceleb_16k` checkpoint), reimplemented in pure Rust
+  in `src/speaker/`: Kaldi-style 80-bin log-mel filterbank, per-recording mean subtraction, the
+  CAM++ forward pass, L2 normalisation. The weights are embedded in the executable as `f16` (about
+  14 MB); no ONNX runtime is linked. Tests pin the features to PyTorch's within 1e-3 and the
+  embeddings to a cosine similarity of at least 0.9999 (measured 0.999995) on a speech fixture,
+  normal and attenuated. Speed in a release build on a 12-thread machine: 60 s of audio in about
+  3 s (real-time factor 0.05; about 0.16 on one thread).
+- **Discovery:** `GET /v1/local/system` reports `speaker_embedding: {engine, dim, sample_rate}`
+  (section 8). A client that finds the key absent is talking to an older server.
+- **Diarization:** `POST /v1/audio/diarize` (section 5d) builds on these embeddings and returns who
+  spoke when by itself.
+
+## 5d. Diarization: who spoke when (local extension)
+
+`POST /v1/audio/diarize` splits a finished recording by speaker. It is a local extension that an
+OpenAI-compatible client never has to call, but its answer follows OpenAI's `diarized_json`
+(`gpt-4o-transcribe-diarize` on `/v1/audio/transcriptions`, verified against the OpenAI
+speech-to-text guide and API reference 2026-10-18): a `segments` array whose entries are
+`{"type": "transcript.text.segment", "id", "start", "end", "speaker"}` (OpenAI adds `text`), where
+`speaker` is a label such as "A" and, when known speakers are given, one of their names. A parser
+written for OpenAI's segments reads this response unchanged.
+
+**It carries no text.** This endpoint answers who spoke when; it does not transcribe. Combining
+diarization and transcription in one call (a `text` per segment) is a later option; until then a
+client transcribes the recording (or each segment) with `/v1/audio/transcriptions` and joins the
+two by time.
+
+- **Auth and limits:** exactly as section 5c: user token (the admin token also works),
+  `multipart/form-data`, 40 MiB body, `file` decoded and converted to 16 kHz mono as for
+  transcription. It needs no loaded model, never enters the inference queue (section 4.3), runs on
+  the CPU only and never touches the GPU. Its own slot limit: one diarization at a time, the rest
+  wait (separate from the embedding and VAD slots).
+- **Fields:** `file` (required) and optional text fields, all validated before any audio work:
+
+  | Field | Default | Range | Meaning |
+  |---|---|---|---|
+  | `segments` | the server's own speech detection | as section 5c | The speech to label, `[{"start", "end"}, ...]` in seconds. |
+  | `threshold` | 0.4 | 0.05-0.95 | Cosine similarity at which two voices count as one speaker: clusters merge while their average similarity is at least this. Also the least similarity for a cluster to be matched to a known speaker. |
+  | `max_speakers` | 26 | 1-26 | Clusters keep merging past `threshold` until at most this many remain. |
+  | `known_speaker_names[]` | none | up to 26, each 1-64 characters, distinct | Names for voices the caller knows (OpenAI's field). |
+  | `known_speaker_embeddings[]` | none | one per name | Base64 of 512 little-endian `f32` values, exactly what `POST /v1/audio/embeddings` returns with `encoding_format=base64` (our extension: save a voice profile once, reuse it). |
+  | `known_speaker_references[]` | none | one per name, at most 4 | A WAV clip of 2-10 s of that person speaking, as a `data:audio/wav;base64,...` URL (OpenAI's form) or plain base64; the server embeds it itself. |
+
+  The three `known_speaker_*[]` fields repeat once per speaker, in the same order. Send either the
+  embeddings or the reference clips, not both; each name needs exactly one of them. A duplicate
+  `file`, `segments`, `threshold` or `max_speakers` is `400 duplicate_field`, a missing `file`
+  `400 missing_file`; an unknown field, a value out of range, lists of different lengths, a
+  malformed embedding, or a reference clip that is no WAV or not 2-10 s is
+  `400 invalid_request_error`; a bad main WAV gets the usual `invalid_audio` /
+  `unsupported_audio` / `audio_too_short` / `audio_too_long`. OpenAI's `response_format`, `model`,
+  `chunking_strategy` and `prompt` are not accepted (there is one response shape and one engine,
+  no chunking beyond the ten-minute maximum, and nothing to prompt).
+- **Response** (the repository's two-voice fixture, segments given):
+
+  ```json
+  { "model": "campplus-voxceleb-v1-average-linkage", "duration": 11.67,
+    "segments": [ { "type": "transcript.text.segment", "id": "seg_0", "start": 0.0,   "end": 2.535, "speaker": "A" },
+                  { "type": "transcript.text.segment", "id": "seg_1", "start": 2.935, "end": 5.77,  "speaker": "B" },
+                  { "type": "transcript.text.segment", "id": "seg_2", "start": 6.17,  "end": 8.885, "speaker": "A" },
+                  { "type": "transcript.text.segment", "id": "seg_3", "start": 9.285, "end": 11.67, "speaker": "B" } ] }
+  ```
+
+  Segments keep the order of the input (or of the time); `id` counts the returned segments from
+  0; times are seconds rounded to milliseconds. A segment shorter than 0.5 s cannot be
+  fingerprinted and is **left out** of the answer. Unnamed speakers are "A", "B", ... in order of
+  first appearance; a label equal to a known name is skipped.
+- **Pipeline:** speech segments (given, or section 5b's detection with default parameters) ->
+  a CAM++ embedding per segment (section 5c) -> average-linkage agglomerative clustering with
+  cosine similarity -> one label per cluster. A cluster is represented by the normalised mean of
+  its segment embeddings; each known speaker is matched to the most similar cluster that reaches
+  `threshold`, the best pairs first and every name and every cluster at most once. A known speaker
+  who is not in the recording simply does not appear.
+- **One algorithm in two languages:** the clustering is implemented once per language, in Rust
+  (`src/speaker/cluster.rs`) and in stt-sdk (`clusterSpeakers` in `src/speakers.ts`), and the two are
+  identical: same merge order (highest mean pairwise similarity first, ties to the earlier
+  clusters), same stopping rule, labels in order of first appearance. Both are tested against the
+  same cases (`tests/fixtures/cluster-golden.json`, copied into stt-sdk's `test/fixtures/`); change
+  them together. The SDK's `diarize()` calls this endpoint; it does not cluster by itself.
+- **Discovery:** `GET /v1/local/system` reports `diarization: {engine, max_speakers}`
+  (section 8); `engine` is also the `model` of the responses. A client that finds the key absent is
+  talking to an older server.
+- **Accuracy:** the repository's synthetic two-voice recording (two Windows voices alternating) is
+  split into exactly its two speakers, by given segments and by the server's own detection. Real
+  conversations are harder (overlapping speech is not handled, a very short turn gives too little
+  voice to cluster, similar voices may need a higher `threshold`): tune `threshold` and
+  `max_speakers` rather than expect a perfect split.
+
 ## 6. Error envelope and codes
 
 Every non-2xx JSON error:
@@ -937,7 +1096,7 @@ source (`src/api.rs`, `src/audio.rs`, `src/auth.rs`, `src/catalog.rs`,
 
 | Status | Codes |
 |---|---|
-| 400 | `invalid_request_error` (`/v1/audio/vad` only: an out-of-range or non-numeric parameter, or an unknown field -- section 5b), `missing_file`, `missing_model`, `duplicate_field`, `unexpected_field`, `invalid_multipart`, `invalid_body`, `invalid_audio`, `unsupported_audio`, `audio_too_short`, `invalid_temperature`, `invalid_priority`, `invalid_bind_host`, `invalid_bind_port`, `invalid_network_mode`, `invalid_cors_origins`, `invalid_queue_max_waiting`, `invalid_queue_wait_timeout_ms`, `invalid_inference_timeout_ms`, `invalid_user_models_dir`, `invalid_model`, `invalid_quant`, `invalid_backend` |
+| 400 | `invalid_request_error` (`/v1/audio/vad` and `/v1/audio/embeddings` only: an out-of-range or non-numeric parameter, a malformed `segments`, or an unknown field -- sections 5b and 5c), `missing_file`, `missing_model`, `duplicate_field`, `unexpected_field`, `invalid_multipart`, `invalid_body`, `invalid_audio`, `unsupported_audio`, `audio_too_short`, `invalid_temperature`, `invalid_priority`, `invalid_bind_host`, `invalid_bind_port`, `invalid_network_mode`, `invalid_cors_origins`, `invalid_queue_max_waiting`, `invalid_queue_wait_timeout_ms`, `invalid_inference_timeout_ms`, `invalid_user_models_dir`, `invalid_model`, `invalid_quant`, `invalid_backend` |
 | 401 | `unauthorized` |
 | 403 | `loopback_only` (`/v1/local/shutdown` from a non-loopback caller), `admin_required` (a valid user token used on an admin-only route -- see section 3), `network_not_private` (a non-loopback caller under `network_mode: "lan"`/`"tailscale"` while the live check doesn't currently allow it -- see 3.1) |
 | 404 | `model_not_found`, `operation_not_found`, `model_not_installed` (verify and remove of a never-installed id; **a transcription/translation naming a model that isn't downloaded or isn't a known id at all -- see 4.3**; `GET /v1/models/{id}` for a non-callable id) |
@@ -1021,6 +1180,8 @@ key's presence before reading it:
                            "memory_bytes": 17179869184 } ] },
   "process": { "pid": 12345, "uptime_ms": 60000, "rss_bytes": 52428800 },
   "vad": { "engine": "silero-v5", "sample_rate": 16000 },
+  "speaker_embedding": { "engine": "campplus-voxceleb-v1", "dim": 512, "sample_rate": 16000 },
+  "diarization": { "engine": "campplus-voxceleb-v1-average-linkage", "max_speakers": 26 },
   "server": { "version": "0.1.0", "host": "127.0.0.1", "port": 54321,
               "data_dir": "C:\\Users\\...\\STT Server" } }
 ```
@@ -1052,6 +1213,12 @@ Notes:
   device -- no such fallback is needed on this build.)
 - `vad` advertises offline speech detection (`POST /v1/audio/vad`, section 5b). A client that
   finds the key absent is talking to an older server and should keep its own detection.
+- `speaker_embedding` advertises speaker embeddings (`POST /v1/audio/embeddings`, section 5c);
+  `engine` is also the `model` of its responses. A client that finds the key absent is talking to
+  an older server.
+- `diarization` advertises speaker diarization (`POST /v1/audio/diarize`, section 5d); `engine` is
+  also the `model` of its responses and `max_speakers` the most speakers (and known speakers) one
+  request can handle. A client that finds the key absent is talking to an older server.
 - `process.uptime_ms` is `now - GetProcessTimes` process creation time (the
   real process start, correct even on the very first call after startup); on
   a platform where that's unavailable it falls back to measuring from the
