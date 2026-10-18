@@ -1,20 +1,21 @@
 ---
 name: speaker-embeddings
-title: Speaker Embeddings (CAM++) as a Server Capability, Groundwork for Speaker Separation
-description: POST /v1/audio/embeddings returns a 512-d voice fingerprint per speech segment of a finished recording with CAM++ (VoxCeleb) running in pure Rust inside stt-server, and stt-sdk exposes it as embedSpeakers() with cosine, match and clustering helpers.
-status: in_progress
+title: Speaker Embeddings (CAM++) and Diarization as Server Capabilities
+description: POST /v1/audio/embeddings returns a 512-d voice fingerprint per speech segment of a finished recording with CAM++ (VoxCeleb) running in pure Rust inside stt-server, and POST /v1/audio/diarize clusters them into who-spoke-when in OpenAI's diarized_json segment shape; stt-sdk exposes embedSpeakers(), diarize() and the cosine, match and clustering helpers.
+status: done
 type: feature
 scope: stt-server, stt-sdk
 attempt: 1
 max_attempts: 4
-last_result: partial
-next_action: "Slice 4+: a POST /v1/audio/diarize that clusters the embeddings itself and answers in OpenAI's diarized_json shape (speaker, start, end, text); wire it into whisper-vibes only after the owner approves."
+last_result: passed
+next_action: null
 success_criteria:
   - A pure-Rust CAM++ (VoxCeleb) forward pass with a Kaldi-style 80-bin fbank, weights exported once from the Apache-2.0 official checkpoint and embedded as f16, matches PyTorch (fbank within 1e-3, embeddings at cosine >= 0.9999, normal and attenuated input).
   - POST /v1/audio/embeddings takes file, optional segments and encoding_format (float or base64), needs no loaded model, never enters the inference queue or touches the GPU, and returns {model, dim, duration, segments:[{start, end, embedding}]} with null for segments under 0.5 s.
   - GET /v1/local/system advertises speaker_embedding {engine, dim, sample_rate}.
   - On a generated two-voice recording the same voice is clearly closer than another and clustering recovers the two speakers.
   - stt-sdk SttServerProvider.embedSpeakers() plus cosineSimilarity, matchSpeaker and clusterSpeakers; no npm publish.
+  - POST /v1/audio/diarize (client-contract section 5d) answers {model, duration, segments:[{type:"transcript.text.segment", id, start, end, speaker}]} (no text) on the CPU with its own slot, splits the two-voice fixture into exactly its two speakers, names speakers from known_speaker_names[] with known_speaker_embeddings[] or known_speaker_references[], rejects bad input with 400, and GET /v1/local/system advertises diarization {engine, max_speakers}; stt-sdk diarize(); no npm publish.
 source: user
 ---
 
@@ -46,16 +47,32 @@ separation, built the way offline-vad was (public API, pure Rust, no ONNX runtim
 - The route has its own `Semaphore(2)` (`speaker_slots`) and runs in `spawn_blocking`; CPU only.
 - Two-voice fixture: `scripts/make_two_speaker_fixture.ps1` (System.Speech, A/B/A/B, 400 ms gaps, 11.7 s). **David is not
   installed on this machine**, so voice A is Microsoft George (male, en-GB OneCore) and voice B Microsoft Zira Desktop.
-- Future diarization should follow OpenAI's `gpt-4o-transcribe-diarize` / `diarized_json` (verified against the OpenAI
+- Diarization follows OpenAI's `gpt-4o-transcribe-diarize` / `diarized_json` (verified against the OpenAI
   speech-to-text guide 2026-10-18: segments with `speaker`, `start`, `end`, `text`; `known_speaker_names[]` and
-  `known_speaker_references[]`; `chunking_strategy` for audio over 30 s). Documented as the future `/v1/audio/diarize`
-  model in client-contract section 5c.
+  `known_speaker_references[]`; `chunking_strategy` for audio over 30 s). Built as `POST /v1/audio/diarize`, client-contract
+  section 5d (see Slice 4 below).
 
 ## Attempts
 - Attempt 1 (2026-10-18): slices 1-3. `src/speaker/`, `POST /v1/audio/embeddings` (`api.rs::audio_embeddings`, with the
   multipart reading shared with the VAD route in `read_audio_form`), `speaker_embedding` in `/v1/local/system`, docs
   (client-contract section 5c, README, AGENTS, THIRD_PARTY_NOTICES) and stt-sdk `embedSpeakers()`, `cosineSimilarity`,
   `matchSpeaker`, `clusterSpeakers`.
+- Attempt 2 (2026-10-18): slice 4. `POST /v1/audio/diarize` (`api.rs::audio_diarize`, `src/speaker/diarize.rs`,
+  `src/speaker/cluster.rs`), `diarization` in `/v1/local/system`, client-contract section 5d, stt-sdk `diarize()`.
+
+## Slice 4 decisions
+- OpenAI re-verified 2026-10-18 (speech-to-text guide and API reference): `gpt-4o-transcribe-diarize` with
+  `response_format=diarized_json` returns `segments` of `{type:"transcript.text.segment", id, start, end, text, speaker}`;
+  `known_speaker_names[]` plus `known_speaker_references[]` (up to four clips of 2-10 s, data URLs in multipart);
+  `chunking_strategy` for audio over 30 s. Ours matches the segment shape without `text` and adds
+  `known_speaker_embeddings[]` (base64 f32, the embeddings endpoint's output) as a local extension.
+- No text: diarize plus transcribe in one call is a later option, documented as such.
+- Clustering is average-linkage, ported from the SDK's `clusterSpeakers`; one implementation per language, pinned by one
+  shared golden file (`tests/fixtures/cluster-golden.json`, copied to stt-sdk `test/fixtures/`). Cosine threshold 0.4,
+  `max_speakers` 1-26 (default 26, labels "A" to "Z").
+- Known speakers: cluster centroids matched to profiles by cosine >= threshold, best pairs first, each name and cluster
+  once. Segments under 0.5 s (no embedding) are left out of the answer. Its own `Semaphore(1)` (`diarize_slots`), CPU only.
+- `/v1/local/system` `diarization: {engine: "campplus-voxceleb-v1-average-linkage", max_speakers: 26}`.
 
 ## Verification Log
 - Parity (`speaker::tests::matches_pytorch_on_the_speech_fixture`, golden from `scripts/campplus_golden.py`, PyTorch
@@ -74,7 +91,13 @@ separation, built the way offline-vad was (public API, pure Rust, no ONNX runtim
   (separate target dir `t`): all pass. Executable: see the commit message and the report (about 14.5 MB over 0.3.5's
   68,993,024 bytes, the weights).
 - stt-sdk: `npm run typecheck`, `npm test`, `npm run build`, `npm run verify:consumer` pass.
+- Diarization (`tests/diarize_binary.rs`, real executable, port 54424, temp data dir): 401 without or with a wrong token; the
+  two-voice fixture splits into exactly its two scripted speakers with given segments and with the server's own VAD;
+  `max_speakers=1` gives one speaker and `threshold=0.95` four; known speakers by embedding (taken from the fixture's own
+  turns, listed in swapped order), by reference clip (data URLs), one known voice leaving the other as "A", a stranger
+  naming nobody; 17 error cases (bad threshold, `max_speakers` 0, fractional or above 26, bad segments, unknown field,
+  mismatched or mixed known lists, duplicate names, bad embedding, bad or too-short reference, duplicate and missing
+  fields); the `diarization` system field.
 
 ## Final Outcome
-Slices 1-3 delivered 2026-10-18; the goal stays in progress for the diarization endpoint. Nothing is published or
-wired into whisper-vibes.
+Slices 1-4 delivered 2026-10-18. Nothing is published or wired into whisper-vibes.

@@ -17,6 +17,8 @@
 //! of the embeddings.
 
 mod campplus;
+mod cluster;
+pub mod diarize;
 mod fbank;
 
 pub const SAMPLE_RATE: u32 = 16_000;

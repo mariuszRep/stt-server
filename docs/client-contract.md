@@ -1003,13 +1003,83 @@ server does not decide who is who; the SDK has the comparison helpers (`cosineSi
   3 s (real-time factor 0.05; about 0.16 on one thread).
 - **Discovery:** `GET /v1/local/system` reports `speaker_embedding: {engine, dim, sample_rate}`
   (section 8). A client that finds the key absent is talking to an older server.
-- **Future diarization:** the next step is a `POST /v1/audio/diarize` that returns who spoke when
-  by itself. Its response should follow OpenAI's `gpt-4o-transcribe-diarize` with
-  `response_format=diarized_json` (OpenAI speech-to-text guide: segments carrying `speaker`,
-  `start`, `end` and `text`; `known_speaker_names[]` / `known_speaker_references[]` take up to four
-  2-10 s reference clips, which is what saved voice profiles would feed; `chunking_strategy` is
-  required for audio over 30 s), so that an OpenAI client's parser reads it unchanged. That
-  endpoint is not built yet; the embeddings here are what it will use.
+- **Diarization:** `POST /v1/audio/diarize` (section 5d) builds on these embeddings and returns who
+  spoke when by itself.
+
+## 5d. Diarization: who spoke when (local extension)
+
+`POST /v1/audio/diarize` splits a finished recording by speaker. It is a local extension that an
+OpenAI-compatible client never has to call, but its answer follows OpenAI's `diarized_json`
+(`gpt-4o-transcribe-diarize` on `/v1/audio/transcriptions`, verified against the OpenAI
+speech-to-text guide and API reference 2026-10-18): a `segments` array whose entries are
+`{"type": "transcript.text.segment", "id", "start", "end", "speaker"}` (OpenAI adds `text`), where
+`speaker` is a label such as "A" and, when known speakers are given, one of their names. A parser
+written for OpenAI's segments reads this response unchanged.
+
+**It carries no text.** This endpoint answers who spoke when; it does not transcribe. Combining
+diarization and transcription in one call (a `text` per segment) is a later option; until then a
+client transcribes the recording (or each segment) with `/v1/audio/transcriptions` and joins the
+two by time.
+
+- **Auth and limits:** exactly as section 5c: user token (the admin token also works),
+  `multipart/form-data`, 40 MiB body, `file` decoded and converted to 16 kHz mono as for
+  transcription. It needs no loaded model, never enters the inference queue (section 4.3), runs on
+  the CPU only and never touches the GPU. Its own slot limit: one diarization at a time, the rest
+  wait (separate from the embedding and VAD slots).
+- **Fields:** `file` (required) and optional text fields, all validated before any audio work:
+
+  | Field | Default | Range | Meaning |
+  |---|---|---|---|
+  | `segments` | the server's own speech detection | as section 5c | The speech to label, `[{"start", "end"}, ...]` in seconds. |
+  | `threshold` | 0.4 | 0.05-0.95 | Cosine similarity at which two voices count as one speaker: clusters merge while their average similarity is at least this. Also the least similarity for a cluster to be matched to a known speaker. |
+  | `max_speakers` | 26 | 1-26 | Clusters keep merging past `threshold` until at most this many remain. |
+  | `known_speaker_names[]` | none | up to 26, each 1-64 characters, distinct | Names for voices the caller knows (OpenAI's field). |
+  | `known_speaker_embeddings[]` | none | one per name | Base64 of 512 little-endian `f32` values, exactly what `POST /v1/audio/embeddings` returns with `encoding_format=base64` (our extension: save a voice profile once, reuse it). |
+  | `known_speaker_references[]` | none | one per name, at most 4 | A WAV clip of 2-10 s of that person speaking, as a `data:audio/wav;base64,...` URL (OpenAI's form) or plain base64; the server embeds it itself. |
+
+  The three `known_speaker_*[]` fields repeat once per speaker, in the same order. Send either the
+  embeddings or the reference clips, not both; each name needs exactly one of them. A duplicate
+  `file`, `segments`, `threshold` or `max_speakers` is `400 duplicate_field`, a missing `file`
+  `400 missing_file`; an unknown field, a value out of range, lists of different lengths, a
+  malformed embedding, or a reference clip that is no WAV or not 2-10 s is
+  `400 invalid_request_error`; a bad main WAV gets the usual `invalid_audio` /
+  `unsupported_audio` / `audio_too_short` / `audio_too_long`. OpenAI's `response_format`, `model`,
+  `chunking_strategy` and `prompt` are not accepted (there is one response shape and one engine,
+  no chunking beyond the ten-minute maximum, and nothing to prompt).
+- **Response** (the repository's two-voice fixture, segments given):
+
+  ```json
+  { "model": "campplus-voxceleb-v1-average-linkage", "duration": 11.67,
+    "segments": [ { "type": "transcript.text.segment", "id": "seg_0", "start": 0.0,   "end": 2.535, "speaker": "A" },
+                  { "type": "transcript.text.segment", "id": "seg_1", "start": 2.935, "end": 5.77,  "speaker": "B" },
+                  { "type": "transcript.text.segment", "id": "seg_2", "start": 6.17,  "end": 8.885, "speaker": "A" },
+                  { "type": "transcript.text.segment", "id": "seg_3", "start": 9.285, "end": 11.67, "speaker": "B" } ] }
+  ```
+
+  Segments keep the order of the input (or of the time); `id` counts the returned segments from
+  0; times are seconds rounded to milliseconds. A segment shorter than 0.5 s cannot be
+  fingerprinted and is **left out** of the answer. Unnamed speakers are "A", "B", ... in order of
+  first appearance; a label equal to a known name is skipped.
+- **Pipeline:** speech segments (given, or section 5b's detection with default parameters) ->
+  a CAM++ embedding per segment (section 5c) -> average-linkage agglomerative clustering with
+  cosine similarity -> one label per cluster. A cluster is represented by the normalised mean of
+  its segment embeddings; each known speaker is matched to the most similar cluster that reaches
+  `threshold`, the best pairs first and every name and every cluster at most once. A known speaker
+  who is not in the recording simply does not appear.
+- **One algorithm in two languages:** the clustering is implemented once per language, in Rust
+  (`src/speaker/cluster.rs`) and in stt-sdk (`clusterSpeakers` in `src/speakers.ts`), and the two are
+  identical: same merge order (highest mean pairwise similarity first, ties to the earlier
+  clusters), same stopping rule, labels in order of first appearance. Both are tested against the
+  same cases (`tests/fixtures/cluster-golden.json`, copied into stt-sdk's `test/fixtures/`); change
+  them together. The SDK's `diarize()` calls this endpoint; it does not cluster by itself.
+- **Discovery:** `GET /v1/local/system` reports `diarization: {engine, max_speakers}`
+  (section 8); `engine` is also the `model` of the responses. A client that finds the key absent is
+  talking to an older server.
+- **Accuracy:** the repository's synthetic two-voice recording (two Windows voices alternating) is
+  split into exactly its two speakers, by given segments and by the server's own detection. Real
+  conversations are harder (overlapping speech is not handled, a very short turn gives too little
+  voice to cluster, similar voices may need a higher `threshold`): tune `threshold` and
+  `max_speakers` rather than expect a perfect split.
 
 ## 6. Error envelope and codes
 
@@ -1111,6 +1181,7 @@ key's presence before reading it:
   "process": { "pid": 12345, "uptime_ms": 60000, "rss_bytes": 52428800 },
   "vad": { "engine": "silero-v5", "sample_rate": 16000 },
   "speaker_embedding": { "engine": "campplus-voxceleb-v1", "dim": 512, "sample_rate": 16000 },
+  "diarization": { "engine": "campplus-voxceleb-v1-average-linkage", "max_speakers": 26 },
   "server": { "version": "0.1.0", "host": "127.0.0.1", "port": 54321,
               "data_dir": "C:\\Users\\...\\STT Server" } }
 ```
@@ -1145,6 +1216,9 @@ Notes:
 - `speaker_embedding` advertises speaker embeddings (`POST /v1/audio/embeddings`, section 5c);
   `engine` is also the `model` of its responses. A client that finds the key absent is talking to
   an older server.
+- `diarization` advertises speaker diarization (`POST /v1/audio/diarize`, section 5d); `engine` is
+  also the `model` of its responses and `max_speakers` the most speakers (and known speakers) one
+  request can handle. A client that finds the key absent is talking to an older server.
 - `process.uptime_ms` is `now - GetProcessTimes` process creation time (the
   real process start, correct even on the very first call after startup); on
   a platform where that's unavailable it falls back to measuring from the

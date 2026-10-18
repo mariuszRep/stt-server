@@ -49,7 +49,9 @@ models and serves batch transcription through an OpenAI-compatible API.
 - `src/vad.rs` — offline speech detection (`POST /v1/audio/vad`): pure-Rust Silero v5 forward pass,
   weights in `assets/silero_v5_16k.f32` (exported by `scripts/export_silero_weights.py`; golden
   probabilities from `scripts/silero_golden.py` in `tests/vad_golden.json`) and the segmenter
-- `src/speaker/` — speaker embeddings (`POST /v1/audio/embeddings`): pure-Rust CAM++ (VoxCeleb) forward
+- `src/speaker/` — speaker embeddings (`POST /v1/audio/embeddings`) and diarization (`POST /v1/audio/diarize`:
+  `diarize.rs`, clustering in `cluster.rs`, identical to stt-sdk's `clusterSpeakers` and pinned by
+  `tests/fixtures/cluster-golden.json`): pure-Rust CAM++ (VoxCeleb) forward
   pass and Kaldi fbank, f16 weights in `assets/campplus_vox_16k.f16` (exported by
   `scripts/export_campplus_weights.py`; golden features and embeddings from `scripts/campplus_golden.py` in
   `tests/speaker_golden.json`; the two-voice fixture from `scripts/make_two_speaker_fixture.ps1`)
