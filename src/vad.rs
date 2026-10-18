@@ -384,7 +384,7 @@ pub fn detect(samples: &[f32], params: &Params) -> Vec<Span> {
     segments(&frame_probabilities(samples), samples.len(), params)
 }
 
-fn rounded(value: f64, decimals: i32) -> f64 {
+pub(crate) fn rounded(value: f64, decimals: i32) -> f64 {
     let scale = 10f64.powi(decimals);
     (value * scale).round() / scale
 }

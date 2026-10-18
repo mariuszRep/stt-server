@@ -1344,6 +1344,7 @@ dependencies = [
  "fs4",
  "futures-util",
  "hound",
+ "realfft",
  "reqwest",
  "rubato",
  "rusqlite",

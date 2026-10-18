@@ -34,7 +34,7 @@ models and serves batch transcription through an OpenAI-compatible API.
 
 | Owns | Must not own |
 |---|---|
-| Model catalog, download, import, drop-in refresh, verification, selection, loading, removal; batch transcription and translation; offline speech detection on finished audio (Silero, pure Rust); capability matrix; queue; CLI and process modes; install scope and data folder; auth with admin and user tokens; network modes (local, LAN, Tailscale); CORS; self-update; system information; SQLite state | Microphone capture, live VAD and chunking (client-side; offline speech detection on finished audio is a server capability, owner direction 2026-10-17), the dictation session, prompt or vocabulary construction, transcript editing (all client-side); provider processes or descriptors; hardware-based model ranking |
+| Model catalog, download, import, drop-in refresh, verification, selection, loading, removal; batch transcription and translation; offline speech detection and speaker embeddings on finished audio (Silero and CAM++, pure Rust); capability matrix; queue; CLI and process modes; install scope and data folder; auth with admin and user tokens; network modes (local, LAN, Tailscale); CORS; self-update; system information; SQLite state | Microphone capture, live VAD and chunking (client-side; offline speech detection on finished audio is a server capability, owner direction 2026-10-17), the dictation session, prompt or vocabulary construction, transcript editing (all client-side); provider processes or descriptors; hardware-based model ranking |
 
 ## Layout
 
@@ -48,6 +48,10 @@ models and serves batch transcription through an OpenAI-compatible API.
 - `src/vad.rs` — offline speech detection (`POST /v1/audio/vad`): pure-Rust Silero v5 forward pass,
   weights in `assets/silero_v5_16k.f32` (exported by `scripts/export_silero_weights.py`; golden
   probabilities from `scripts/silero_golden.py` in `tests/vad_golden.json`) and the segmenter
+- `src/speaker/` — speaker embeddings (`POST /v1/audio/embeddings`): pure-Rust CAM++ (VoxCeleb) forward
+  pass and Kaldi fbank, f16 weights in `assets/campplus_vox_16k.f16` (exported by
+  `scripts/export_campplus_weights.py`; golden features and embeddings from `scripts/campplus_golden.py` in
+  `tests/speaker_golden.json`; the two-voice fixture from `scripts/make_two_speaker_fixture.ps1`)
 - `src/import_user.rs` — copy a user's models into a machine-wide install
 - `src/store.rs` migrations; `src/discovery.rs`, `src/autostart.rs`, `src/service.rs`,
   `src/sysinfo.rs`

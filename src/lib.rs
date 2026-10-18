@@ -26,6 +26,7 @@ pub mod selfupdate;
 #[cfg(windows)]
 pub mod service;
 pub mod service_names;
+pub mod speaker;
 pub mod store;
 pub mod sysinfo;
 pub mod update_transaction;
