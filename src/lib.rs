@@ -21,6 +21,7 @@ pub mod network;
 pub mod operations;
 pub mod queue;
 pub mod realtime;
+pub mod registry;
 pub mod run_plan;
 pub mod selfupdate;
 #[cfg(windows)]

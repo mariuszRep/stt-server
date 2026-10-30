@@ -11,12 +11,14 @@ use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use crate::capabilities::EffectiveCaps;
-use crate::catalog::{Catalog, CatalogModel};
+use crate::catalog::{Catalog, CatalogInfo, CatalogModel};
 use crate::engine::{caps_for, load_engine, spawn_tracked_load, LoadedModel, LoadingStatus};
 use crate::queue::InferenceQueue;
 
 pub struct App {
     pub catalog: Vec<CatalogModel>,
+    /// Which version of the embedded catalog this is; see [`CatalogInfo`].
+    pub catalog_info: CatalogInfo,
     pub db: Mutex<Connection>,
     /// `Arc`-wrapped (not a plain `Mutex`) so the background startup load
     /// spawned by `open_app_at_full` can hold its own clone of this slot and
@@ -808,6 +810,10 @@ pub fn open_app_at_full(
     }
 
     Ok(Arc::new(App {
+        catalog_info: CatalogInfo {
+            catalog_version: catalog.catalog_version,
+            generated_at: catalog.generated_at,
+        },
         catalog: catalog.models,
         db: Mutex::new(db),
         loaded,

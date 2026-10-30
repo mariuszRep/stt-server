@@ -21,6 +21,8 @@ mod cluster;
 pub mod diarize;
 mod fbank;
 
+pub use campplus::{WEIGHTS_BYTES, WEIGHTS_FILE, WEIGHTS_SHA256};
+
 pub const SAMPLE_RATE: u32 = 16_000;
 /// Identifies the embedding space in responses: vectors of different models never compare.
 pub const MODEL_ID: &str = "campplus-voxceleb-v1";

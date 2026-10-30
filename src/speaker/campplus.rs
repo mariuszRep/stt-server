@@ -16,6 +16,10 @@ const BLOCKS: [(usize, usize); 3] = [(12, 1), (24, 2), (16, 2)];
 const SEGMENT: usize = 100;
 
 const WEIGHTS: &[u8] = include_bytes!("../../assets/campplus_vox_16k.f16");
+/// What the registry reports about the compiled-in weights; a test pins the size and hash to the blob.
+pub const WEIGHTS_FILE: &str = "campplus_vox_16k.f16";
+pub const WEIGHTS_BYTES: usize = WEIGHTS.len();
+pub const WEIGHTS_SHA256: &str = "11122726706b2cfe164966cdafb93cc7727176e1db9d45952ef999d90b53e65b";
 
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
@@ -531,8 +535,6 @@ mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
 
-    const WEIGHTS_SHA256: &str = "11122726706b2cfe164966cdafb93cc7727176e1db9d45952ef999d90b53e65b";
-
     #[test]
     fn half_floats_convert_exactly() {
         for (bits, value) in [
@@ -551,7 +553,7 @@ mod tests {
 
     #[test]
     fn embedded_weights_are_the_exported_blob() {
-        assert_eq!(WEIGHTS.len(), 7_169_568 * 2);
+        assert_eq!(WEIGHTS_BYTES, 7_169_568 * 2);
         assert_eq!(format!("{:x}", Sha256::digest(WEIGHTS)), WEIGHTS_SHA256);
     }
 }

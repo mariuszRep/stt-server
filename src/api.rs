@@ -22,7 +22,7 @@ use crate::app::App;
 use crate::audio::decode_wav;
 use crate::auth::{authorize, authorized, AccessLevel};
 use crate::capabilities::{catalog_mismatch, EffectiveCaps};
-use crate::catalog::{capability_matrix, catalog_model, model_view};
+use crate::catalog::{add_catalog_text, capability_matrix, catalog_model, model_view};
 use crate::download::install_model;
 use crate::dropin::run_refresh;
 use crate::engine::{load_engine, BackendDiagnostic, CancelWhenDropped, LoadedModel};
@@ -30,6 +30,7 @@ use crate::errors::{classify_run_result, internal, ApiError, ApiResult, RunOutco
 use crate::format::{format_response, DiagnosticsExtra, Formatted, LanguageEvidence};
 use crate::import::import_model;
 use crate::operations::{cancel_operation, operation};
+use crate::registry;
 use crate::run_plan::{plan as build_plan, Endpoint, ParsedRequest};
 use crate::store::{
     all_installed, backend_preference, installed_file, is_valid_cors_origin, selected_id,
@@ -454,7 +455,9 @@ pub async fn system_info(
         port: app.bind_port,
         data_dir: app.data_dir.display().to_string(),
     };
-    Ok(Json(crate::sysinfo::to_json(&snapshot, &server)))
+    let mut body = crate::sysinfo::to_json(&snapshot, &server);
+    body["catalog"] = app.catalog_info.to_json();
+    Ok(Json(body))
 }
 
 pub async fn recommendations(
@@ -585,7 +588,7 @@ fn custom_model_view(installed: &crate::store::InstalledFile) -> Value {
         "response_formats": {"json": "supported", "text": "unsupported", "verbose_json": "unsupported", "srt": "unknown", "vtt": "unknown"},
     });
     crate::capabilities::add_unverified_engine_controls(&mut effective_capabilities);
-    json!({
+    let mut view = json!({
         "id": installed.id,
         "name": custom_model_name(installed),
         "architecture": installed.custom_arch,
@@ -601,7 +604,9 @@ fn custom_model_view(installed: &crate::store::InstalledFile) -> Value {
         "recommended_rank": Value::Null,
         "needs_verification": installed.needs_verification,
         "file_path": installed.path.to_string_lossy(),
-    })
+    });
+    registry::label_speech_row(&mut view, &installed.id);
+    view
 }
 
 /// Custom (non-catalog) installed models: rows with `custom_arch` set, i.e.
@@ -614,17 +619,15 @@ fn installed_custom_models(app: &App) -> ApiResult<Vec<crate::store::InstalledFi
         .collect())
 }
 
-pub async fn local_models(
-    State(app): State<Arc<App>>,
-    headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
-    authorize(&headers, &app, AccessLevel::User)?;
-    let default_id = selected_id(&app)?;
+/// Every `/models/manage` row: the catalog's models with their installed state, then the
+/// registered custom (drop-in) models. Shared by `GET /models/manage` and `GET /v1/registry`.
+fn manage_rows(app: &App) -> ApiResult<Vec<Value>> {
+    let default_id = selected_id(app)?;
     let mut data = app
         .catalog
         .iter()
         .map(|model| {
-            let installed = installed_file(&app, &model.slug)?;
+            let installed = installed_file(app, &model.slug)?;
             let mut view = model_view(
                 model,
                 installed
@@ -636,20 +639,52 @@ pub async fn local_models(
                 view["source"] = json!(installed.source);
                 view["needs_verification"] = json!(installed.needs_verification);
             }
-            if let Some(effective) = effective_view_if_loaded(&app, &model.slug)? {
+            if let Some(effective) = effective_view_if_loaded(app, &model.slug)? {
                 view["effective_capabilities"] = effective;
             }
             view["default"] = json!(default_id.as_deref() == Some(model.slug.as_str()));
             Ok(view)
         })
         .collect::<ApiResult<Vec<_>>>()?;
-    for custom in installed_custom_models(&app)? {
+    for custom in installed_custom_models(app)? {
         let is_default = default_id.as_deref() == Some(custom.id.as_str());
         let mut view = custom_model_view(&custom);
         view["default"] = json!(is_default);
         data.push(view);
     }
-    Ok(Json(json!({"object":"list", "data":data})))
+    Ok(data)
+}
+
+pub async fn local_models(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    authorize(&headers, &app, AccessLevel::User)?;
+    let mut body = json!({"object":"list", "data": manage_rows(&app)?});
+    app.catalog_info.stamp(&mut body);
+    Ok(Json(body))
+}
+
+/// `GET /v1/registry`: every model this server serves, in the shared model-registry shape
+/// (`ModelEntry` and `ModelState`, see `crate::registry`): the speech models of `/models/manage`
+/// and the two compiled into the server.
+pub async fn registry_models(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    authorize(&headers, &app, AccessLevel::User)?;
+    let rows = manage_rows(&app)?;
+    let loaded_id = app
+        .loaded
+        .lock()
+        .map_err(internal)?
+        .as_ref()
+        .map(|active| active.id.clone());
+    Ok(Json(registry::document(
+        &rows,
+        loaded_id.as_deref(),
+        &app.catalog_info,
+    )))
 }
 
 /// The capability view for a callable (downloaded+verified) model, for the
@@ -739,7 +774,7 @@ fn openai_model_entry(app: &App, id: &str, default_id: Option<&str>) -> ApiResul
         (json!(languages), json!(language_detect))
     };
 
-    Ok(json!({
+    let mut entry = json!({
         "id": id,
         "object": "model",
         "owned_by": "local",
@@ -748,7 +783,12 @@ fn openai_model_entry(app: &App, id: &str, default_id: Option<&str>) -> ApiResul
         "capabilities": capabilities,
         "languages": languages,
         "language_detect": language_detect,
-    }))
+    });
+    if let Some(model) = catalog_model {
+        add_catalog_text(&mut entry, model);
+    }
+    registry::label_speech_row(&mut entry, id);
+    Ok(entry)
 }
 
 /// Every callable model id: downloaded and verified catalog models plus
@@ -1911,6 +1951,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/local/system", get(system_info))
         .route("/v1/local/config", get(get_config).patch(patch_config))
         .route("/v1/local/shutdown", post(shutdown_endpoint))
+        .route("/v1/registry", get(registry_models))
         .route("/models/manage", get(local_models))
         .route("/models/manage/refresh", post(refresh_models))
         .route("/models/manage/unload", post(unload_model))
@@ -3298,6 +3339,128 @@ mod router_tests {
         std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
     }
 
+    /// A callable catalog model and a drop-in carry the registry labels on `/v1/models`, `/models/manage` and
+    /// `/v1/registry`, and the registry entry and state say what the other two rows say.
+    #[tokio::test]
+    async fn installed_models_carry_registry_labels_on_every_route() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        {
+            let db = app.db.lock().unwrap();
+            db.execute(
+                "INSERT INTO installed(id,path,sha256,quant,source) VALUES('parakeet-unified-en-0.6b','unused','x','Q8_0','catalog_download')",
+                [],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO installed(id,path,sha256,filename,source,custom_arch,custom_name) VALUES('custom-named-aaaaaaaa','unused','x','some-model-q4_0.gguf','user_folder','whisper','My Named Model')",
+                [],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO settings(key,value) VALUES('selected_model','custom-named-aaaaaaaa')",
+                [],
+            )
+            .unwrap();
+        }
+        let router = router(app.clone());
+        let get = |uri: &'static str| {
+            let router = router.clone();
+            let token = token.clone();
+            async move {
+                let request = Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap();
+                let response = router.oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{uri}");
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<Value>(&bytes).unwrap()
+            }
+        };
+        let find = |body: &Value, id: &str| {
+            body["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["id"] == id)
+                .unwrap_or_else(|| panic!("no {id}"))
+                .clone()
+        };
+        let labels = |row: &Value, id: &str| {
+            assert_eq!(row["kind"], "speech", "{id}");
+            assert_eq!(row["provider"], "stt-server", "{id}");
+            assert_eq!(row["ref"], format!("speech/stt-server/{id}"), "{id}");
+            assert_eq!(row["locality"], "local", "{id}");
+            assert_eq!(row["tasks"], json!(["speech-to-text"]), "{id}");
+            assert_eq!(row["privacy"], json!({"sends": []}), "{id}");
+        };
+
+        // `/v1/models`: the callable catalog model keeps its catalog text; the drop-in has none.
+        let callable = get("/v1/models").await;
+        let catalog_entry = find(&callable, "parakeet-unified-en-0.6b");
+        labels(&catalog_entry, "parakeet-unified-en-0.6b");
+        assert_eq!(catalog_entry["parameters"], "0.6B");
+        assert_eq!(catalog_entry["language_count"], 1);
+        assert_eq!(
+            catalog_entry["base_model"],
+            "nvidia/parakeet-unified-en-0.6b"
+        );
+        assert_eq!(catalog_entry["owned_by"], "local");
+        let custom_entry = find(&callable, "custom-named-aaaaaaaa");
+        labels(&custom_entry, "custom-named-aaaaaaaa");
+        assert!(custom_entry.get("description").is_none());
+        assert!(custom_entry.get("parameters").is_none());
+
+        // `/models/manage`: the drop-in is labelled too.
+        let manage = get("/models/manage").await;
+        labels(
+            &find(&manage, "custom-named-aaaaaaaa"),
+            "custom-named-aaaaaaaa",
+        );
+
+        // `/v1/registry`: the drop-in is an entry from the same row, with its state.
+        let registry = get("/v1/registry").await;
+        let entry = find(&registry, "custom-named-aaaaaaaa");
+        labels(&entry, "custom-named-aaaaaaaa");
+        assert_eq!(entry["name"], "My Named Model");
+        assert_eq!(entry["local"]["custom"], true);
+        assert_eq!(entry["local"]["source"], "user_folder");
+        assert!(entry.get("editorial").is_none());
+        assert!(entry.get("description").is_none());
+        let state_of = |reference: &str| {
+            registry["states"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|state| state["ref"] == reference)
+                .unwrap()
+                .clone()
+        };
+        let state = state_of("speech/stt-server/custom-named-aaaaaaaa");
+        assert_eq!(state["installed"], true);
+        assert_eq!(state["default"], true);
+        assert_eq!(state["loaded"], false);
+        let catalog_state = state_of("speech/stt-server/parakeet-unified-en-0.6b");
+        assert_eq!(catalog_state["installed"], true);
+        assert_eq!(catalog_state["installedQuant"], "Q8_0");
+        assert_eq!(catalog_state["default"], false);
+        assert_eq!(
+            registry["states"].as_array().unwrap().len(),
+            registry["data"].as_array().unwrap().len()
+        );
+
+        drop(router);
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
     /// `/readiness` while a background load is in progress (see
     /// `engine::spawn_tracked_load`/`app::open_app_at_full`): 503 with a
     /// `"loading model"` reason, the loading model's id, and `elapsed_ms`,
@@ -4565,6 +4728,7 @@ mod router_tests {
             ("GET", "/readiness", None),
             ("GET", "/v1/models", None),
             ("GET", "/models/manage", None),
+            ("GET", "/v1/registry", None),
             ("GET", "/models/manage/default", None),
             ("GET", "/v1/local/system", None),
             ("GET", "/models/manage/recommendations", None),

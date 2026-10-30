@@ -176,7 +176,7 @@ where to drop files should read `GET /v1/local/config`'s
   | Level | Routes |
   |---|---|
   | Unauthenticated | `GET /health` |
-  | User (admin token also works) | `GET /readiness`, `GET /v1/models`, `GET /models/manage`, `GET /models/manage/default`, `GET /v1/local/system`, `GET /models/manage/recommendations`, `GET /models/manage/operations/{id}`, `POST /v1/audio/transcriptions`, `POST /v1/audio/translations`, `POST /v1/audio/vad` (section 5b), `POST /v1/audio/embeddings` (section 5c), `GET /v1/realtime` (WebSocket, section 5a) |
+  | User (admin token also works) | `GET /readiness`, `GET /v1/models`, `GET /models/manage`, `GET /v1/registry` (section 4.5), `GET /models/manage/default`, `GET /v1/local/system`, `GET /models/manage/recommendations`, `GET /models/manage/operations/{id}`, `POST /v1/audio/transcriptions`, `POST /v1/audio/translations`, `POST /v1/audio/vad` (section 5b), `POST /v1/audio/embeddings` (section 5c), `GET /v1/realtime` (WebSocket, section 5a) |
   | Admin only | `GET`/`PATCH /v1/local/config`, `POST /models/manage/{id}/download`, `POST /models/manage/{id}/verify`, `POST /models/manage/{id}/default` (set default and load), `DELETE /models/manage/default` (unload and forget the default), `POST /models/manage/unload` (unload, keep the default; section 4), `DELETE /models/manage/{id}` (remove), `POST /models/manage/refresh` (drop-in refresh), `POST /models/manage/import`, `POST /models/manage/import-user` (copy another install's models in; see section 1.4), `POST /models/manage/operations/{id}/cancel`, `POST /v1/local/shutdown` |
 
   The CLI (`stt-server models ...`, `status`, `stop`, `update`, ...)
@@ -311,7 +311,13 @@ or descriptors.
   `id`, `name`, `downloaded` (bool), `default` (bool), `source`,
   `needs_verification`, capability info. This is the model manager: it lists
   models the OpenAI-shaped `/v1/models` list never shows (not-yet-downloaded
-  catalog entries), deliberately outside `/v1`.
+  catalog entries), deliberately outside `/v1`. The body also carries
+  `catalog_version` and `generated_at` of the embedded catalog, and every row
+  the registry labels of section 4.5 (`kind`, `provider`, `ref`, `locality`,
+  `tasks`, `privacy`), the catalog's own `description`, `parameters`,
+  `base_model`, `language_count` (a drop-in has none of these four) and, for
+  a catalog model, `recommended` (a model can have a `recommended_rank`
+  without being recommended).
 - **OpenAI-shaped list:** `GET /v1/models` -- `{"object": "list", "data":
   [{"id", "object": "model", "owned_by": "local", "name": string, "default":
   bool, "capabilities": ControlCapability-map, "languages": [string, ...],
@@ -334,7 +340,9 @@ or descriptors.
   top-level convenience fields derived from that same live-or-catalog view:
   the loaded model's supported language codes and whether it can
   auto-detect language, or the catalog/custom model's static claim when
-  never loaded. `GET /v1/models/{id}` returns one such entry directly (not
+  never loaded. Each entry also carries the registry labels of section 4.5
+  and, for a catalog model, `description`, `parameters`, `base_model` and
+  `language_count`. `GET /v1/models/{id}` returns one such entry directly (not
   wrapped in `{"data": [...]}}`), or `404 model_not_installed` if `id` is
   not callable.
 - **Recommendations:** `GET /models/manage/recommendations` -- the curated,
@@ -659,6 +667,72 @@ returned**, only a client starting a new operation call does:
   `state: "failed"`/`"cancelled"` plus (for downloads) a reusable `.part` file that makes the next
   attempt fast. Do not build a client that waits for a failed/cancelled/interrupted operation to
   change state on its own.
+
+### 4.5 Registry fields and `GET /v1/registry`
+
+The estate keeps one list of models in one format, defined by stt-sdk (`src/registry/`,
+`ModelEntry`; its JSON Schema is `schema/model-entry.v1.json`). This server labels the models
+**it serves itself** in that vocabulary and nothing else: it has no provider descriptors and
+knows no other provider's models. All of it is additive; no existing field changed.
+
+- **Labels** on every `/models/manage` row (catalog and drop-in), every `/v1/models` entry and
+  every `/models/manage/recommendations` row:
+
+  | Field | Value |
+  |---|---|
+  | `kind` | `"speech"` |
+  | `provider` | `"stt-server"` |
+  | `ref` | `"speech/stt-server/<id>"` (`kind/provider/id`; `<id>` is the row's `id`, a catalog slug or `custom-<slug>-<sha8>`) |
+  | `locality` | `"local"` |
+  | `tasks` | `["speech-to-text"]` |
+  | `privacy` | `{"sends": []}` (nothing leaves this computer) |
+
+- **Catalog text** the server used to drop, on a catalog model's row and entry: `description`,
+  `parameters` (size class, `"0.6B"`), `base_model` (the upstream model) and `language_count`.
+  `/models/manage` catalog rows also carry `recommended` (bool).
+- **`catalog_version`** (number) and **`generated_at`** (ISO 8601 text) of the embedded catalog
+  (today `2` and `2026-08-17T11:27:14+00:00`): top-level on `GET /models/manage` and
+  `GET /v1/registry`, and under `catalog` in `GET /v1/local/system` (section 8).
+- **`GET /v1/registry`** (user token): every model this server serves in the registry's own shape,
+  `ModelEntry` (camelCase, as the SDK types it) with its `ModelState` next to it:
+
+  ```json
+  { "object": "list", "schema_version": 1,
+    "catalog_version": 2, "generated_at": "2026-08-17T11:27:14+00:00",
+    "data": [ { "ref": "speech/stt-server/parakeet-unified-en-0.6b", "kind": "speech",
+                "provider": "stt-server", "id": "parakeet-unified-en-0.6b",
+                "name": "Parakeet Unified EN 0.6B", "description": "...",
+                "tasks": ["speech-to-text"], "locality": "local", "access": "free",
+                "privacy": { "sends": [] }, "capabilities": { "...": {"status": "..."} },
+                "family": "parakeet", "architecture": "parakeet", "parameters": "0.6B",
+                "baseModel": "nvidia/parakeet-unified-en-0.6b", "license": "cc-by-4.0",
+                "languages": ["en"],
+                "local": { "files": [ { "filename": "...", "quant": "Q8_0", "sizeBytes": 731357568, "sha256": "..." } ],
+                           "revision": "...", "upstreamId": "...", "defaultQuant": "Q8_0", "sizeBytes": 731357568 },
+                "editorial": { "recommended": true, "recommendedRank": 1, "speedScore": 79, "accuracyScore": 90, "source": "handy" } } ],
+    "states": [ { "ref": "speech/stt-server/parakeet-unified-en-0.6b", "installed": false, "loaded": false,
+                  "default": false, "installedQuant": null } ] }
+  ```
+
+  `data` and `states` have the same length and order. The speech entries are the rows of
+  `GET /models/manage`, so a catalog model and a drop-in appear whether installed or not
+  (`states[].installed` says which), followed by the two models compiled into the executable,
+  which are not in `/models/manage` (they are no speech models and cannot be downloaded,
+  selected or removed):
+
+  | `ref` | `tasks` | `builtin` | file (`local.files[0]`) |
+  |---|---|---|---|
+  | `speaker/stt-server/campplus-voxceleb-v1` | `["speaker-embedding"]` | `true` | `campplus_vox_16k.f16`, 14339136 bytes, SHA-256 `11122726706b2cfe164966cdafb93cc7727176e1db9d45952ef999d90b53e65b` |
+  | `vad/stt-server/silero-v5` | `["voice-activity-detection"]` | `true` | `silero_v5_16k.f32`, 1238532 bytes, SHA-256 `b8df2e6e32753b7aa47ab59571b0d9d0b490a223f8dc9118bb388efeaec6f8e3` |
+
+  Their state is always `{"installed": true, "default": true}` (the only model of their kind).
+  CAM++ reports `speaker_embedding` (`dim`, `sample_rate`) and `diarization` (`max_speakers`) as
+  `supported` with `evidence: "builtin"`; Silero has no controls (`capabilities: {}`).
+- **Capabilities in the registry shape** give every control a `status`: a speech row's matrix
+  (section 4.1) with `response_formats`, which is a plain map in the rows, turned into `{"status":
+  "supported"|"unknown", "extra": {"values": <the map>}}`, and facts that are not controls
+  (`arch`, ...) left out. `/models/manage` and `/v1/models` keep the shapes of section 4.1.
+- `access` is `"free"` on every entry (a local model); plan tiers are an application matter.
 
 ## 5. Transcription / translation requests
 
@@ -1182,6 +1256,7 @@ key's presence before reading it:
   "vad": { "engine": "silero-v5", "sample_rate": 16000 },
   "speaker_embedding": { "engine": "campplus-voxceleb-v1", "dim": 512, "sample_rate": 16000 },
   "diarization": { "engine": "campplus-voxceleb-v1-average-linkage", "max_speakers": 26 },
+  "catalog": { "catalog_version": 2, "generated_at": "2026-08-17T11:27:14+00:00" },
   "server": { "version": "0.1.0", "host": "127.0.0.1", "port": 54321,
               "data_dir": "C:\\Users\\...\\STT Server" } }
 ```
@@ -1219,6 +1294,8 @@ Notes:
 - `diarization` advertises speaker diarization (`POST /v1/audio/diarize`, section 5d); `engine` is
   also the `model` of its responses and `max_speakers` the most speakers (and known speakers) one
   request can handle. A client that finds the key absent is talking to an older server.
+- `catalog` is the version of the embedded model catalog (also on `GET /models/manage`, section
+  4.5). A client that finds the key absent is talking to an older server.
 - `process.uptime_ms` is `now - GetProcessTimes` process creation time (the
   real process start, correct even on the very first call after startup); on
   a platform where that's unavailable it falls back to measuring from the

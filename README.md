@@ -36,7 +36,10 @@ model needed): fields `file`, optional `segments` (`[{start,end}]` in seconds, e
 detection) and `encoding_format` (`float` or `base64`). `POST /v1/audio/diarize` (section 5d) says who spoke when in OpenAI's
 `diarized_json` segment shape (`{type, id, start, end, speaker}`, no text): fields `file`, `segments`, `threshold`,
 `max_speakers`, `known_speaker_names[]` with `known_speaker_embeddings[]` or `known_speaker_references[]`; CPU only,
-no loaded model, its own slot. Audio is converted to 16 kHz mono before inference. Accepted multipart fields are `file`, `model`,
+no loaded model, its own slot. `GET /v1/registry` (section 4.5) lists every model the server serves, the speech models and the
+two compiled into it (CAM++, Silero), in the estate's shared model-registry shape (`kind`, `provider`, `ref`, `locality`,
+`tasks`, `privacy`); the same labels, the catalog's `description`/`parameters`/`base_model`/`language_count` and the
+catalog's `catalog_version`/`generated_at` ride on `/models/manage`, `/v1/models` and `/v1/local/system`. Audio is converted to 16 kHz mono before inference. Accepted multipart fields are `file`, `model`,
 `language`, `prompt`, `temperature`, `response_format` (`json`/`text`/`verbose_json`/`srt`/`vtt`), and repeatable
 `timestamp_granularities`/`timestamp_granularities[]` (plus `target_language` on translations only, default `en`, any language the model offers; also available live, section 5a); `prompt` is passed to the engine verbatim
 (no server-side composition or trimming) and is only accepted on whisper-family models. `model` is
