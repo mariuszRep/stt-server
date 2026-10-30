@@ -16,6 +16,8 @@
 
 use std::sync::OnceLock;
 
+/// Identifies the model in `/v1/local/system` and the registry.
+pub const MODEL_ID: &str = "silero-v5";
 pub const SAMPLE_RATE: u32 = 16_000;
 /// Samples scored per step: the only frame size the 16 kHz Silero model accepts.
 pub const FRAME: usize = 512;
@@ -28,6 +30,10 @@ const BINS: usize = 129;
 const KERNEL: usize = 3;
 
 const WEIGHTS: &[u8] = include_bytes!("../assets/silero_v5_16k.f32");
+/// What the registry reports about the compiled-in weights; a test pins the size and hash to the blob.
+pub const WEIGHTS_FILE: &str = "silero_v5_16k.f32";
+pub const WEIGHTS_BYTES: usize = WEIGHTS.len();
+pub const WEIGHTS_SHA256: &str = "b8df2e6e32753b7aa47ab59571b0d9d0b490a223f8dc9118bb388efeaec6f8e3";
 
 /// One encoder convolution (kernel 3, padding 1, ReLU after it). Weights are laid out
 /// `[out][tap][in]` so the inner product of every tap is contiguous.
@@ -384,7 +390,7 @@ pub fn detect(samples: &[f32], params: &Params) -> Vec<Span> {
     segments(&frame_probabilities(samples), samples.len(), params)
 }
 
-fn rounded(value: f64, decimals: i32) -> f64 {
+pub(crate) fn rounded(value: f64, decimals: i32) -> f64 {
     let scale = 10f64.powi(decimals);
     (value * scale).round() / scale
 }
@@ -414,15 +420,13 @@ mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
 
-    const WEIGHTS_SHA256: &str = "b8df2e6e32753b7aa47ab59571b0d9d0b490a223f8dc9118bb388efeaec6f8e3";
-
     fn fixture() -> Vec<f32> {
         crate::audio::decode_wav(include_bytes!("../tests/fixtures/speech-16k.wav")).unwrap()
     }
 
     #[test]
     fn embedded_weights_are_the_exported_blob() {
-        assert_eq!(WEIGHTS.len(), 309_633 * 4);
+        assert_eq!(WEIGHTS_BYTES, 309_633 * 4);
         assert_eq!(format!("{:x}", Sha256::digest(WEIGHTS)), WEIGHTS_SHA256);
     }
 

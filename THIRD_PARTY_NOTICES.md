@@ -33,6 +33,34 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+## 3D-Speaker CAM++ (https://github.com/modelscope/3D-Speaker)
+
+`assets/campplus_vox_16k.f16` holds the weights of the CAM++ speaker-embedding model trained on
+VoxCeleb (`iic/speech_campplus_sv_en_voxceleb_16k` on ModelScope, whose model card names the
+Apache License 2.0 and which 3D-Speaker publishes under the same licence), exported once with
+`scripts/export_campplus_weights.py` (inference-mode batch normalisation folded in, stored as
+`f16`). `src/speaker/` re-implements the model's forward pass and 3D-Speaker's feature
+pipeline in Rust. SHA-256 of the blob:
+`11122726706b2cfe164966cdafb93cc7727176e1db9d45952ef999d90b53e65b`. The model was trained on
+VoxCeleb2; the weights are the licensed artefact. 3D-Speaker is licensed under the Apache License,
+Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0):
+
+```
+Copyright 3D-Speaker contributors (Alibaba Group)
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+```
+
 ## Handy (https://github.com/cjpais/Handy)
 
 Small pieces of `src/download.rs` (the stall-timeout constant, the

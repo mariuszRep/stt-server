@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use crate::app::App;
 use crate::capabilities;
 use crate::errors::{ApiError, ApiResult};
+use crate::registry;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CatalogFile {
@@ -30,7 +31,17 @@ pub struct CatalogModel {
     pub name: String,
     pub architecture: String,
     pub family: String,
+    /// Size class as the catalog writes it (`0.6B`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The upstream model the GGUF was converted from (`nvidia/parakeet-unified-en-0.6b`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_model: Option<String>,
     pub license: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language_count: Option<u32>,
     pub languages: Vec<String>,
     pub capabilities: ModelClaims,
     pub speed_score: Option<u32>,
@@ -47,6 +58,11 @@ pub struct CatalogModel {
 
 #[derive(Deserialize)]
 pub struct Catalog {
+    /// The catalog format's own version (`2`), reported by `/models/manage`,
+    /// `/v1/registry` and `/v1/local/system`.
+    pub catalog_version: u32,
+    /// When the catalog was generated upstream (ISO 8601, as the file writes it).
+    pub generated_at: String,
     /// Unused (user decision): we do not use Handy's `blob.handy.computer`
     /// mirror without that project's permission, so downloads are
     /// HuggingFace-only (see `download::candidate_urls`). Kept deserializable
@@ -54,6 +70,26 @@ pub struct Catalog {
     #[serde(default)]
     pub mirrors: Vec<String>,
     pub models: Vec<CatalogModel>,
+}
+
+/// Which catalog the server was built with: what clients read to know how old the model list is.
+#[derive(Debug, Clone)]
+pub struct CatalogInfo {
+    pub catalog_version: u32,
+    pub generated_at: String,
+}
+
+impl CatalogInfo {
+    pub fn to_json(&self) -> Value {
+        json!({"catalog_version": self.catalog_version, "generated_at": self.generated_at})
+    }
+
+    /// Sets `catalog_version` and `generated_at` on the top level of a response body.
+    pub fn stamp(&self, body: &mut Value) {
+        for (key, value) in self.to_json().as_object().into_iter().flatten() {
+            body[key] = value.clone();
+        }
+    }
 }
 
 pub fn catalog_model<'a>(app: &'a App, id: &str) -> ApiResult<&'a CatalogModel> {
@@ -171,6 +207,12 @@ pub fn capability_matrix(model: &CatalogModel) -> Value {
     } else {
         json!([])
     };
+    // Subtitles are rendered from segment timestamps; only the loaded model confirms them.
+    let subtitles = if has_timestamps {
+        "unknown"
+    } else {
+        "unsupported"
+    };
     let mut matrix = json!({
         "prompt": claim(is_whisper_arch, Value::Null, !is_whisper_arch),
         "temperature": claim(is_whisper_arch, Value::Null, !is_whisper_arch),
@@ -183,7 +225,7 @@ pub fn capability_matrix(model: &CatalogModel) -> Value {
         "translation": translation,
         "timestamp_granularity": claim(has_timestamps, json!(model.capabilities.timestamps), false),
         "streaming": claim(model.capabilities.streaming, json!(model.capabilities.streaming), false),
-        "response_formats": {"json": "supported", "text": "supported", "verbose_json": "unknown"},
+        "response_formats": {"json": "supported", "text": "supported", "verbose_json": "unknown", "srt": subtitles, "vtt": subtitles},
     });
     capabilities::add_unverified_engine_controls(&mut matrix);
     matrix
@@ -202,7 +244,7 @@ pub fn model_view(model: &CatalogModel, installed_quant: Option<&str>) -> Value 
             })
         })
         .collect();
-    json!({
+    let mut view = json!({
         "id": model.slug,
         "name": model.name,
         "upstream_id": model.id,
@@ -218,11 +260,29 @@ pub fn model_view(model: &CatalogModel, installed_quant: Option<&str>) -> Value 
         "speed_score": model.speed_score,
         "accuracy_score": model.accuracy_score,
         "benchmark_source": "Handy catalog generated 2026-08-17; scores are derived display values, not local measurements",
+        "recommended": model.recommended,
         "recommended_rank": model.recommended_rank,
         "downloaded": installed_quant.is_some(),
         "installed_quant": installed_quant,
         "installable": true,
-    })
+    });
+    add_catalog_text(&mut view, model);
+    registry::label_speech_row(&mut view, &model.slug);
+    view
+}
+
+/// The catalog's descriptive fields, left out of a row when the catalog does not carry them.
+pub fn add_catalog_text(view: &mut Value, model: &CatalogModel) {
+    for (key, value) in [
+        ("description", model.description.as_ref().map(|v| json!(v))),
+        ("parameters", model.parameters.as_ref().map(|v| json!(v))),
+        ("base_model", model.base_model.as_ref().map(|v| json!(v))),
+        ("language_count", model.language_count.map(|v| json!(v))),
+    ] {
+        if let Some(value) = value {
+            view[key] = value;
+        }
+    }
 }
 
 #[cfg(test)]

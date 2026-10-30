@@ -678,7 +678,11 @@ mod tests {
             name: "Fake Model".to_owned(),
             architecture: "whisper".to_owned(),
             family: "fake".to_owned(),
+            parameters: None,
+            description: None,
+            base_model: None,
             license: "mit".to_owned(),
+            language_count: None,
             languages: vec!["en".to_owned()],
             capabilities: ModelClaims {
                 streaming: false,

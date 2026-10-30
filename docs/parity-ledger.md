@@ -257,8 +257,9 @@ run against that specific model, which is out of scope for this read-only pass.
 - No `prompt_max_tokens` ceiling is exposed by transcribe-cpp 0.2.3 (documented in
   `capabilities.rs`'s field doc already); Handy does not expose one either via its own
   `WhisperRunOptions`, so this is parity, not a gap.
-- Handy supports SRT/VTT export in its own UI layer (client-side), which this server
-  intentionally does not own (`response_formats` correctly reports `srt`/`vtt` unsupported).
+- Handy supports SRT/VTT export in its own UI layer (client-side). This server also returns them,
+  as OpenAI's endpoints do (`response_format=srt|vtt`, rendered from the segment timestamps; see
+  the `subtitle-response-formats` goal and `client-contract.md`).
 - Granite/GigaAM/MedASR/Qwen3-ASR/Voxtral/Cohere/Fun-ASR-Nano have no equivalent engine or UI
   code in Handy at all, so "parity with Handy" is not a meaningful standard for them; transcribe-
   cpp's own source is the correct ground truth and was used instead for this pass.
@@ -278,3 +279,18 @@ has (Vulkan out-of-memory) and CPU fallback is too slow to be usable; no fix is 
 it is a hardware requirement to note for users, not a defect to resolve. Bugs 1, 2, 3, and 5 above
 are resolved and covered by tests; Bug 4 (moonshine-streaming-tiny timeout) remains genuinely open
 per the note above.
+
+## 2026-10-30: model-registry fields (slice S2, additive)
+
+`/models/manage` rows, `/v1/models` entries and `/models/manage/recommendations` rows gain `kind`, `provider`, `ref`,
+`locality`, `tasks`, `privacy` and the catalog text the server used to drop (`description`, `parameters`, `base_model`,
+`language_count`); catalog rows gain `recommended`; `catalog_version`/`generated_at` are read and reported by
+`/models/manage`, `/v1/registry` (new) and `/v1/local/system`. `docs/client-contract.md` section 4.5.
+
+- Compatibility: with the new fields removed, the 69 `/models/manage` rows hash to the value the 0.3.6 server served before
+  (`tests/registry_binary.rs`, SHA-256 `c8a5373c...fdcf`).
+- The 71 `/v1/registry` entries (69 speech models + CAM++ + Silero) all validate against stt-sdk's
+  `schema/model-entry.v1.json` (ajv, once, by hand).
+- Gate: `cargo fmt --check`, `cargo clippy --release --all-targets --offline -- -D warnings`, `cargo test --release
+  --offline` (444 unit + 22 integration tests) green. `scripts\build-local.ps1 -Offline` (target folder `t\`): 83,657,728
+  bytes, SHA-256 `0E5BCE0359D5FA0A7AFB144D97D171661BE6DE80E9A53D183E38DF84099F2288`.

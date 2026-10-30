@@ -149,7 +149,16 @@ pub fn to_json(snapshot: &SystemSnapshot, server: &ServerSection) -> Value {
         "memory": memory,
         "gpu": gpu,
         "process": process,
-        "vad": {"engine": "silero-v5", "sample_rate": crate::vad::SAMPLE_RATE},
+        "vad": {"engine": crate::vad::MODEL_ID, "sample_rate": crate::vad::SAMPLE_RATE},
+        "speaker_embedding": {
+            "engine": crate::speaker::MODEL_ID,
+            "dim": crate::speaker::DIM,
+            "sample_rate": crate::speaker::SAMPLE_RATE,
+        },
+        "diarization": {
+            "engine": crate::speaker::diarize::ENGINE,
+            "max_speakers": crate::speaker::diarize::MAX_SPEAKERS,
+        },
         "server": {
             "version": server.version,
             "api_level": server.api_level,

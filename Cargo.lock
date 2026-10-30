@@ -1337,13 +1337,14 @@ checksum = "fe895eb47f22e2ddd4dabc02bce419d2e643c8e3b585c78158b349195bc24d82"
 
 [[package]]
 name = "stt-server"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "axum",
  "base64 0.22.1",
  "fs4",
  "futures-util",
  "hound",
+ "realfft",
  "reqwest",
  "rubato",
  "rusqlite",

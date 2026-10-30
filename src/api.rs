@@ -22,7 +22,7 @@ use crate::app::App;
 use crate::audio::decode_wav;
 use crate::auth::{authorize, authorized, AccessLevel};
 use crate::capabilities::{catalog_mismatch, EffectiveCaps};
-use crate::catalog::{capability_matrix, catalog_model, model_view};
+use crate::catalog::{add_catalog_text, capability_matrix, catalog_model, model_view};
 use crate::download::install_model;
 use crate::dropin::run_refresh;
 use crate::engine::{load_engine, BackendDiagnostic, CancelWhenDropped, LoadedModel};
@@ -30,6 +30,7 @@ use crate::errors::{classify_run_result, internal, ApiError, ApiResult, RunOutco
 use crate::format::{format_response, DiagnosticsExtra, Formatted, LanguageEvidence};
 use crate::import::import_model;
 use crate::operations::{cancel_operation, operation};
+use crate::registry;
 use crate::run_plan::{plan as build_plan, Endpoint, ParsedRequest};
 use crate::store::{
     all_installed, backend_preference, installed_file, is_valid_cors_origin, selected_id,
@@ -454,7 +455,9 @@ pub async fn system_info(
         port: app.bind_port,
         data_dir: app.data_dir.display().to_string(),
     };
-    Ok(Json(crate::sysinfo::to_json(&snapshot, &server)))
+    let mut body = crate::sysinfo::to_json(&snapshot, &server);
+    body["catalog"] = app.catalog_info.to_json();
+    Ok(Json(body))
 }
 
 pub async fn recommendations(
@@ -582,10 +585,10 @@ fn custom_model_view(installed: &crate::store::InstalledFile) -> Value {
         "translation": {"status": "unknown"},
         "timestamp_granularity": {"status": "unknown"},
         "streaming": {"status": if claims["streaming"] == true { "unknown" } else { "unsupported" }},
-        "response_formats": {"json": "supported", "text": "unsupported", "verbose_json": "unsupported"},
+        "response_formats": {"json": "supported", "text": "unsupported", "verbose_json": "unsupported", "srt": "unknown", "vtt": "unknown"},
     });
     crate::capabilities::add_unverified_engine_controls(&mut effective_capabilities);
-    json!({
+    let mut view = json!({
         "id": installed.id,
         "name": custom_model_name(installed),
         "architecture": installed.custom_arch,
@@ -601,7 +604,9 @@ fn custom_model_view(installed: &crate::store::InstalledFile) -> Value {
         "recommended_rank": Value::Null,
         "needs_verification": installed.needs_verification,
         "file_path": installed.path.to_string_lossy(),
-    })
+    });
+    registry::label_speech_row(&mut view, &installed.id);
+    view
 }
 
 /// Custom (non-catalog) installed models: rows with `custom_arch` set, i.e.
@@ -614,17 +619,15 @@ fn installed_custom_models(app: &App) -> ApiResult<Vec<crate::store::InstalledFi
         .collect())
 }
 
-pub async fn local_models(
-    State(app): State<Arc<App>>,
-    headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
-    authorize(&headers, &app, AccessLevel::User)?;
-    let default_id = selected_id(&app)?;
+/// Every `/models/manage` row: the catalog's models with their installed state, then the
+/// registered custom (drop-in) models. Shared by `GET /models/manage` and `GET /v1/registry`.
+fn manage_rows(app: &App) -> ApiResult<Vec<Value>> {
+    let default_id = selected_id(app)?;
     let mut data = app
         .catalog
         .iter()
         .map(|model| {
-            let installed = installed_file(&app, &model.slug)?;
+            let installed = installed_file(app, &model.slug)?;
             let mut view = model_view(
                 model,
                 installed
@@ -636,20 +639,52 @@ pub async fn local_models(
                 view["source"] = json!(installed.source);
                 view["needs_verification"] = json!(installed.needs_verification);
             }
-            if let Some(effective) = effective_view_if_loaded(&app, &model.slug)? {
+            if let Some(effective) = effective_view_if_loaded(app, &model.slug)? {
                 view["effective_capabilities"] = effective;
             }
             view["default"] = json!(default_id.as_deref() == Some(model.slug.as_str()));
             Ok(view)
         })
         .collect::<ApiResult<Vec<_>>>()?;
-    for custom in installed_custom_models(&app)? {
+    for custom in installed_custom_models(app)? {
         let is_default = default_id.as_deref() == Some(custom.id.as_str());
         let mut view = custom_model_view(&custom);
         view["default"] = json!(is_default);
         data.push(view);
     }
-    Ok(Json(json!({"object":"list", "data":data})))
+    Ok(data)
+}
+
+pub async fn local_models(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    authorize(&headers, &app, AccessLevel::User)?;
+    let mut body = json!({"object":"list", "data": manage_rows(&app)?});
+    app.catalog_info.stamp(&mut body);
+    Ok(Json(body))
+}
+
+/// `GET /v1/registry`: every model this server serves, in the shared model-registry shape
+/// (`ModelEntry` and `ModelState`, see `crate::registry`): the speech models of `/models/manage`
+/// and the two compiled into the server.
+pub async fn registry_models(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    authorize(&headers, &app, AccessLevel::User)?;
+    let rows = manage_rows(&app)?;
+    let loaded_id = app
+        .loaded
+        .lock()
+        .map_err(internal)?
+        .as_ref()
+        .map(|active| active.id.clone());
+    Ok(Json(registry::document(
+        &rows,
+        loaded_id.as_deref(),
+        &app.catalog_info,
+    )))
 }
 
 /// The capability view for a callable (downloaded+verified) model, for the
@@ -671,7 +706,7 @@ fn callable_capabilities(app: &App, id: &str, catalog_fallback: Option<Value>) -
             "translation": {"status": "unknown"},
             "timestamp_granularity": {"status": "unknown"},
             "streaming": {"status": "unsupported"},
-            "response_formats": {"json": "supported", "text": "unsupported", "verbose_json": "unsupported"},
+            "response_formats": {"json": "supported", "text": "unsupported", "verbose_json": "unsupported", "srt": "unknown", "vtt": "unknown"},
         });
         crate::capabilities::add_unverified_engine_controls(&mut unknown);
         unknown
@@ -739,7 +774,7 @@ fn openai_model_entry(app: &App, id: &str, default_id: Option<&str>) -> ApiResul
         (json!(languages), json!(language_detect))
     };
 
-    Ok(json!({
+    let mut entry = json!({
         "id": id,
         "object": "model",
         "owned_by": "local",
@@ -748,7 +783,12 @@ fn openai_model_entry(app: &App, id: &str, default_id: Option<&str>) -> ApiResul
         "capabilities": capabilities,
         "languages": languages,
         "language_detect": language_detect,
-    }))
+    });
+    if let Some(model) = catalog_model {
+        add_catalog_text(&mut entry, model);
+    }
+    registry::label_speech_row(&mut entry, id);
+    Ok(entry)
 }
 
 /// Every callable model id: downloaded and verified catalog models plus
@@ -1582,7 +1622,7 @@ async fn transcribe_or_translate(
         target_language: plan.target_language.clone(),
     };
 
-    let formatted = format_response(&transcript, &plan, samples, &extra);
+    let formatted = format_response(&transcript, &plan, samples, &extra)?;
     Ok(formatted_into_response(formatted))
 }
 
@@ -1602,7 +1642,7 @@ pub async fn translations(
     transcribe_or_translate(app, headers, multipart, Endpoint::Translations).await
 }
 
-fn invalid_vad_request(message: impl Into<String>) -> ApiError {
+fn invalid_request(message: impl Into<String>) -> ApiError {
     ApiError::new(
         StatusCode::BAD_REQUEST,
         "invalid_request_error",
@@ -1620,9 +1660,56 @@ fn vad_option<T: std::str::FromStr>(
         .map(|raw| {
             raw.trim()
                 .parse()
-                .map_err(|_| invalid_vad_request(format!("{name} must be a number")))
+                .map_err(|_| invalid_request(format!("{name} must be a number")))
         })
         .transpose()
+}
+
+/// The multipart shape of the offline audio endpoints: a required `file` plus text fields from
+/// `allowed`, each at most once, and the repeatable text fields from `lists` (any number of
+/// times, in order); anything else is a 400.
+struct AudioForm {
+    file: Vec<u8>,
+    options: std::collections::HashMap<String, String>,
+    lists: std::collections::HashMap<String, Vec<String>>,
+}
+
+async fn read_audio_form(
+    mut multipart: Multipart,
+    allowed: &[&str],
+    lists: &[&str],
+) -> ApiResult<AudioForm> {
+    let mut file: Option<Vec<u8>> = None;
+    let mut options = std::collections::HashMap::new();
+    let mut listed: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    while let Some(field) = multipart.next_field().await.map_err(invalid_multipart)? {
+        let name = field.name().unwrap_or("").to_owned();
+        if name == "file" {
+            if file.is_some() {
+                return Err(duplicate_field("file"));
+            }
+            file = Some(field.bytes().await.map_err(invalid_multipart)?.to_vec());
+        } else if allowed.contains(&name.as_str()) {
+            let text = field.text().await.map_err(invalid_multipart)?;
+            if options.insert(name.clone(), text).is_some() {
+                return Err(duplicate_field(&name));
+            }
+        } else if lists.contains(&name.as_str()) {
+            let text = field.text().await.map_err(invalid_multipart)?;
+            listed.entry(name).or_default().push(text);
+        } else {
+            return Err(invalid_request(format!("Field {name} is not supported")));
+        }
+    }
+    let file = file.ok_or_else(|| {
+        ApiError::new(StatusCode::BAD_REQUEST, "missing_file", "file is required")
+    })?;
+    Ok(AudioForm {
+        file,
+        options,
+        lists: listed,
+    })
 }
 
 /// `POST /v1/audio/vad`: speech segments of a finished recording. A local extension (OpenAI has
@@ -1631,36 +1718,20 @@ fn vad_option<T: std::str::FromStr>(
 pub async fn audio_vad(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
-    mut multipart: Multipart,
+    multipart: Multipart,
 ) -> ApiResult<Json<Value>> {
     authorize(&headers, &app, AccessLevel::User)?;
-    let mut file: Option<Vec<u8>> = None;
-    let mut options = std::collections::HashMap::new();
-    while let Some(field) = multipart.next_field().await.map_err(invalid_multipart)? {
-        let name = field.name().unwrap_or("").to_owned();
-        match name.as_str() {
-            "file" => {
-                if file.is_some() {
-                    return Err(duplicate_field("file"));
-                }
-                file = Some(field.bytes().await.map_err(invalid_multipart)?.to_vec());
-            }
-            "threshold" | "min_speech_ms" | "min_silence_ms" | "speech_pad_ms" => {
-                let text = field.text().await.map_err(invalid_multipart)?;
-                if options.insert(name.clone(), text).is_some() {
-                    return Err(duplicate_field(&name));
-                }
-            }
-            other => {
-                return Err(invalid_vad_request(format!(
-                    "Field {other} is not supported"
-                )))
-            }
-        }
-    }
-    let file = file.ok_or_else(|| {
-        ApiError::new(StatusCode::BAD_REQUEST, "missing_file", "file is required")
-    })?;
+    let AudioForm { file, options, .. } = read_audio_form(
+        multipart,
+        &[
+            "threshold",
+            "min_speech_ms",
+            "min_silence_ms",
+            "speech_pad_ms",
+        ],
+        &[],
+    )
+    .await?;
     let defaults = crate::vad::Params::default();
     let params = crate::vad::Params {
         threshold: vad_option(&options, "threshold")?.unwrap_or(defaults.threshold),
@@ -1668,11 +1739,146 @@ pub async fn audio_vad(
         min_silence_ms: vad_option(&options, "min_silence_ms")?.unwrap_or(defaults.min_silence_ms),
         speech_pad_ms: vad_option(&options, "speech_pad_ms")?.unwrap_or(defaults.speech_pad_ms),
     };
-    params.validate().map_err(invalid_vad_request)?;
+    params.validate().map_err(invalid_request)?;
 
     let _slot = app.vad_slots.acquire().await.map_err(internal)?;
     let report = tokio::task::spawn_blocking(move || {
         decode_wav(&file).map(|samples| crate::vad::report(&samples, &params))
+    })
+    .await
+    .map_err(internal)??;
+    Ok(Json(report))
+}
+
+/// `POST /v1/audio/embeddings`: a speaker embedding ("voice fingerprint") per speech segment of
+/// a finished recording. A local extension (OpenAI's `/v1/embeddings` is for text) that needs no
+/// loaded model; like the VAD it runs beside the inference queue, on its own slots.
+pub async fn audio_embeddings(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> ApiResult<Json<Value>> {
+    authorize(&headers, &app, AccessLevel::User)?;
+    let AudioForm { file, options, .. } =
+        read_audio_form(multipart, &["segments", "encoding_format"], &[]).await?;
+    let encoding = match options.get("encoding_format").map(|raw| raw.trim()) {
+        None | Some("float") => crate::speaker::Encoding::Float,
+        Some("base64") => crate::speaker::Encoding::Base64,
+        Some(_) => {
+            return Err(invalid_request("encoding_format must be float or base64"));
+        }
+    };
+    let segments = options
+        .get("segments")
+        .map(|raw| crate::speaker::parse_segments(raw))
+        .transpose()
+        .map_err(invalid_request)?;
+
+    let _slot = app.speaker_slots.acquire().await.map_err(internal)?;
+    let report = tokio::task::spawn_blocking(move || {
+        decode_wav(&file)
+            .map(|samples| crate::speaker::report(&samples, segments.as_deref(), encoding))
+    })
+    .await
+    .map_err(internal)??;
+    Ok(Json(report))
+}
+
+/// `POST /v1/audio/diarize`: who spoke when in a finished recording, shaped like OpenAI's
+/// `diarized_json` segments but without text. A local extension: CPU only, beside the inference
+/// queue, on its own slot.
+pub async fn audio_diarize(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> ApiResult<Json<Value>> {
+    use crate::speaker::diarize;
+    authorize(&headers, &app, AccessLevel::User)?;
+    let AudioForm {
+        file,
+        options,
+        mut lists,
+    } = read_audio_form(
+        multipart,
+        &["segments", "threshold", "max_speakers"],
+        &[
+            "known_speaker_names[]",
+            "known_speaker_embeddings[]",
+            "known_speaker_references[]",
+        ],
+    )
+    .await?;
+    let segments = options
+        .get("segments")
+        .map(|raw| crate::speaker::parse_segments(raw))
+        .transpose()
+        .map_err(invalid_request)?;
+    let threshold = options
+        .get("threshold")
+        .map_or(Ok(diarize::DEFAULT_THRESHOLD), |raw| {
+            diarize::parse_threshold(raw)
+        })
+        .map_err(invalid_request)?;
+    let max_speakers = options
+        .get("max_speakers")
+        .map_or(Ok(diarize::MAX_SPEAKERS), |raw| {
+            diarize::parse_max_speakers(raw)
+        })
+        .map_err(invalid_request)?;
+    let mut take = |name: &str| lists.remove(name).unwrap_or_default();
+    let (names, embeddings, references) = (
+        take("known_speaker_names[]"),
+        take("known_speaker_embeddings[]"),
+        take("known_speaker_references[]"),
+    );
+    diarize::check_known_lists(&names, &embeddings, &references).map_err(invalid_request)?;
+    let names = diarize::parse_names(&names).map_err(invalid_request)?;
+    let profiles = embeddings
+        .iter()
+        .enumerate()
+        .map(|(index, raw)| {
+            diarize::parse_embedding(raw)
+                .map_err(|e| invalid_request(format!("known_speaker_embeddings[][{index}]: {e}")))
+        })
+        .collect::<ApiResult<Vec<_>>>()?;
+    let clips = references
+        .iter()
+        .enumerate()
+        .map(|(index, raw)| {
+            diarize::parse_reference(raw)
+                .map_err(|e| invalid_request(format!("known_speaker_references[][{index}]: {e}")))
+        })
+        .collect::<ApiResult<Vec<_>>>()?;
+
+    let _slot = app.diarize_slots.acquire().await.map_err(internal)?;
+    let report = tokio::task::spawn_blocking(move || {
+        let embedded = clips
+            .iter()
+            .enumerate()
+            .map(|(index, clip)| {
+                let reference_error = |detail: String| {
+                    invalid_request(format!("known_speaker_references[][{index}]: {detail}"))
+                };
+                let samples = decode_wav(clip).map_err(|e| reference_error(e.message))?;
+                diarize::reference_embedding(&samples).map_err(reference_error)
+            })
+            .collect::<ApiResult<Vec<_>>>()?;
+        let known = names
+            .into_iter()
+            .zip(profiles.into_iter().chain(embedded))
+            .map(|(name, embedding)| diarize::KnownSpeaker { name, embedding })
+            .collect();
+        decode_wav(&file).map(|samples| {
+            diarize::report(
+                &samples,
+                &diarize::Request {
+                    segments,
+                    threshold,
+                    max_speakers,
+                    known,
+                },
+            )
+        })
     })
     .await
     .map_err(internal)??;
@@ -1733,10 +1939,19 @@ pub fn router(app: Arc<App>) -> Router {
             "/v1/audio/vad",
             post(audio_vad).layer(DefaultBodyLimit::max(40 * 1024 * 1024)),
         )
+        .route(
+            "/v1/audio/embeddings",
+            post(audio_embeddings).layer(DefaultBodyLimit::max(40 * 1024 * 1024)),
+        )
+        .route(
+            "/v1/audio/diarize",
+            post(audio_diarize).layer(DefaultBodyLimit::max(40 * 1024 * 1024)),
+        )
         .route("/v1/realtime", get(crate::realtime::realtime))
         .route("/v1/local/system", get(system_info))
         .route("/v1/local/config", get(get_config).patch(patch_config))
         .route("/v1/local/shutdown", post(shutdown_endpoint))
+        .route("/v1/registry", get(registry_models))
         .route("/models/manage", get(local_models))
         .route("/models/manage/refresh", post(refresh_models))
         .route("/models/manage/unload", post(unload_model))
@@ -3124,6 +3339,128 @@ mod router_tests {
         std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
     }
 
+    /// A callable catalog model and a drop-in carry the registry labels on `/v1/models`, `/models/manage` and
+    /// `/v1/registry`, and the registry entry and state say what the other two rows say.
+    #[tokio::test]
+    async fn installed_models_carry_registry_labels_on_every_route() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
+        let app = open_app_at(path.clone()).unwrap();
+        let token = app.token.clone();
+        {
+            let db = app.db.lock().unwrap();
+            db.execute(
+                "INSERT INTO installed(id,path,sha256,quant,source) VALUES('parakeet-unified-en-0.6b','unused','x','Q8_0','catalog_download')",
+                [],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO installed(id,path,sha256,filename,source,custom_arch,custom_name) VALUES('custom-named-aaaaaaaa','unused','x','some-model-q4_0.gguf','user_folder','whisper','My Named Model')",
+                [],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO settings(key,value) VALUES('selected_model','custom-named-aaaaaaaa')",
+                [],
+            )
+            .unwrap();
+        }
+        let router = router(app.clone());
+        let get = |uri: &'static str| {
+            let router = router.clone();
+            let token = token.clone();
+            async move {
+                let request = Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap();
+                let response = router.oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{uri}");
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<Value>(&bytes).unwrap()
+            }
+        };
+        let find = |body: &Value, id: &str| {
+            body["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["id"] == id)
+                .unwrap_or_else(|| panic!("no {id}"))
+                .clone()
+        };
+        let labels = |row: &Value, id: &str| {
+            assert_eq!(row["kind"], "speech", "{id}");
+            assert_eq!(row["provider"], "stt-server", "{id}");
+            assert_eq!(row["ref"], format!("speech/stt-server/{id}"), "{id}");
+            assert_eq!(row["locality"], "local", "{id}");
+            assert_eq!(row["tasks"], json!(["speech-to-text"]), "{id}");
+            assert_eq!(row["privacy"], json!({"sends": []}), "{id}");
+        };
+
+        // `/v1/models`: the callable catalog model keeps its catalog text; the drop-in has none.
+        let callable = get("/v1/models").await;
+        let catalog_entry = find(&callable, "parakeet-unified-en-0.6b");
+        labels(&catalog_entry, "parakeet-unified-en-0.6b");
+        assert_eq!(catalog_entry["parameters"], "0.6B");
+        assert_eq!(catalog_entry["language_count"], 1);
+        assert_eq!(
+            catalog_entry["base_model"],
+            "nvidia/parakeet-unified-en-0.6b"
+        );
+        assert_eq!(catalog_entry["owned_by"], "local");
+        let custom_entry = find(&callable, "custom-named-aaaaaaaa");
+        labels(&custom_entry, "custom-named-aaaaaaaa");
+        assert!(custom_entry.get("description").is_none());
+        assert!(custom_entry.get("parameters").is_none());
+
+        // `/models/manage`: the drop-in is labelled too.
+        let manage = get("/models/manage").await;
+        labels(
+            &find(&manage, "custom-named-aaaaaaaa"),
+            "custom-named-aaaaaaaa",
+        );
+
+        // `/v1/registry`: the drop-in is an entry from the same row, with its state.
+        let registry = get("/v1/registry").await;
+        let entry = find(&registry, "custom-named-aaaaaaaa");
+        labels(&entry, "custom-named-aaaaaaaa");
+        assert_eq!(entry["name"], "My Named Model");
+        assert_eq!(entry["local"]["custom"], true);
+        assert_eq!(entry["local"]["source"], "user_folder");
+        assert!(entry.get("editorial").is_none());
+        assert!(entry.get("description").is_none());
+        let state_of = |reference: &str| {
+            registry["states"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|state| state["ref"] == reference)
+                .unwrap()
+                .clone()
+        };
+        let state = state_of("speech/stt-server/custom-named-aaaaaaaa");
+        assert_eq!(state["installed"], true);
+        assert_eq!(state["default"], true);
+        assert_eq!(state["loaded"], false);
+        let catalog_state = state_of("speech/stt-server/parakeet-unified-en-0.6b");
+        assert_eq!(catalog_state["installed"], true);
+        assert_eq!(catalog_state["installedQuant"], "Q8_0");
+        assert_eq!(catalog_state["default"], false);
+        assert_eq!(
+            registry["states"].as_array().unwrap().len(),
+            registry["data"].as_array().unwrap().len()
+        );
+
+        drop(router);
+        drop(app);
+        std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
+    }
+
     /// `/readiness` while a background load is in progress (see
     /// `engine::spawn_tracked_load`/`app::open_app_at_full`): 503 with a
     /// `"loading model"` reason, the loading model's id, and `elapsed_ms`,
@@ -3417,6 +3754,60 @@ mod router_tests {
     }
 
     #[tokio::test]
+    async fn embeddings_fingerprint_the_requested_segments() {
+        let segments = r#"[{"start": 0.3, "end": 2.9}, {"start": 3.0, "end": 3.2}]"#;
+        let (status, body) = post_wav_fields(
+            "/v1/audio/embeddings",
+            SPEECH_WAV,
+            &[("segments", segments)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["model"], "campplus-voxceleb-v1");
+        assert_eq!(body["dim"], 512);
+        assert_eq!(body["duration"], 6.165);
+        let entries = body["segments"].as_array().unwrap();
+        assert_eq!(entries[0]["embedding"].as_array().unwrap().len(), 512);
+        assert!(entries[1]["embedding"].is_null());
+    }
+
+    #[tokio::test]
+    async fn embeddings_reject_bad_parameters_with_invalid_request_error() {
+        for fields in [
+            ("encoding_format", "hex"),
+            ("segments", "not json"),
+            ("segments", r#"[{"start": 2, "end": 1}]"#),
+            ("unknown", "1"),
+        ] {
+            let (status, body) = post_audio_fields("/v1/audio/embeddings", &[fields]).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{fields:?}");
+            assert_eq!(body["error"]["code"], "invalid_request_error", "{fields:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn diarize_labels_the_speech_fixture_and_rejects_bad_parameters() {
+        let (status, body) = post_wav_fields("/v1/audio/diarize", SPEECH_WAV, &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["duration"], 6.165);
+        let segments = body["segments"].as_array().unwrap();
+        assert!(!segments.is_empty());
+        assert_eq!(segments[0]["type"], "transcript.text.segment");
+        assert_eq!(segments[0]["speaker"], "A");
+        for fields in [
+            ("threshold", "2"),
+            ("max_speakers", "0"),
+            ("segments", "not json"),
+            ("known_speaker_names[]", "Ann"),
+            ("unknown", "1"),
+        ] {
+            let (status, body) = post_audio_fields("/v1/audio/diarize", &[fields]).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{fields:?}");
+            assert_eq!(body["error"]["code"], "invalid_request_error", "{fields:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn vad_from_the_lan_without_a_token_is_unauthorized() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
         let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
@@ -3453,7 +3844,7 @@ mod router_tests {
     }
 
     #[tokio::test]
-    async fn system_info_reports_the_vad_engine() {
+    async fn system_info_reports_the_vad_embedding_and_diarization_engines() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
         let path = parent.join(format!("stt-server-test-{}", Uuid::new_v4()));
         let app = open_app_at(path.clone()).unwrap();
@@ -3467,6 +3858,14 @@ mod router_tests {
         assert_eq!(
             body["vad"],
             json!({"engine": "silero-v5", "sample_rate": 16000})
+        );
+        assert_eq!(
+            body["speaker_embedding"],
+            json!({"engine": "campplus-voxceleb-v1", "dim": 512, "sample_rate": 16000})
+        );
+        assert_eq!(
+            body["diarization"],
+            json!({"engine": "campplus-voxceleb-v1-average-linkage", "max_speakers": 26})
         );
         drop(app);
         std::fs::remove_dir_all(path.canonicalize().unwrap()).unwrap();
@@ -3524,6 +3923,32 @@ mod router_tests {
                 assert_eq!(body["error"]["code"], "server_not_ready");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn subtitle_formats_are_accepted_on_both_endpoints_and_reach_the_model_check() {
+        for uri in ["/v1/audio/transcriptions", "/v1/audio/translations"] {
+            for format in ["srt", "vtt"] {
+                let (status, body) = post_audio_fields(uri, &[("response_format", format)]).await;
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri} {format}");
+                assert_eq!(body["error"]["code"], "server_not_ready");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn subtitle_text_is_served_as_plain_text() {
+        let body = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHi\n\n";
+        let response = formatted_into_response(Formatted::PlainText(body.to_string()));
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(bytes, body.as_bytes());
     }
 
     #[tokio::test]
@@ -4303,6 +4728,7 @@ mod router_tests {
             ("GET", "/readiness", None),
             ("GET", "/v1/models", None),
             ("GET", "/models/manage", None),
+            ("GET", "/v1/registry", None),
             ("GET", "/models/manage/default", None),
             ("GET", "/v1/local/system", None),
             ("GET", "/models/manage/recommendations", None),

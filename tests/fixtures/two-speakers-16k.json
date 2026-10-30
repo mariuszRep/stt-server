@@ -1,0 +1,29 @@
+{
+  "voices": {
+    "A": "Microsoft George",
+    "B": "Microsoft Zira Desktop"
+  },
+  "duration": 11.67,
+  "segments": [
+    {
+      "speaker": "A",
+      "start": 0.0,
+      "end": 2.535
+    },
+    {
+      "speaker": "B",
+      "start": 2.935,
+      "end": 5.77
+    },
+    {
+      "speaker": "A",
+      "start": 6.17,
+      "end": 8.885
+    },
+    {
+      "speaker": "B",
+      "start": 9.285,
+      "end": 11.67
+    }
+  ]
+}

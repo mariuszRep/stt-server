@@ -11,12 +11,14 @@ use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use crate::capabilities::EffectiveCaps;
-use crate::catalog::{Catalog, CatalogModel};
+use crate::catalog::{Catalog, CatalogInfo, CatalogModel};
 use crate::engine::{caps_for, load_engine, spawn_tracked_load, LoadedModel, LoadingStatus};
 use crate::queue::InferenceQueue;
 
 pub struct App {
     pub catalog: Vec<CatalogModel>,
+    /// Which version of the embedded catalog this is; see [`CatalogInfo`].
+    pub catalog_info: CatalogInfo,
     pub db: Mutex<Connection>,
     /// `Arc`-wrapped (not a plain `Mutex`) so the background startup load
     /// spawned by `open_app_at_full` can hold its own clone of this slot and
@@ -54,6 +56,12 @@ pub struct App {
     /// Offline speech detection (`POST /v1/audio/vad`) runs beside, not in, the inference
     /// queue; this caps how many run at once.
     pub vad_slots: tokio::sync::Semaphore,
+    /// Speaker embeddings (`POST /v1/audio/embeddings`) likewise run beside the queue, on the
+    /// CPU, and never take the GPU; this caps how many run at once.
+    pub speaker_slots: tokio::sync::Semaphore,
+    /// Diarization (`POST /v1/audio/diarize`) runs on the CPU beside the queue as well, on its
+    /// own slot, so it neither waits behind embeddings nor takes cores from two of them at once.
+    pub diarize_slots: tokio::sync::Semaphore,
     /// Queue/inference limits: settable via `PATCH /v1/local/config` and
     /// overridable per-process by CLI flags (`--queue-max-waiting`,
     /// `--queue-wait-timeout-ms`, `--inference-timeout-ms`). Read at request
@@ -802,6 +810,10 @@ pub fn open_app_at_full(
     }
 
     Ok(Arc::new(App {
+        catalog_info: CatalogInfo {
+            catalog_version: catalog.catalog_version,
+            generated_at: catalog.generated_at,
+        },
         catalog: catalog.models,
         db: Mutex::new(db),
         loaded,
@@ -812,6 +824,8 @@ pub fn open_app_at_full(
         user_token,
         inference: InferenceQueue::new(),
         vad_slots: tokio::sync::Semaphore::new(2),
+        speaker_slots: tokio::sync::Semaphore::new(2),
+        diarize_slots: tokio::sync::Semaphore::new(1),
         limits: std::sync::RwLock::new(limits),
         selection: tokio::sync::Mutex::new(()),
         // No blanket total-request timeout: a 48 GB model download must not
